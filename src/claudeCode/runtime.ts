@@ -79,6 +79,12 @@ export type ClaudeSlashCommandDescriptor = {
   source: "sdk" | "fallback";
 };
 
+export type ClaudeEffortFallback = {
+  requested: string;
+  resolved: string;
+  supported: string[];
+};
+
 export type ClaudeBridgeSessionInfo = ExternalBridgeSessionInfo;
 
 export type ClaudeBridgeScope = {
@@ -142,13 +148,13 @@ export function getClaudePermissionMode(): "safe" | "yolo" {
 }
 
 export function buildClaudeReasoningConfig():
-  | { provider: "anthropic"; level: "low" | "medium" | "high" }
+  | { provider: "anthropic"; level: "low" | "medium" | "high" | "xhigh" }
   | undefined {
   const mode = getClaudeReasoningModePref();
   if (mode === "auto") return undefined;
   return {
     provider: "anthropic",
-    level: mode,
+    level: mode === "max" ? "xhigh" : mode,
   };
 }
 
@@ -208,6 +214,13 @@ export function listClaudeSlashCommands(
   coreRuntime: AgentRuntime,
 ): ClaudeSlashCommandDescriptor[] {
   return getClaudeBridgeRuntime(coreRuntime).listSlashCommandsSync();
+}
+
+export async function listClaudeEfforts(
+  coreRuntime: AgentRuntime,
+  model?: string,
+): Promise<string[]> {
+  return getClaudeBridgeRuntime(coreRuntime).listEfforts(model);
 }
 
 export async function refreshClaudeBridgeActions(

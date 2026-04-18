@@ -1710,6 +1710,12 @@ export function openStandaloneChat(options?: {
               btn.dataset.sessionVersion = String(entry.sessionVersion);
             }
 
+            const textWrap = doc.createElementNS(
+              HTML_NS,
+              "div",
+            ) as HTMLDivElement;
+            textWrap.className = "llm-standalone-search-text";
+
             const label = doc.createElementNS(
               HTML_NS,
               "span",
@@ -1720,7 +1726,7 @@ export function openStandaloneChat(options?: {
             const labelText = isPaperEntry
               ? resolvePaperLabel(entry.paperItemID)
               : t("Library chat");
-            label.textContent = isPaperEntry ? labelText : t("Library chat");
+            label.textContent = labelText;
 
             const title = doc.createElementNS(
               HTML_NS,
@@ -1729,7 +1735,8 @@ export function openStandaloneChat(options?: {
             title.className = "llm-standalone-search-title";
             title.textContent = entry.title || t("Untitled chat");
 
-            btn.append(label, title);
+            textWrap.append(label, title);
+            btn.append(textWrap);
             btn.title = `${labelText}: ${entry.title || t("Untitled chat")}`;
             searchResults.appendChild(btn);
           }

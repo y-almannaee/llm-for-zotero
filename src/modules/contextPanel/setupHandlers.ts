@@ -349,6 +349,7 @@ import {
   buildClaudeReasoningConfig,
   getClaudeRuntimeModelEntries,
   getSelectedClaudeRuntimeEntry,
+  listClaudeEfforts,
   rememberClaudeConversationSelection,
   resolveRememberedClaudeConversationKey,
   refreshClaudeSlashCommands,
@@ -6881,14 +6882,24 @@ export function setupHandlers(
     }
     const { currentModel } = getSelectedModelInfo();
     if (isClaudeConversationSystem()) {
+      const selectedMode = getClaudeReasoningModePref();
       const options: ReasoningOption[] = [
         { level: "low", enabled: true, label: "Low" },
         { level: "medium", enabled: true, label: "Medium" },
         { level: "high", enabled: true, label: "High" },
+        { level: "xhigh", enabled: true, label: "XHigh" },
+        {
+          level: "xhigh",
+          enabled: true,
+          label: "Max",
+        },
       ];
-      const selectedMode = getClaudeReasoningModePref();
       const selectedLevel =
-        selectedMode === "auto" ? "none" : (selectedMode as ReasoningLevelSelection);
+        selectedMode === "auto"
+          ? "none"
+          : selectedMode === "max"
+            ? ("xhigh" as ReasoningLevelSelection)
+            : (selectedMode as ReasoningLevelSelection);
       return {
         provider: "anthropic" as const,
         currentModel,
@@ -7045,14 +7056,25 @@ export function setupHandlers(
       const { provider, currentModel, options, enabledLevels, selectedLevel } =
         getReasoningState();
       const available = enabledLevels.length > 0;
-      const resolvedReasoningLabel = available
-        ? getReasoningLevelDisplayLabel(
-            selectedLevel as LLMReasoningLevel,
-            provider,
-            currentModel,
-            options,
-          )
-        : "off";
+      const resolvedReasoningLabel = isClaudeConversationSystem()
+        ? (() => {
+            const mode = getClaudeReasoningModePref();
+            if (mode === "auto") return "Auto";
+            if (mode === "xhigh") return "XHigh";
+            if (mode === "max") return "Max";
+            if (mode === "high") return "High";
+            if (mode === "medium") return "Medium";
+            if (mode === "low") return "Low";
+            return "Auto";
+          })()
+        : available
+          ? getReasoningLevelDisplayLabel(
+              selectedLevel as LLMReasoningLevel,
+              provider,
+              currentModel,
+              options,
+            )
+          : "off";
       const active =
         available && isReasoningDisplayLabelActive(resolvedReasoningLabel);
       const reasoningLabel = resolvedReasoningLabel;
@@ -7125,6 +7147,47 @@ export function setupHandlers(
       t("Reasoning level"),
       "llm-reasoning-menu-section",
     );
+    if (isClaudeConversationSystem()) {
+      const claudeModes: Array<{
+        value: "auto" | "low" | "medium" | "high" | "xhigh" | "max";
+        label: string;
+      }> = [
+        { value: "auto", label: "Auto" },
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High" },
+        { value: "xhigh", label: "XHigh" },
+        { value: "max", label: "Max" },
+      ];
+      const currentMode = getClaudeReasoningModePref();
+      for (const mode of claudeModes) {
+        const option = createElement(
+          body.ownerDocument as Document,
+          "button",
+          "llm-response-menu-item llm-reasoning-option",
+          {
+            type: "button",
+            textContent:
+              currentMode === mode.value
+                ? `\u2713 ${mode.label}`
+                : mode.label,
+          },
+        );
+        const applyClaudeSelection = (e: Event) => {
+          if (!isPrimaryPointerEvent(e)) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (!item) return;
+          setClaudeReasoningModePref(mode.value as any);
+          setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
+          updateReasoningButton();
+        };
+        option.addEventListener("pointerdown", applyClaudeSelection);
+        option.addEventListener("click", applyClaudeSelection);
+        reasoningMenu.appendChild(option);
+      }
+      return;
+    }
     if (!enabledLevels.length) {
       const offOption = createElement(
         body.ownerDocument as Document,
@@ -7181,7 +7244,8 @@ export function setupHandlers(
           e.stopPropagation();
           if (!item) return;
           if (isClaudeConversationSystem()) {
-            setClaudeReasoningModePref(level as any);
+            const nextMode = optionState.label === "Max" ? "max" : level;
+            setClaudeReasoningModePref(nextMode as any);
           } else {
             selectedReasoningCache.clear();
             selectedReasoningCache.set(item.id, level);

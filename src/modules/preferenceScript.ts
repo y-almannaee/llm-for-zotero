@@ -2015,7 +2015,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       const next =
         claudeCodeReasoningSelect.value === "low" ||
         claudeCodeReasoningSelect.value === "medium" ||
-        claudeCodeReasoningSelect.value === "high"
+        claudeCodeReasoningSelect.value === "high" ||
+        claudeCodeReasoningSelect.value === "xhigh" ||
+        claudeCodeReasoningSelect.value === "max"
           ? claudeCodeReasoningSelect.value
           : "auto";
       setClaudeReasoningModePref(next);

@@ -74,6 +74,7 @@ export type AgentRuntimeLike = Pick<
     source: "sdk" | "fallback";
   }>;
   refreshSlashCommands(force?: boolean): Promise<void>;
+  listEfforts(model?: string): Promise<string[]>;
   runExternalAction(
     name: string,
     input: unknown,
@@ -115,6 +116,10 @@ type ExternalSlashCommandDescriptor = {
   description: string;
   argumentHint?: string;
   source: "sdk" | "fallback";
+};
+
+type ExternalEffortInfo = {
+  efforts: string[];
 };
 
 const EXTERNAL_ACTION_PREFIX = "cc_tool::";
@@ -574,16 +579,26 @@ async function runExternalBridgeTurn(
     typeof params.request.reasoning?.level === "string"
       ? params.request.reasoning.level
       : "";
+  const claudeEffortLevel =
+    typeof params.request.claudeEffortLevel === "string"
+      ? params.request.claudeEffortLevel.trim().toLowerCase()
+      : "";
   const effort =
-    reasoningLevel === "xhigh"
-      ? "max"
-      : reasoningLevel === "high" ||
-          reasoningLevel === "medium" ||
-          reasoningLevel === "low"
-        ? reasoningLevel
-        : reasoningLevel === "default"
-          ? "auto"
-        : undefined;
+    claudeEffortLevel === "max" ||
+    claudeEffortLevel === "xhigh" ||
+    claudeEffortLevel === "high" ||
+    claudeEffortLevel === "medium" ||
+    claudeEffortLevel === "low"
+      ? claudeEffortLevel
+      : reasoningLevel === "xhigh"
+        ? "xhigh"
+        : reasoningLevel === "high" ||
+            reasoningLevel === "medium" ||
+            reasoningLevel === "low"
+          ? reasoningLevel
+          : reasoningLevel === "default"
+            ? "auto"
+            : undefined;
   const debugModeEnabled = false;
 
   const userTextRaw = params.request.userText || "";
@@ -1101,6 +1116,27 @@ async function fetchExternalTools(baseUrl: string): Promise<ExternalToolDescript
   return tools;
 }
 
+async function fetchExternalEfforts(
+  baseUrl: string,
+  model?: string,
+): Promise<ExternalEffortInfo> {
+  const sources = encodeURIComponent(getClaudeSettingSourcesByPref().join(","));
+  const modelParam = model?.trim() ? `&model=${encodeURIComponent(model.trim())}` : "";
+  const response = await fetch(`${normalizeBaseUrl(baseUrl)}/efforts?settingSources=${sources}${modelParam}`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(`Bridge HTTP ${response.status}`);
+  }
+  const json = await response.json() as { efforts?: unknown[] };
+  return {
+    efforts: Array.isArray(json.efforts)
+      ? json.efforts.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  };
+}
+
 async function fetchExternalCommands(baseUrl: string): Promise<ExternalSlashCommandDescriptor[]> {
   try {
     const sources = encodeURIComponent(getClaudeSettingSourcesByPref().join(","));
@@ -1339,6 +1375,7 @@ export function createExternalBackendBridgeRuntime(options: {
   let cachedSlashCommands: ExternalSlashCommandDescriptor[] = [];
   let slashCommandsCacheExpiresAt = 0;
   let slashCommandsRefreshInFlight: Promise<void> | null = null;
+  const cachedEffortsByModel = new Map<string, ExternalEffortInfo>();
   const SLASH_COMMANDS_CACHE_TTL_MS = 60_000;
   const conversationContextSignature = new Map<number, string>();
   const conversationScopeByKey = new Map<number, BridgeScope>();
@@ -1384,6 +1421,20 @@ export function createExternalBackendBridgeRuntime(options: {
       }
     })();
     await refreshInFlight;
+  };
+
+  const listEfforts = async (model?: string): Promise<string[]> => {
+    const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
+    if (!bridgeUrl || !isClaudeCodeModeEnabled()) {
+      return [];
+    }
+    const key = (model || "").trim().toLowerCase();
+    if (cachedEffortsByModel.has(key)) {
+      return cachedEffortsByModel.get(key)?.efforts || [];
+    }
+    const info = await fetchExternalEfforts(bridgeUrl, model);
+    cachedEffortsByModel.set(key, info);
+    return info.efforts;
   };
 
   const refreshSlashCommands = async (force = false): Promise<void> => {
@@ -1487,6 +1538,7 @@ export function createExternalBackendBridgeRuntime(options: {
     refreshExternalActions,
     listSlashCommandsSync,
     refreshSlashCommands,
+    listEfforts,
     runExternalAction: async (name, input, opts = {}) => {
       const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
       if (!bridgeUrl) {

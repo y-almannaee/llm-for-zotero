@@ -153,6 +153,7 @@ import { toFileUrl } from "../../utils/pathFileUrl";
 import { replaceOwnerAttachmentRefs } from "../../utils/attachmentRefStore";
 import { decorateAssistantCitationLinks } from "./assistantCitationLinks";
 import { getCoreAgentRuntime } from "../../agent/index";
+import { getClaudeReasoningModePref } from "../../claudeCode/prefs";
 import { getAgentRunTrace } from "../../agent/store/traceStore";
 import {
   applyHistoryCompression,
@@ -2938,6 +2939,17 @@ async function buildAgentRuntimeRequest(
     authMode: params.effectiveRequestConfig.authMode,
     providerProtocol: params.effectiveRequestConfig.providerProtocol,
     reasoning: params.effectiveRequestConfig.reasoning,
+    claudeEffortLevel:
+      typeof params.effectiveRequestConfig.reasoning?.level === "string"
+        ? ((params.effectiveRequestConfig.reasoning.level === "xhigh"
+            ? (getClaudeReasoningModePref() === "max" ? "max" : "xhigh")
+            : params.effectiveRequestConfig.reasoning.level) as
+            | "low"
+            | "medium"
+            | "high"
+            | "xhigh"
+            | "max")
+        : undefined,
     advanced: params.effectiveRequestConfig.advanced,
     history: params.history,
     item: params.item,

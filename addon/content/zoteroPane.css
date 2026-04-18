@@ -980,6 +980,9 @@
 
 .llm-standalone-search-results {
   flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 6px 8px 12px;
@@ -1005,9 +1008,7 @@
 .llm-standalone-search-item {
   appearance: none;
   -moz-appearance: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  display: block;
   width: 100%;
   padding: 7px 8px;
   border: none;
@@ -1019,6 +1020,15 @@
   text-align: left;
   cursor: pointer;
   line-height: 1.4;
+  box-sizing: border-box;
+}
+
+.llm-standalone-search-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
 }
 
 .llm-standalone-search-item:hover {

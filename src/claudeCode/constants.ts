@@ -10,6 +10,8 @@ export const CLAUDE_REASONING_OPTIONS = [
   "low",
   "medium",
   "high",
+  "xhigh",
+  "max",
 ] as const;
 export type ClaudeReasoningMode = (typeof CLAUDE_REASONING_OPTIONS)[number];
 
