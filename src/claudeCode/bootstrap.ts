@@ -26,6 +26,9 @@ function getBootstrapSettingsTemplate(): string {
       permissions: {
         defaultMode: "default",
       },
+      env: {
+        ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+      },
       enabledPlugins: {},
     },
     null,

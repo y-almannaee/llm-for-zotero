@@ -24,20 +24,17 @@ function getIOUtils(): IOUtilsLike | undefined {
   return (globalThis as unknown as { IOUtils?: IOUtilsLike }).IOUtils;
 }
 
-function getProfileDir(): string {
-  const zotero = Zotero as unknown as {
-    Profile?: { dir?: string };
-    DataDirectory?: { dir?: string };
-  };
-  const profileDir = zotero.Profile?.dir?.trim();
-  if (profileDir) return profileDir;
-  const dataDir = zotero.DataDirectory?.dir?.trim();
-  if (dataDir) return dataDir;
-  throw new Error("Cannot resolve Zotero profile directory for Claude project skills");
+function getHomeDir(): string {
+  const env = (globalThis as unknown as {
+    process?: { env?: Record<string, string | undefined> };
+  }).process?.env;
+  const home = env?.HOME?.trim() || env?.USERPROFILE?.trim() || "";
+  if (home) return home;
+  throw new Error("Cannot resolve home directory for Claude runtime root");
 }
 
 export function getClaudeRuntimeRootDir(): string {
-  return joinLocalPath(getProfileDir(), "agent-runtime");
+  return joinLocalPath(getHomeDir(), "Zotero", "agent-runtime");
 }
 
 export function getClaudeProjectDir(): string {

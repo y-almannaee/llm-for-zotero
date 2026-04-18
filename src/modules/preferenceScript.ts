@@ -1898,11 +1898,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       getServices()?.dirsvc?.get?.("Home", getNsIFile())?.path?.trim() ||
       (Zotero as unknown as { Profile?: { dir?: string } }).Profile?.dir?.trim() ||
       "";
-    const zoteroWithProfile = Zotero as unknown as { Profile?: { dir?: string } };
-    const profileDir = zoteroWithProfile.Profile?.dir || "";
-    const runtimeRoot = profileDir
-      ? joinLocalPath(profileDir, "agent-runtime")
-      : joinLocalPath(home || ".", "Zotero", "agent-runtime");
+    const runtimeRoot = joinLocalPath(home || ".", "Zotero", "agent-runtime");
     const projectClaudeDir = joinLocalPath(runtimeRoot, ".claude");
     const localScopesDir = joinLocalPath(runtimeRoot, "scopes");
     const localConversationDir = joinLocalPath(
