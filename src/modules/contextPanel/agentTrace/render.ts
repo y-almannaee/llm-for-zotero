@@ -2027,13 +2027,15 @@ function buildAgentTraceRequestSummary(
   const paperTitles = userMessage
     ? normalizePaperContexts(userMessage.paperContexts).map((entry) => entry.title)
     : [];
-  const fileNames = Array.isArray(userMessage?.attachments)
-    ? userMessage.attachments
+  const attachments = userMessage?.attachments;
+  const screenshotImages = userMessage?.screenshotImages;
+  const fileNames = Array.isArray(attachments)
+    ? attachments
         .filter((entry) => entry && entry.category !== "image")
         .map((entry) => entry.name)
     : [];
-  const screenshotCount = Array.isArray(userMessage?.screenshotImages)
-    ? userMessage.screenshotImages.filter(Boolean).length
+  const screenshotCount = Array.isArray(screenshotImages)
+    ? screenshotImages.filter(Boolean).length
     : 0;
   return {
     selectedTexts,
@@ -2253,8 +2255,9 @@ function toolContentLooksEmpty(content: unknown): boolean {
     "pages",
     "collections",
   ]) {
-    if (Array.isArray(record[key])) {
-      return record[key].length === 0;
+    const value = record[key];
+    if (Array.isArray(value)) {
+      return value.length === 0;
     }
   }
   return false;
@@ -2360,6 +2363,19 @@ function compactAgentTraceEvents(
   return compact;
 }
 
+function findLastReasoningDisplayItem(
+  items: AgentTraceDisplayItem[],
+  key: string,
+): Extract<AgentTraceDisplayItem, { type: "reasoning" }> | null {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.type === "reasoning" && item.key === key) {
+      return item;
+    }
+  }
+  return null;
+}
+
 export function buildAgentTraceDisplayItems(
   events: AgentRunEventRecord[],
   userMessage: Message | null | undefined,
@@ -2435,9 +2451,7 @@ export function buildAgentTraceDisplayItems(
           undefined;
         if (!text) break;
         const roundKey = `round:${entry.payload.round}`;
-        const existing = items.findLast(
-          (item) => item.type === "reasoning" && item.key === roundKey,
-        );
+        const existing = findLastReasoningDisplayItem(items, roundKey);
         if (existing && existing.type === "reasoning") {
           // Accumulate delta chunks; skip if already contained (dedup)
           const prev = existing.summary || "";
