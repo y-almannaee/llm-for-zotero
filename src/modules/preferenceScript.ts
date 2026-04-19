@@ -727,19 +727,24 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       const apiKeyOption = el(doc, "option") as HTMLOptionElement;
       apiKeyOption.value = "api_key";
       apiKeyOption.textContent = t("API Key");
+      apiKeyOption.selected = group.authMode === "api_key";
       const codexAppServerOption = el(doc, "option") as HTMLOptionElement;
       codexAppServerOption.value = "codex_app_server";
       codexAppServerOption.textContent = t("Codex App Server");
+      codexAppServerOption.selected = group.authMode === "codex_app_server";
       const codexOption = el(doc, "option") as HTMLOptionElement;
       codexOption.value = "codex_auth";
       codexOption.textContent = t("Codex Auth (Legacy)");
+      codexOption.selected = group.authMode === "codex_auth";
       const copilotOption = el(doc, "option") as HTMLOptionElement;
       copilotOption.value = "copilot_auth";
       copilotOption.textContent = t("GitHub Copilot");
+      copilotOption.selected = group.authMode === "copilot_auth";
       // [webchat] Add webchat option
       const webchatOption = el(doc, "option") as HTMLOptionElement;
       webchatOption.value = "webchat";
       webchatOption.textContent = t("WebChat");
+      webchatOption.selected = group.authMode === "webchat";
       authModeSelect.append(
         apiKeyOption,
         codexAppServerOption,
@@ -747,7 +752,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         copilotOption,
         webchatOption,
       );
-      authModeSelect.value = group.authMode;
       authModeSelect.addEventListener("change", () => {
         const nextAuthMode = normalizeAuthMode(authModeSelect.value);
         group.authMode = nextAuthMode;
@@ -847,14 +851,14 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           const option = el(doc, "option") as HTMLOptionElement;
           option.value = preset.id;
           option.textContent = preset.label;
+          option.selected = preset.id === selectedPresetId;
           providerPresetSelect.appendChild(option);
         }
         const customizedOption = el(doc, "option") as HTMLOptionElement;
         customizedOption.value = "customized";
         customizedOption.textContent = t("Customized");
+        customizedOption.selected = selectedPresetId === "customized";
         providerPresetSelect.appendChild(customizedOption);
-
-        providerPresetSelect.value = selectedPresetId;
         providerPresetSelect.addEventListener("change", () => {
           const nextPresetId = normalizeProviderPresetId(
             providerPresetSelect.value,
@@ -899,9 +903,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         const option = el(doc, "option") as HTMLOptionElement;
         option.value = protocol;
         option.textContent = getProviderProtocolSpec(protocol).label;
+        option.selected = protocol === group.providerProtocol;
         protocolSelect.appendChild(option);
       }
-      protocolSelect.value = group.providerProtocol;
       protocolSelect.disabled = protocolOptions.length <= 1;
       protocolSelect.addEventListener("change", () => {
         group.providerProtocol = resolveSelectedProtocol(
