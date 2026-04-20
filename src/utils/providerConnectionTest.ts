@@ -12,6 +12,8 @@ import {
 import { createAgentModelAdapter } from "../agent/model/factory";
 import type { AgentRuntimeRequest } from "../agent/types";
 import {
+  extractCodexAppServerThreadId,
+  extractCodexAppServerTurnId,
   getOrCreateCodexAppServerProcess,
   waitForCodexAppServerTurnCompletion,
 } from "./codexAppServerProcess";
@@ -69,7 +71,7 @@ function extractAnthropicText(data: unknown): string {
       if (!entry || typeof entry !== "object") return "";
       return (entry as { type?: unknown; text?: unknown }).type === "text" &&
         typeof (entry as { text?: unknown }).text === "string"
-        ? ((entry as { text: string }).text || "")
+        ? (entry as { text: string }).text || ""
         : "";
     })
     .join("");
@@ -80,9 +82,11 @@ function extractGeminiText(data: unknown): string {
   const candidates = (data as { candidates?: unknown }).candidates;
   if (!Array.isArray(candidates)) return "";
   const parts = (
-    candidates[0] as {
-      content?: { parts?: Array<{ text?: unknown }> };
-    } | undefined
+    candidates[0] as
+      | {
+          content?: { parts?: Array<{ text?: unknown }> };
+        }
+      | undefined
   )?.content?.parts;
   if (!Array.isArray(parts)) return "";
   return parts
@@ -218,7 +222,8 @@ export function getProviderConnectionCapabilityLabel(params: {
     authMode: params.authMode,
     providerProtocol: params.protocol,
   };
-  const capabilities = createAgentModelAdapter(request).getCapabilities(request);
+  const capabilities =
+    createAgentModelAdapter(request).getCapabilities(request);
   return describeAgentCapabilityClass(
     getAgentCapabilityClass({
       toolCalls: capabilities.toolCalls,
@@ -231,20 +236,30 @@ export async function runCodexAppServerConnectionTest(params: {
   modelName: string;
 }): Promise<{ reply: string; capabilityLabel: string }> {
   const proc = await getOrCreateCodexAppServerProcess("codex_app_server");
+  const reply = await proc.runTurnExclusive(async () => {
+    const threadResp = await proc.sendRequest("thread/start", {
+      model: params.modelName || undefined,
+      approvalPolicy: "never",
+    });
+    const threadId = extractCodexAppServerThreadId(threadResp);
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread ID");
+    }
 
-  const threadResp = await proc.sendRequest("thread/start", {
-    model: params.modelName || undefined,
-    approvalPolicy: "never",
-  }) as { thread: { id: string } };
+    const turnResp = await proc.sendRequest("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "Say OK" }],
+    });
+    const turnId = extractCodexAppServerTurnId(turnResp);
+    if (!turnId) {
+      throw new Error("Codex app-server did not return a turn ID");
+    }
 
-  const turnResp = await proc.sendRequest("turn/start", {
-    threadId: threadResp.thread.id,
-    input: [{ type: "text", text: "Say OK" }],
-  }) as { turn: { id: string } };
-
-  const reply = await waitForCodexAppServerTurnCompletion({
-    proc,
-    turnId: turnResp.turn.id,
+    return waitForCodexAppServerTurnCompletion({
+      proc,
+      turnId,
+      cacheKey: "codex_app_server",
+    });
   });
 
   const capabilityLabel = describeAgentCapabilityClass(

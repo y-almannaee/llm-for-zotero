@@ -4,26 +4,14 @@ import type {
   AgentModelStep,
 } from "../types";
 import type { AgentModelAdapter, AgentStepParams } from "./adapter";
-import type { AgentModelMessage } from "../types";
 import {
+  extractCodexAppServerThreadId,
+  extractCodexAppServerTurnId,
   getOrCreateCodexAppServerProcess,
   waitForCodexAppServerTurnCompletion,
 } from "../../utils/codexAppServerProcess";
-
-function extractLatestUserText(messages: AgentModelMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "user") continue;
-    if (typeof msg.content === "string") return msg.content;
-    if (Array.isArray(msg.content)) {
-      const textParts = msg.content
-        .filter((p: unknown) => (p as any)?.type === "text")
-        .map((p: unknown) => (p as any).text as string);
-      if (textParts.length > 0) return textParts.join("\n");
-    }
-  }
-  return "";
-}
+import { extractLatestCodexAppServerUserInput } from "../../utils/codexAppServerInput";
+import { isMultimodalRequestSupported } from "./messageBuilder";
 
 export class CodexAppServerAdapter implements AgentModelAdapter {
   private threadId: string | null = null;
@@ -37,7 +25,7 @@ export class CodexAppServerAdapter implements AgentModelAdapter {
     return {
       streaming: true,
       toolCalls: false,
-      multimodal: false,
+      multimodal: isMultimodalRequestSupported(_request),
       fileInputs: false,
       reasoning: false,
     };
@@ -53,29 +41,44 @@ export class CodexAppServerAdapter implements AgentModelAdapter {
   async runStep(params: AgentStepParams): Promise<AgentModelStep> {
     const request = params.request;
     const proc = await getOrCreateCodexAppServerProcess(this.processKey);
+    let text: string;
+    try {
+      text = await proc.runTurnExclusive(async () => {
+        if (!this.threadId) {
+          const threadResp = await proc.sendRequest("thread/start", {
+            model: request.model,
+            approvalPolicy: "never",
+          });
+          this.threadId = extractCodexAppServerThreadId(threadResp);
+          if (!this.threadId) {
+            throw new Error("Codex app-server did not return a thread ID");
+          }
+        }
+        const userInput = await extractLatestCodexAppServerUserInput(
+          params.messages,
+        );
 
-    if (!this.threadId) {
-      const threadResp = await proc.sendRequest("thread/start", {
-        model: request.model,
-        approvalPolicy: "never",
-      }) as { thread: { id: string } };
-      this.threadId = threadResp.thread.id;
+        const turnResp = await proc.sendRequest("turn/start", {
+          threadId: this.threadId,
+          input: userInput,
+        });
+        const turnId = extractCodexAppServerTurnId(turnResp);
+        if (!turnId) {
+          throw new Error("Codex app-server did not return a turn ID");
+        }
+
+        return waitForCodexAppServerTurnCompletion({
+          proc,
+          turnId,
+          onTextDelta: params.onTextDelta,
+          signal: params.signal,
+          cacheKey: this.processKey,
+        });
+      });
+    } catch (error) {
+      this.threadId = null;
+      throw error;
     }
-
-    const userText = extractLatestUserText(params.messages);
-
-    const turnResp = await proc.sendRequest("turn/start", {
-      threadId: this.threadId,
-      input: [{ type: "text", text: userText }],
-    }) as { turn: { id: string } };
-    const turnId = turnResp.turn.id;
-
-    const text = await waitForCodexAppServerTurnCompletion({
-      proc,
-      turnId,
-      onTextDelta: params.onTextDelta,
-      signal: params.signal,
-    });
 
     const assistantMessage = { role: "assistant" as const, content: text };
     return { kind: "final", text, assistantMessage };

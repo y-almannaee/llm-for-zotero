@@ -13,6 +13,7 @@ export class CodexAppServerProcess {
   private pendingRequests = new Map<number, PendingRequest>();
   private notificationHandlers = new Map<string, Set<NotificationHandler>>();
   private readLoopPromise: Promise<void> | null = null;
+  private turnQueue = Promise.resolve();
   private lineBuffer = "";
   private destroyed = false;
 
@@ -25,18 +26,26 @@ export class CodexAppServerProcess {
     let Subprocess: any;
     if (CU?.importESModule) {
       try {
-        const mod = CU.importESModule("resource://gre/modules/Subprocess.sys.mjs");
+        const mod = CU.importESModule(
+          "resource://gre/modules/Subprocess.sys.mjs",
+        );
         Subprocess = mod.Subprocess || mod.default || mod;
-      } catch { /* fallback */ }
+      } catch {
+        /* fallback */
+      }
     }
     if (!Subprocess?.call && CU?.import) {
       try {
         const mod = CU.import("resource://gre/modules/Subprocess.jsm");
         Subprocess = mod.Subprocess || mod;
-      } catch { /* fallback */ }
+      } catch {
+        /* fallback */
+      }
     }
     if (!Subprocess?.call) {
-      throw new Error("Subprocess module not available in this Zotero environment");
+      throw new Error(
+        "Subprocess module not available in this Zotero environment",
+      );
     }
 
     const info = getRuntimePlatformInfo();
@@ -93,13 +102,17 @@ export class CodexAppServerProcess {
           try {
             this.handleMessage(JSON.parse(trimmed));
           } catch {
-            Zotero.debug?.(`[llm-for-zotero] codex app-server: failed to parse line: ${trimmed}`);
+            Zotero.debug?.(
+              `[llm-for-zotero] codex app-server: failed to parse line: ${trimmed}`,
+            );
           }
         }
       }
       // Reject all pending requests on pipe close
       for (const [, pending] of this.pendingRequests) {
-        pending.reject(new Error("codex app-server process closed unexpectedly"));
+        pending.reject(
+          new Error("codex app-server process closed unexpectedly"),
+        );
       }
       this.pendingRequests.clear();
     })();
@@ -112,7 +125,9 @@ export class CodexAppServerProcess {
       if (!pending) return;
       this.pendingRequests.delete(id);
       if ("error" in msg) {
-        pending.reject(new Error(String((msg.error as any)?.message ?? msg.error)));
+        pending.reject(
+          new Error(String((msg.error as any)?.message ?? msg.error)),
+        );
       } else {
         pending.resolve(msg.result);
       }
@@ -120,13 +135,20 @@ export class CodexAppServerProcess {
       const handlers = this.notificationHandlers.get(msg.method);
       if (handlers) {
         for (const handler of handlers) {
-          try { handler(msg.params); } catch { /* ignore */ }
+          try {
+            handler(msg.params);
+          } catch {
+            /* ignore */
+          }
         }
       }
     }
   }
 
   sendRequest(method: string, params?: unknown): Promise<unknown> {
+    if (this.destroyed) {
+      return Promise.reject(new Error("CodexAppServerProcess destroyed"));
+    }
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pendingRequests.set(id, { resolve, reject });
@@ -141,10 +163,31 @@ export class CodexAppServerProcess {
   }
 
   sendNotification(method: string, params?: unknown): void {
+    if (this.destroyed) return;
     const msg = JSON.stringify({ method, params }) + "\n";
     try {
       (this.proc as any).stdin.write(msg);
-    } catch { /* ignore if process is gone */ }
+    } catch {
+      /* ignore if process is gone */
+    }
+  }
+
+  async runTurnExclusive<T>(callback: () => Promise<T>): Promise<T> {
+    const previous = this.turnQueue;
+    let release!: () => void;
+    this.turnQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      if (this.destroyed) {
+        throw new Error("CodexAppServerProcess destroyed");
+      }
+      return await callback();
+    } finally {
+      release();
+    }
   }
 
   onNotification(method: string, handler: NotificationHandler): () => void {
@@ -172,8 +215,40 @@ export class CodexAppServerProcess {
       pending.reject(new Error("CodexAppServerProcess destroyed"));
     }
     this.pendingRequests.clear();
-    try { (this.proc as any).kill(); } catch { /* ignore */ }
+    try {
+      (this.proc as any).kill();
+    } catch {
+      /* ignore */
+    }
   }
+}
+
+function extractCodexAppServerId(
+  result: unknown,
+  nestedKey: "thread" | "turn",
+): string {
+  if (!result || typeof result !== "object") return "";
+  const typed = result as {
+    id?: unknown;
+    thread?: { id?: unknown };
+    turn?: { id?: unknown };
+  };
+  if (typeof typed.id === "string" && typed.id.trim()) {
+    return typed.id.trim();
+  }
+  const nested = typed[nestedKey];
+  if (nested && typeof nested.id === "string" && nested.id.trim()) {
+    return nested.id.trim();
+  }
+  return "";
+}
+
+export function extractCodexAppServerThreadId(result: unknown): string {
+  return extractCodexAppServerId(result, "thread");
+}
+
+export function extractCodexAppServerTurnId(result: unknown): string {
+  return extractCodexAppServerId(result, "turn");
 }
 
 export function waitForCodexAppServerTurnCompletion(params: {
@@ -181,17 +256,25 @@ export function waitForCodexAppServerTurnCompletion(params: {
   turnId: string;
   onTextDelta?: (delta: string) => void | Promise<void>;
   signal?: AbortSignal;
+  cacheKey?: string;
 }): Promise<string> {
-  const { proc, turnId, onTextDelta, signal } = params;
+  const { proc, turnId, onTextDelta, signal, cacheKey } = params;
   return new Promise((resolve, reject) => {
     let accumulated = "";
     let settled = false;
+    const abortHandler = () => {
+      if (cacheKey) {
+        destroyCachedCodexAppServerProcess(cacheKey, proc);
+      }
+      settle(() => reject(new DOMException("Aborted", "AbortError")));
+    };
 
     function settle(fn: () => void) {
       if (settled) return;
       settled = true;
       unsubDelta();
       unsubCompleted();
+      signal?.removeEventListener("abort", abortHandler);
       fn();
     }
 
@@ -237,16 +320,12 @@ export function waitForCodexAppServerTurnCompletion(params: {
           return;
         }
         settle(() =>
-          reject(
-            new Error(`Turn ended with status: ${status ?? "unknown"}`),
-          ),
+          reject(new Error(`Turn ended with status: ${status ?? "unknown"}`)),
         );
       },
     );
 
-    signal?.addEventListener("abort", () => {
-      settle(() => reject(new DOMException("Aborted", "AbortError")));
-    });
+    signal?.addEventListener("abort", abortHandler, { once: true });
   });
 }
 
@@ -262,20 +341,27 @@ async function resolveCodexBinary(): Promise<string> {
   let Subprocess: any;
   if (CU?.importESModule) {
     try {
-      const mod = CU.importESModule("resource://gre/modules/Subprocess.sys.mjs");
+      const mod = CU.importESModule(
+        "resource://gre/modules/Subprocess.sys.mjs",
+      );
       Subprocess = mod.Subprocess || mod.default || mod;
-    } catch { /* fallback */ }
+    } catch {
+      /* fallback */
+    }
   }
   if (!Subprocess?.call && CU?.import) {
     try {
       const mod = CU.import("resource://gre/modules/Subprocess.jsm");
       Subprocess = mod.Subprocess || mod;
-    } catch { /* fallback */ }
+    } catch {
+      /* fallback */
+    }
   }
 
   if (Subprocess?.call) {
     try {
-      const lookupCmd = info.platform === "windows" ? "where codex" : "which codex";
+      const lookupCmd =
+        info.platform === "windows" ? "where codex" : "which codex";
       const proc = await Subprocess.call({
         command: info.shellPath,
         arguments: [info.shellFlag, lookupCmd],
@@ -287,42 +373,72 @@ async function resolveCodexBinary(): Promise<string> {
           if (!chunk) break;
           out += chunk;
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
       await proc.wait();
       const found = out.trim().split("\n")[0]?.trim();
       if (found) return found;
-    } catch { /* continue to fallback */ }
+    } catch {
+      /* continue to fallback */
+    }
   }
 
   // 3. Common install paths
-  const candidates = info.platform === "windows"
-    ? [
-        `${env.USERPROFILE ?? "C:\\Users\\User"}\\.cargo\\bin\\codex.exe`,
-        "C:\\Program Files\\codex\\codex.exe",
-      ]
-    : [
-        `${env.HOME ?? "~"}/.cargo/bin/codex`,
-        "/usr/local/bin/codex",
-        "/usr/bin/codex",
-      ];
+  const candidates =
+    info.platform === "windows"
+      ? [
+          `${env.USERPROFILE ?? "C:\\Users\\User"}\\.cargo\\bin\\codex.exe`,
+          "C:\\Program Files\\codex\\codex.exe",
+        ]
+      : [
+          `${env.HOME ?? "~"}/.cargo/bin/codex`,
+          "/usr/local/bin/codex",
+          "/usr/bin/codex",
+        ];
 
   const IOUtils = (globalThis as any).IOUtils;
   if (IOUtils?.exists) {
     for (const candidate of candidates) {
       try {
         if (await IOUtils.exists(candidate)) return candidate;
-      } catch { /* continue */ }
+      } catch {
+        /* continue */
+      }
     }
   }
 
   throw new Error(
-    'codex binary not found. Install Codex CLI (https://github.com/openai/codex) and ensure it is on your PATH, ' +
-    'or set the CODEX_PATH environment variable to the absolute path of the codex executable.',
+    "codex binary not found. Install Codex CLI (https://github.com/openai/codex) and ensure it is on your PATH, " +
+      "or set the CODEX_PATH environment variable to the absolute path of the codex executable.",
   );
 }
 
 // Per-auth-mode singleton processes
 const processCache = new Map<string, Promise<CodexAppServerProcess>>();
+
+export function destroyCachedCodexAppServerProcess(
+  cacheKey: string,
+  proc?: CodexAppServerProcess,
+): void {
+  const existing = processCache.get(cacheKey);
+  if (!existing) {
+    proc?.destroy();
+    return;
+  }
+
+  processCache.delete(cacheKey);
+  existing
+    .then((cachedProc) => {
+      if (proc && cachedProc !== proc) return;
+      cachedProc.destroy();
+    })
+    .catch(() => {
+      if (proc) {
+        proc.destroy();
+      }
+    });
+}
 
 export async function getOrCreateCodexAppServerProcess(
   cacheKey: string,

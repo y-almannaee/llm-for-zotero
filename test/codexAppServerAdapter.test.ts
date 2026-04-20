@@ -24,4 +24,11 @@ describe("CodexAppServerAdapter", function () {
     assert.isTrue(adapter.supportsTools(request));
     assert.isFalse(adapter.getCapabilities(request).toolCalls);
   });
+
+  it("advertises multimodal support for non-text-only models", function () {
+    const adapter = new CodexAppServerAdapter("codex_app_server");
+    const request = makeRequest();
+
+    assert.isTrue(adapter.getCapabilities(request).multimodal);
+  });
 });
