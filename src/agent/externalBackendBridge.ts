@@ -359,18 +359,6 @@ function getAgentPermissionModePref(): "safe" | "yolo" {
   }
 }
 
-function isAgentModeEnabled(): boolean {
-  if (getConversationSystemPref() === "claude_code") {
-    return true;
-  }
-  try {
-    const enabled = Zotero.Prefs.get(`${config.prefsPrefix}.enableAgentMode`, true);
-    return enabled === true || `${enabled || ""}`.toLowerCase() === "true";
-  } catch {
-    return false;
-  }
-}
-
 function isClaudeCodeModeEnabled(): boolean {
   try {
     const enabled = Zotero.Prefs.get(`${config.prefsPrefix}.enableClaudeCodeMode`, true);
@@ -378,6 +366,10 @@ function isClaudeCodeModeEnabled(): boolean {
   } catch {
     return false;
   }
+}
+
+function isClaudeBridgeActive(): boolean {
+  return getConversationSystemPref() === "claude_code" && isClaudeCodeModeEnabled();
 }
 
 function normalizeScopeType(value: unknown): BridgeScopeType | null {
@@ -1464,7 +1456,7 @@ export function createExternalBackendBridgeRuntime(options: {
 
   const listEfforts = async (model?: string): Promise<string[]> => {
     const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
-    if (!bridgeUrl || !isClaudeCodeModeEnabled()) {
+    if (!bridgeUrl || !isClaudeBridgeActive()) {
       return [];
     }
     const configKey = resolveCapabilityConfigKey();
@@ -1540,7 +1532,7 @@ export function createExternalBackendBridgeRuntime(options: {
 
   const listSlashCommandsSync = (): ExternalSlashCommandDescriptor[] => {
     const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
-    const hasBridge = !!bridgeUrl && isClaudeCodeModeEnabled();
+    const hasBridge = !!bridgeUrl && isClaudeBridgeActive();
     const count = cachedSlashCommands.length;
     dbg("listSlashCommandsSync called", { hasBridge, count, bridgeUrl });
     if (!hasBridge) {
@@ -1561,7 +1553,7 @@ export function createExternalBackendBridgeRuntime(options: {
     getRunTrace: (runId: string) => coreRuntime.getRunTrace(runId),
     getCapabilities: (request) => {
       const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
-      if (!bridgeUrl || !isAgentModeEnabled()) {
+      if (!bridgeUrl || !isClaudeBridgeActive()) {
         return coreRuntime.getCapabilities(request);
       }
       return {
@@ -1573,7 +1565,7 @@ export function createExternalBackendBridgeRuntime(options: {
       };
     },
     listExternalActionsSync: () => {
-      if (!normalizeBaseUrl(getBridgeUrl()) || !isAgentModeEnabled()) {
+      if (!normalizeBaseUrl(getBridgeUrl()) || !isClaudeBridgeActive()) {
         return [];
       }
       return cachedTools.map((tool) => ({
