@@ -4584,13 +4584,28 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
       const bubbleHeaderNodes: HTMLElement[] = [];
 
       if (hasModelName) {
+        const modelHeader = doc.createElement("div") as HTMLDivElement;
+        modelHeader.className = "llm-model-header";
+
         const modelName = doc.createElement("div") as HTMLDivElement;
         modelName.className = "llm-model-name";
         modelName.textContent = formatDisplayModelName(
           msg.modelName,
           msg.modelProviderLabel,
         );
-        bubbleHeaderNodes.push(modelName);
+        modelHeader.appendChild(modelName);
+
+        if (!hasAnswerText && msg.streaming && msg.modelProviderLabel === "Claude Code") {
+          const roseLoader = doc.createElement("span") as HTMLSpanElement;
+          roseLoader.className = "llm-rose-loader llm-rose-loader-inline";
+          mountClaudeRoseThreeLoader(
+            roseLoader,
+            msg.waitingAnimationStartedAt || msg.timestamp || Date.now(),
+          );
+          modelHeader.appendChild(roseLoader);
+        }
+
+        bubbleHeaderNodes.push(modelHeader);
       }
 
       const hasReasoningSummary = Boolean(msg.reasoningSummary?.trim());
@@ -4681,21 +4696,11 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
         bubble.insertBefore(bubbleHeaderNodes[i], bubble.firstChild);
       }
 
-      if (!hasAnswerText) {
+      if (!hasAnswerText && !(msg.streaming && msg.modelProviderLabel === "Claude Code")) {
         const typing = doc.createElement("div") as HTMLDivElement;
         typing.className = "llm-typing";
-        if (msg.streaming && msg.modelProviderLabel === "Claude Code") {
-          const roseLoader = doc.createElement("span") as HTMLSpanElement;
-          roseLoader.className = "llm-rose-loader";
-          mountClaudeRoseThreeLoader(
-            roseLoader,
-            msg.waitingAnimationStartedAt || msg.timestamp || Date.now(),
-          );
-          typing.append(roseLoader);
-        } else {
-          typing.innerHTML =
-            '<span class="llm-typing-dot"></span><span class="llm-typing-dot"></span><span class="llm-typing-dot"></span>';
-        }
+        typing.innerHTML =
+          '<span class="llm-typing-dot"></span><span class="llm-typing-dot"></span><span class="llm-typing-dot"></span>';
         bubble.appendChild(typing);
       }
     }
