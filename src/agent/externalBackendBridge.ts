@@ -1271,6 +1271,19 @@ export async function fetchExternalBridgeSessionInfo(params: {
         headers: { Accept: "application/json" },
       });
       if (!response.ok) {
+        if (response.status === 400 || response.status === 404) {
+          if (debugEnabled) {
+            dbg("session-info probe miss", {
+              source: candidate.source,
+              conversationKey,
+              queryScopeType: candidate.scopeType,
+              queryScopeId: candidate.scopeId,
+              queryScopeLabel: candidate.scopeLabel,
+              httpStatus: response.status,
+            });
+          }
+          return null;
+        }
         throw new Error(`Bridge HTTP ${response.status}`);
       }
       const json = (await response.json()) as {
@@ -1398,12 +1411,13 @@ export function createExternalBackendBridgeRuntime(options: {
   const conversationContextSignature = new Map<number, string>();
   const conversationScopeByKey = new Map<number, BridgeScope>();
   const TOOL_CACHE_TTL_MS = 5 * 60_000;
-  let lastToolConfigKey = "";
+  let lastCapabilityConfigKey = "";
 
-  const resolveToolConfigKey = (): string => {
+  const resolveCapabilityConfigKey = (): string => {
     const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
     const source = getClaudeConfigSourcePref();
-    return `${bridgeUrl}|${source}`;
+    const settingSources = getClaudeSettingSourcesCsvByPref();
+    return `${bridgeUrl}|${source}|${settingSources}`;
   };
 
   const refreshExternalActions = async (force = false): Promise<void> => {
@@ -1411,15 +1425,21 @@ export function createExternalBackendBridgeRuntime(options: {
     if (!bridgeUrl) {
       cachedTools = [];
       cacheExpiresAt = 0;
-      lastToolConfigKey = "";
+      cachedSlashCommands = [];
+      slashCommandsCacheExpiresAt = 0;
+      cachedEffortsByModel.clear();
+      lastCapabilityConfigKey = "";
       return;
     }
-    const configKey = resolveToolConfigKey();
-    if (configKey !== lastToolConfigKey) {
+    const configKey = resolveCapabilityConfigKey();
+    if (configKey !== lastCapabilityConfigKey) {
       force = true;
       cachedTools = [];
       cacheExpiresAt = 0;
-      lastToolConfigKey = configKey;
+      cachedSlashCommands = [];
+      slashCommandsCacheExpiresAt = 0;
+      cachedEffortsByModel.clear();
+      lastCapabilityConfigKey = configKey;
     }
     if (!force && Date.now() < cacheExpiresAt && cachedTools.length > 0) {
       return;
@@ -1447,7 +1467,16 @@ export function createExternalBackendBridgeRuntime(options: {
     if (!bridgeUrl || !isClaudeCodeModeEnabled()) {
       return [];
     }
-    const key = (model || "").trim().toLowerCase();
+    const configKey = resolveCapabilityConfigKey();
+    if (configKey !== lastCapabilityConfigKey) {
+      cachedTools = [];
+      cacheExpiresAt = 0;
+      cachedSlashCommands = [];
+      slashCommandsCacheExpiresAt = 0;
+      cachedEffortsByModel.clear();
+      lastCapabilityConfigKey = configKey;
+    }
+    const key = `${configKey}|${(model || "").trim().toLowerCase()}`;
     if (cachedEffortsByModel.has(key)) {
       return cachedEffortsByModel.get(key)?.efforts || [];
     }
@@ -1469,6 +1498,8 @@ export function createExternalBackendBridgeRuntime(options: {
       dbg("refreshSlashCommands: no bridgeUrl, clearing cache");
       cachedSlashCommands = [];
       slashCommandsCacheExpiresAt = 0;
+      cachedEffortsByModel.clear();
+      lastCapabilityConfigKey = "";
       return;
     }
     if (!force && Date.now() < slashCommandsCacheExpiresAt && cachedSlashCommands.length > 0) {
@@ -1604,18 +1635,21 @@ export function createExternalBackendBridgeRuntime(options: {
 
         if (outcome.kind === "fallback" && outcome.reason === "approval_required") {
           if (
-            tool?.requiresConfirmation &&
             opts.confirmationMode === "native_ui" &&
             typeof opts.requestConfirmation === "function"
           ) {
             const requestId = `ext-confirm-${Date.now()}`;
+            const riskLevel =
+              tool?.riskLevel === "high" || tool?.riskLevel === "medium" || tool?.riskLevel === "low"
+                ? tool.riskLevel
+                : "high";
             const pendingAction: AgentPendingAction = {
               toolName,
               title: `Approve ${toolName}`,
               mode: "approval",
               confirmLabel: "Run",
               cancelLabel: "Cancel",
-              description: `This action is marked as ${tool.riskLevel} risk.`,
+              description: `This action is marked as ${riskLevel} risk.`,
               fields: [],
             };
             onProgress({ type: "confirmation_required", requestId, action: pendingAction });

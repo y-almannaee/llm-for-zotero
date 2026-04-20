@@ -95,6 +95,7 @@ export type ClaudeBridgeScope = {
 
 const conversationScopeCache = new Map<number, ClaudeBridgeScope>();
 let bridgeRuntimeCache: AgentRuntimeLike | null = null;
+let bridgeRuntimeCoreRef: AgentRuntime | null = null;
 
 function getBridgeUrl(): string {
   return getClaudeBridgeUrl();
@@ -193,12 +194,18 @@ export function getRememberedClaudeConversationScope(
   return conversationScopeCache.get(Math.floor(conversationKey)) || null;
 }
 
+export function resetClaudeBridgeRuntime(): void {
+  bridgeRuntimeCache = null;
+  bridgeRuntimeCoreRef = null;
+}
+
 export function getClaudeBridgeRuntime(coreRuntime: AgentRuntime): AgentRuntimeLike {
-  if (!bridgeRuntimeCache) {
+  if (!bridgeRuntimeCache || bridgeRuntimeCoreRef !== coreRuntime) {
     bridgeRuntimeCache = createExternalBackendBridgeRuntime({
       coreRuntime,
       getBridgeUrl,
     });
+    bridgeRuntimeCoreRef = coreRuntime;
   }
   return bridgeRuntimeCache;
 }

@@ -1822,32 +1822,31 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
   if (agentBackendModeSelect) {
     const key = `${config.prefsPrefix}.agentBackendMode`;
-    agentBackendModeSelect.value = isClaudeCodeModeEnabled()
-      ? "claude_bridge"
-      : "disabled";
-    const syncAgentBackendUi = () => {
-      const enabled = normalizeAgentBackendMode(agentBackendModeSelect.value) === "claude_bridge";
+    const applyAgentBackendUi = (enabled: boolean) => {
       agentBackendModeSelect.value = enabled ? "claude_bridge" : "disabled";
+      if (agentBridgeSettingsWrap) {
+        agentBridgeSettingsWrap.style.display = enabled ? "flex" : "none";
+      }
+    };
+    applyAgentBackendUi(isClaudeCodeModeEnabled());
+    agentBackendModeSelect.addEventListener("change", () => {
+      const enabled = normalizeAgentBackendMode(agentBackendModeSelect.value) === "claude_bridge";
+      applyAgentBackendUi(enabled);
       setClaudeCodeModeEnabled(enabled);
       Zotero.Prefs.set(key, enabled ? "claude_bridge" : "disabled", true);
       if (!enabled) {
         setConversationSystemPref("upstream");
       }
-      if (agentBridgeSettingsWrap) {
-        agentBridgeSettingsWrap.style.display = enabled ? "flex" : "none";
-      }
-    };
-    syncAgentBackendUi();
-    agentBackendModeSelect.addEventListener("change", () => {
-      syncAgentBackendUi();
     });
   }
 
   if (agentBridgeUrlInput) {
     agentBridgeUrlInput.value = getClaudeBridgeUrl() || DEFAULT_AGENT_BRIDGE_URL;
-    agentBridgeUrlInput.addEventListener("input", () => {
+    const commitBridgeUrl = () => {
       setClaudeBridgeUrl(agentBridgeUrlInput.value);
-    });
+    };
+    agentBridgeUrlInput.addEventListener("change", commitBridgeUrl);
+    agentBridgeUrlInput.addEventListener("blur", commitBridgeUrl);
   }
 
   const copyTextToClipboard = async (text: string) => {

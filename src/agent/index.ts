@@ -12,24 +12,17 @@ import { initConversationMemoryStore } from "./store/conversationMemory";
 import { createAgentModelAdapter } from "./model/factory";
 import { createBuiltInActionRegistry, type ActionRegistry } from "./actions";
 import { registerMcpServer, unregisterMcpServer } from "./mcp/server";
-import {
-  createExternalBackendBridgeRuntime,
-  type AgentRuntimeLike,
-} from "./externalBackendBridge";
 import type {
   AgentConfirmationResolution,
   AgentEvent,
   AgentRuntimeRequest,
   AgentToolDefinition,
 } from "./types";
-import {
-  getClaudeBridgeUrl,
-  getConversationSystemPref,
-} from "../claudeCode/prefs";
+import { getConversationSystemPref } from "../claudeCode/prefs";
 import { getClaudeCommandCatalog } from "../claudeCode/commandCatalog";
+import { getClaudeBridgeRuntime, resetClaudeBridgeRuntime } from "../claudeCode/runtime";
 
 let runtime: AgentRuntime | null = null;
-let runtimeBridge: AgentRuntimeLike | null = null;
 let _actionRegistry: ActionRegistry | null = null;
 let _toolRegistry: ReturnType<typeof createBuiltInToolRegistry> | null = null;
 
@@ -59,18 +52,11 @@ export async function initAgentSubsystem(): Promise<AgentRuntime> {
     adapterFactory: (request) => createAgentModelAdapter(request),
   });
 
-  // Initialize action registry and MCP server
   _actionRegistry = createBuiltInActionRegistry();
   registerMcpServer({
     actionRegistry: _actionRegistry,
     toolRegistry: _toolRegistry,
     zoteroGateway: _zoteroGateway!,
-  });
-
-  runtimeBridge = createExternalBackendBridgeRuntime({
-    coreRuntime: runtime,
-    getBridgeUrl: () =>
-      getConversationSystemPref() === "claude_code" ? getClaudeBridgeUrl() : "",
   });
 
   return runtime;
@@ -80,7 +66,7 @@ export function shutdownAgentSubsystem(): void {
   unregisterMcpServer();
   _actionRegistry = null;
   _toolRegistry = null;
-  runtimeBridge = null;
+  resetClaudeBridgeRuntime();
   runtime = null;
   _zoteroGateway = null;
 }
@@ -93,10 +79,11 @@ export function getCoreAgentRuntime(): AgentRuntime {
 }
 
 export function getAgentRuntime(): AgentRuntime {
-  if (getConversationSystemPref() === "claude_code" && runtimeBridge) {
-    return runtimeBridge as unknown as AgentRuntime;
+  const coreRuntime = getCoreAgentRuntime();
+  if (getConversationSystemPref() === "claude_code") {
+    return getClaudeBridgeRuntime(coreRuntime) as unknown as AgentRuntime;
   }
-  return getCoreAgentRuntime();
+  return coreRuntime;
 }
 
 /**
