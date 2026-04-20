@@ -377,6 +377,7 @@ export type AgentRuntimeRequest = AgentRequest & {
   modelProviderLabel?: string;
   libraryID?: number;
   activeNoteContext?: ActiveNoteContext;
+  metadata?: Record<string, unknown>;
 };
 
 export type AgentRuntimeOutcome =

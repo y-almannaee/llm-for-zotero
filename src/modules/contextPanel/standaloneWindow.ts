@@ -49,7 +49,6 @@ import { clearOwnerAttachmentRefs } from "../../utils/attachmentRefStore";
 import { chatHistory, loadedConversationKeys } from "./state";
 import {
   loadConversationHistoryScope,
-  loadAllConversationHistory,
 } from "./historyLoader";
 import { resolveStandalonePaperTabLabel } from "./standaloneTabLabel";
 import { resolvePaperContextRefFromItem } from "./paperAttribution";
@@ -60,6 +59,10 @@ import {
   resolveRememberedClaudeConversationKey,
   refreshClaudeSlashCommands,
 } from "../../claudeCode/runtime";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
 import {
   createClaudeProjectSkillTemplate,
   deleteClaudeProjectSkillFile,
@@ -95,7 +98,6 @@ import {
 } from "../../claudeCode/store";
 import {
   loadClaudeConversationHistoryScope,
-  loadAllClaudeConversationHistory,
 } from "../../claudeCode/historyLoader";
 
 type StandaloneSessionState = {
@@ -199,6 +201,7 @@ function restoreEmbeddedPanelsAfterStandaloneClose(
   for (const [body] of activeContextPanels) {
     if (excludedBody && body === excludedBody) continue;
     if (!(body as Element).isConnected) {
+      void releaseClaudeRuntimeForBody(body as Element);
       activeContextPanels.delete(body);
       activeContextPanelRawItems.delete(body);
       activeContextPanelStateSync.delete(body);
@@ -1395,6 +1398,7 @@ export function openStandaloneChat(options?: {
 
           activeContextPanels.set(contentArea, () => activeItem);
           activeContextPanelRawItems.set(contentArea, mountedItem);
+          void retainClaudeRuntimeForBody(contentArea, mountedItem);
           const chatHooks: SetupHandlersHooks = {
             onConversationHistoryChanged: () => {
               if (cancelled) return;
@@ -1751,9 +1755,30 @@ export function openStandaloneChat(options?: {
       const runSearch = async (query: string) => {
         const thisSeq = ++searchSeq;
         try {
-          const allEntries: SidebarConv[] = isClaudeConversationSystem()
-            ? (await loadAllClaudeConversationHistory({
-                libraryID: getCurrentLibraryScopeID(),
+          const allEntries: SidebarConv[] = await (async () => {
+            if (isClaudeConversationSystem()) {
+              if (standaloneMode === "open") {
+                return (await loadClaudeConversationHistoryScope({
+                  libraryID: getCurrentLibraryScopeID(),
+                  kind: "global",
+                  limit: 100,
+                })).map((entry) => ({
+                  conversationKey: entry.conversationKey,
+                  lastActivityAt: entry.lastActivityAt,
+                  title: entry.title,
+                  paperItemID: entry.paperItemID,
+                  mode: entry.kind === "paper" ? "paper" : "open",
+                }));
+              }
+              const paperID = Number(currentBasePaperItem?.id || 0);
+              const paperLibID = Number(currentBasePaperItem?.libraryID || getCurrentLibraryScopeID());
+              if (!Number.isFinite(paperID) || paperID <= 0 || !Number.isFinite(paperLibID) || paperLibID <= 0) {
+                return [];
+              }
+              return (await loadClaudeConversationHistoryScope({
+                libraryID: paperLibID,
+                kind: "paper",
+                paperItemID: paperID,
                 limit: 100,
               })).map((entry) => ({
                 conversationKey: entry.conversationKey,
@@ -1761,8 +1786,11 @@ export function openStandaloneChat(options?: {
                 title: entry.title,
                 paperItemID: entry.paperItemID,
                 mode: entry.kind === "paper" ? "paper" : "open",
-              }))
-            : (await loadAllConversationHistory({
+              }));
+            }
+            if (standaloneMode === "open") {
+              return (await loadConversationHistoryScope({
+                mode: "open",
                 libraryID: getCurrentLibraryScopeID(),
                 limit: 100,
               })).map((entry) => ({
@@ -1773,6 +1801,26 @@ export function openStandaloneChat(options?: {
                 paperItemID: entry.paperItemID,
                 mode: entry.mode,
               }));
+            }
+            const paperID = Number(currentBasePaperItem?.id || 0);
+            const paperLibID = Number(currentBasePaperItem?.libraryID || getCurrentLibraryScopeID());
+            if (!Number.isFinite(paperID) || paperID <= 0 || !Number.isFinite(paperLibID) || paperLibID <= 0) {
+              return [];
+            }
+            return (await loadConversationHistoryScope({
+              mode: "paper",
+              libraryID: paperLibID,
+              paperItemID: paperID,
+              limit: 100,
+            })).map((entry) => ({
+              conversationKey: entry.conversationKey,
+              lastActivityAt: entry.lastActivityAt,
+              title: entry.title,
+              sessionVersion: entry.sessionVersion,
+              paperItemID: entry.paperItemID,
+              mode: entry.mode,
+            }));
+          })();
           if (thisSeq !== searchSeq || cancelled) return;
 
           if (!query.trim()) {
@@ -1835,8 +1883,15 @@ export function openStandaloneChat(options?: {
 
           if (thisSeq !== searchSeq || cancelled) return;
 
-          // Merge title matches + content matches
-          const allMatches: SidebarConv[] = [...titleMatches, ...contentMatches];
+          // Merge title matches + content matches, dedup by conversationKey
+          const dedupedMatches = new Map<number, SidebarConv>();
+          for (const entry of [...titleMatches, ...contentMatches]) {
+            const existing = dedupedMatches.get(entry.conversationKey);
+            if (!existing || entry.lastActivityAt > existing.lastActivityAt) {
+              dedupedMatches.set(entry.conversationKey, entry);
+            }
+          }
+          const allMatches: SidebarConv[] = Array.from(dedupedMatches.values());
           allMatches.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
           renderSearchResults(allMatches, query);
         } catch (err) {
@@ -2611,10 +2666,6 @@ export function openStandaloneChat(options?: {
             return;
           }
 
-          // Skip if the current conversation is already empty (no user messages)
-          const currentHistory = chatHistory.get(activeConversationKey) || [];
-          if (!currentHistory.some((m) => m.role === "user")) return;
-
           if (standaloneMode === "open") {
             const currentLibraryID = getCurrentLibraryScopeID();
             const newKey = isClaudeConversationSystem()
@@ -3159,6 +3210,7 @@ export function openStandaloneChat(options?: {
     );
     const contentArea = root?.querySelector(".llm-standalone-content");
     if (contentArea) {
+      void releaseClaudeRuntimeForBody(contentArea as Element);
       activeContextPanels.delete(contentArea);
       activeContextPanelRawItems.delete(contentArea);
       activeContextPanelStateSync.delete(contentArea);

@@ -240,6 +240,25 @@ export async function runClaudeTurn(
   return getClaudeBridgeRuntime(coreRuntime).runTurn(params);
 }
 
+export async function updateClaudeRuntimeRetention(
+  coreRuntime: AgentRuntime,
+  params: {
+    conversationKey: number;
+    scope?: ClaudeBridgeScope | null;
+    mountId: string;
+    retain: boolean;
+  },
+): Promise<void> {
+  const bridgeUrl = getBridgeUrl();
+  if (!bridgeUrl.trim()) return;
+  await getClaudeBridgeRuntime(coreRuntime).updateRuntimeRetention({
+    conversationKey: params.conversationKey,
+    scope: params.scope || undefined,
+    mountId: params.mountId,
+    retain: params.retain,
+  });
+}
+
 export async function fetchClaudeSessionInfo(
   conversationKey: number,
   scope?: ClaudeBridgeScope | null,

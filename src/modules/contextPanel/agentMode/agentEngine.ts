@@ -12,6 +12,18 @@ import type {
   AgentRunEventRecord,
   AgentRuntimeRequest,
 } from "../../../agent/types";
+
+function buildPendingAgentTraceEvents(): AgentRunEventRecord[] {
+  return [
+    {
+      runId: "pending",
+      seq: 1,
+      eventType: "status",
+      payload: { type: "status", text: "Starting Claude runtime" },
+      createdAt: Date.now(),
+    },
+  ];
+}
 import type {
   AdvancedModelParams,
   ChatAttachment,
@@ -273,79 +285,17 @@ export async function sendAgentTurn(
     attachments,
     forcedSkillIds,
   } = opts;
-  await deps.ensureConversationLoaded(item);
   const conversationKey = deps.getConversationKey(item);
-  const history = deps.chatHistory.get(conversationKey) || [];
-  const llmHistory = deps.buildLLMHistoryMessages(history.slice());
-  const effectiveRequestConfig = deps.resolveEffectiveRequestConfig({
-    item,
-    model,
-    apiBase,
-    apiKey,
-    authMode,
-    providerProtocol,
-    modelEntryId,
-    modelProviderLabel,
-    reasoning,
-    advanced,
-  });
+  const ui = deps.getPanelRequestUI(body);
+  const thisRequestId = deps.nextRequestId();
+  deps.setPendingRequestId(conversationKey, thisRequestId);
+  deps.setRequestUIBusy(body, ui, conversationKey, "Preparing agent...");
+
   const selectedTextsForMessage = deps.normalizeSelectedTexts(selectedTexts);
   const selectedTextSourcesForMessage = deps.normalizeSelectedTextSources(
     selectedTextSources,
     selectedTextsForMessage.length,
   );
-  const normalizedPaperContexts = deps.normalizePaperContexts(paperContexts);
-  const normalizedFullTextPaperContexts =
-    deps.normalizePaperContexts(fullTextPaperContexts);
-  const {
-    paperContexts: paperContextsForMessage,
-    fullTextPaperContexts: fullTextPaperContextsForMessage,
-  } = deps.includeAutoLoadedPaperContext(
-    item,
-    normalizedPaperContexts,
-    normalizedFullTextPaperContexts,
-  );
-  const runtimeRequest = await deps.buildAgentRuntimeRequest({
-    conversationKey,
-    item,
-    userText: question,
-    selectedTexts: selectedTextsForMessage,
-    selectedTextSources: selectedTextSourcesForMessage,
-    paperContexts: paperContextsForMessage,
-    fullTextPaperContexts: fullTextPaperContextsForMessage,
-    attachments,
-    screenshots: images,
-    forcedSkillIds,
-    effectiveRequestConfig,
-    history: llmHistory,
-  });
-  const agentRuntime = deps.getAgentRuntime();
-  const capabilities = agentRuntime.getCapabilities(runtimeRequest);
-  if (!capabilities.toolCalls) {
-    const fallback = await agentRuntime.runTurn({
-      request: runtimeRequest,
-    });
-    if (fallback.kind === "fallback") {
-      await deps.sendChatFallback({
-        body, item, question, images, model, apiBase, apiKey, reasoning, advanced,
-        displayQuestion, selectedTexts, selectedTextSources, selectedTextPaperContexts,
-        selectedTextNoteContexts, paperContexts, fullTextPaperContexts, attachments,
-        runtimeMode: "agent",
-        agentRunId: fallback.runId,
-        skipAgentDispatch: true,
-      });
-      return;
-    }
-  }
-
-  const ui = deps.getPanelRequestUI(body);
-  const thisRequestId = deps.nextRequestId();
-  deps.setPendingRequestId(conversationKey, thisRequestId);
-  const initialConversationKey = deps.getConversationKey(item);
-  deps.setRequestUIBusy(body, ui, initialConversationKey, "Preparing agent...");
-
-  const historyForRun = deps.chatHistory.get(conversationKey) || [];
-  const shownQuestion = displayQuestion || question;
   const selectedTextPaperContextsForMessage =
     deps.normalizeSelectedTextPaperContextsByIndex(
       selectedTextPaperContexts,
@@ -356,6 +306,7 @@ export async function sendAgentTurn(
       selectedTextNoteContexts,
       selectedTextsForMessage.length,
     );
+  const shownQuestion = displayQuestion || question;
   const screenshotImagesForMessage = Array.isArray(images)
     ? images
         .filter((entry): entry is string => typeof entry === "string")
@@ -363,6 +314,8 @@ export async function sendAgentTurn(
         .filter(Boolean)
         .slice(0, deps.maxSelectedImages)
     : [];
+
+  const historyForRun = deps.chatHistory.get(conversationKey) || [];
   const userMessage: Message = {
     role: "user",
     text: shownQuestion,
@@ -387,12 +340,6 @@ export async function sendAgentTurn(
       ? selectedTextNoteContextsForMessage
       : undefined,
     selectedTextExpandedIndex: -1,
-    paperContexts: paperContextsForMessage.length
-      ? paperContextsForMessage
-      : undefined,
-    fullTextPaperContexts: fullTextPaperContextsForMessage.length
-      ? fullTextPaperContextsForMessage
-      : undefined,
     paperContextsExpanded: false,
     screenshotImages: screenshotImagesForMessage.length
       ? screenshotImagesForMessage
@@ -411,12 +358,22 @@ export async function sendAgentTurn(
     selectedTexts: userMessage.selectedTexts,
     selectedTextSources: userMessage.selectedTextSources,
     selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
-    paperContexts: userMessage.paperContexts,
-    fullTextPaperContexts: userMessage.fullTextPaperContexts,
     screenshotImages: userMessage.screenshotImages,
     attachments: userMessage.attachments,
   });
 
+  const effectiveRequestConfig = deps.resolveEffectiveRequestConfig({
+    item,
+    model,
+    apiBase,
+    apiKey,
+    authMode,
+    providerProtocol,
+    modelEntryId,
+    modelProviderLabel,
+    reasoning,
+    advanced,
+  });
   const assistantMessage: Message = {
     role: "assistant",
     text: "",
@@ -428,6 +385,10 @@ export async function sendAgentTurn(
     streaming: true,
     waitingAnimationStartedAt:
       effectiveRequestConfig.modelProviderLabel === "Claude Code" ? Date.now() : undefined,
+    pendingAgentTraceEvents:
+      effectiveRequestConfig.modelProviderLabel === "Claude Code"
+        ? buildPendingAgentTraceEvents()
+        : undefined,
     reasoningOpen: false,
   };
   historyForRun.push(assistantMessage);
@@ -435,6 +396,68 @@ export async function sendAgentTurn(
     deps.createPanelUpdateHelpers(body, item, conversationKey, ui);
   const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
   refreshChatSafely();
+
+  await deps.ensureConversationLoaded(item);
+  const history = deps.chatHistory.get(conversationKey) || [];
+  const llmHistory = deps.buildLLMHistoryMessages(history.slice(0, -2));
+  const normalizedPaperContexts = deps.normalizePaperContexts(paperContexts);
+  const normalizedFullTextPaperContexts =
+    deps.normalizePaperContexts(fullTextPaperContexts);
+  const {
+    paperContexts: paperContextsForMessage,
+    fullTextPaperContexts: fullTextPaperContextsForMessage,
+  } = deps.includeAutoLoadedPaperContext(
+    item,
+    normalizedPaperContexts,
+    normalizedFullTextPaperContexts,
+  );
+  userMessage.paperContexts = paperContextsForMessage.length
+    ? paperContextsForMessage
+    : undefined;
+  userMessage.fullTextPaperContexts = fullTextPaperContextsForMessage.length
+    ? fullTextPaperContextsForMessage
+    : undefined;
+  await deps.updateStoredLatestUserMessage(conversationKey, {
+    text: userMessage.text,
+    timestamp: userMessage.timestamp,
+    runMode: "agent",
+    selectedText: userMessage.selectedText,
+    selectedTexts: userMessage.selectedTexts,
+    selectedTextSources: userMessage.selectedTextSources,
+    selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
+    selectedTextNoteContexts: userMessage.selectedTextNoteContexts,
+    paperContexts: userMessage.paperContexts,
+    fullTextPaperContexts: userMessage.fullTextPaperContexts,
+    screenshotImages: userMessage.screenshotImages,
+    attachments: userMessage.attachments,
+  });
+  const runtimeRequest = await deps.buildAgentRuntimeRequest({
+    conversationKey,
+    item,
+    userText: question,
+    selectedTexts: selectedTextsForMessage,
+    selectedTextSources: selectedTextSourcesForMessage,
+    paperContexts: paperContextsForMessage,
+    fullTextPaperContexts: fullTextPaperContextsForMessage,
+    attachments,
+    screenshots: images,
+    forcedSkillIds,
+    effectiveRequestConfig,
+    history: llmHistory,
+  });
+  const agentRuntime = deps.getAgentRuntime();
+  const capabilities = agentRuntime.getCapabilities(runtimeRequest);
+  if (!capabilities.toolCalls) {
+    historyForRun.pop();
+    await deps.sendChatFallback({
+      body, item, question, images, model, apiBase, apiKey, reasoning, advanced,
+      displayQuestion, selectedTexts, selectedTextSources, selectedTextPaperContexts,
+      selectedTextNoteContexts, paperContexts, fullTextPaperContexts, attachments,
+      runtimeMode: "agent",
+      skipAgentDispatch: true,
+    });
+    return;
+  }
 
   let assistantPersisted = false;
   const persistAssistantOnce = async () => {
@@ -482,6 +505,7 @@ export async function sendAgentTurn(
       signal: deps.currentAbortController(conversationKey)?.signal,
       onStart: async (runId) => {
         assistantMessage.agentRunId = runId;
+        assistantMessage.pendingAgentTraceEvents = undefined;
         userMessage.agentRunId = runId;
         deps.agentRunTraceCache.set(runId, []);
         refreshChatSafely();
@@ -506,6 +530,15 @@ export async function sendAgentTurn(
         }
         switch (event.type) {
           case "status":
+            if (!assistantMessage.agentRunId && assistantMessage.pendingAgentTraceEvents) {
+              assistantMessage.pendingAgentTraceEvents.push({
+                runId: "pending",
+                seq: assistantMessage.pendingAgentTraceEvents.length + 1,
+                eventType: event.type,
+                payload: event,
+                createdAt: Date.now(),
+              });
+            }
             setStatusSafely(event.text, "sending");
             break;
           case "reasoning": {
@@ -655,6 +688,10 @@ export async function retryAgentTurn(
   assistantMessage.reasoningSummary = undefined;
   assistantMessage.reasoningDetails = undefined;
   assistantMessage.reasoningOpen = deps.isReasoningExpandedByDefault();
+  assistantMessage.pendingAgentTraceEvents =
+    assistantMessage.modelProviderLabel === "Claude Code"
+      ? buildPendingAgentTraceEvents()
+      : undefined;
 
   const effectiveRequestConfig = deps.resolveEffectiveRequestConfig({
     item,
@@ -765,6 +802,7 @@ export async function retryAgentTurn(
       signal: deps.currentAbortController(conversationKey)?.signal,
       onStart: async (runId) => {
         assistantMessage.agentRunId = runId;
+        assistantMessage.pendingAgentTraceEvents = undefined;
         retryPair.userMessage.agentRunId = runId;
         deps.agentRunTraceCache.set(runId, []);
         refreshChatSafely();
@@ -789,6 +827,15 @@ export async function retryAgentTurn(
         }
         switch (event.type) {
           case "status":
+            if (!assistantMessage.agentRunId && assistantMessage.pendingAgentTraceEvents) {
+              assistantMessage.pendingAgentTraceEvents.push({
+                runId: "pending",
+                seq: assistantMessage.pendingAgentTraceEvents.length + 1,
+                eventType: event.type,
+                payload: event,
+                createdAt: Date.now(),
+              });
+            }
             setStatusSafely(event.text, "sending");
             break;
           case "reasoning": {

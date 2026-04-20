@@ -76,6 +76,10 @@ import {
   activeClaudeConversationModeByLibrary,
   activeClaudeGlobalConversationByLibrary,
 } from "../../claudeCode/state";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
 
 export { openStandaloneChat } from "./standaloneWindow";
 import {
@@ -144,6 +148,7 @@ export function registerReaderContextPanel() {
     onRender: ({ body, item }) => {
       // When standalone window is open, show placeholder instead of full UI
       if (isStandaloneWindowActive()) {
+        void releaseClaudeRuntimeForBody(body);
         renderStandalonePlaceholder(body);
         const resolvedState = resolveInitialPanelItemState(item);
         activeContextPanels.set(body, () => resolvedState.item);
@@ -208,6 +213,7 @@ export function registerReaderContextPanel() {
           buildUI(body, resolvedState.item);
           activeContextPanels.set(body, () => resolvedState.item);
           activeContextPanelRawItems.set(body, item || null);
+          void retainClaudeRuntimeForBody(body, resolvedState.item);
           // Attach handlers synchronously so buttons (lock, send, etc.) are
           // immediately interactive — don't gate on ensureConversationLoaded.
           setupHandlers(body, item);
@@ -228,6 +234,7 @@ export function registerReaderContextPanel() {
           // (e.g. Add Text) always resolve the active item.
           activeContextPanels.set(body, () => resolvedState.item);
           activeContextPanelRawItems.set(body, item || null);
+          void retainClaudeRuntimeForBody(body, resolvedState.item);
         }
       } catch { /* ignore */ }
     },
@@ -377,7 +384,9 @@ export function registerReaderSelectionTracking() {
           };
           for (const [panelBody] of activeContextPanels.entries()) {
             if (!(panelBody as Element).isConnected) {
+              void releaseClaudeRuntimeForBody(panelBody as Element);
               activeContextPanels.delete(panelBody);
+              activeContextPanelRawItems.delete(panelBody);
               activeContextPanelStateSync.delete(panelBody);
               continue;
             }

@@ -2387,6 +2387,22 @@ export function buildAgentTraceDisplayItems(
   let announcedWriting = false;
   let lastMeaningfulStatus: string | null = null;
   let reasoningStep = 1;
+  const sawSessionResume = events.some((entry) => {
+    const record = entry as unknown as {
+      eventType?: unknown;
+      payload?: { providerType?: unknown; payload?: unknown };
+    };
+    if (record.eventType !== "provider_event") return false;
+    if (!isAgentTraceRecord(record.payload)) return false;
+    if (record.payload.providerType !== "system") return false;
+    const providerPayload = isAgentTraceRecord(record.payload.payload)
+      ? record.payload.payload
+      : null;
+    return (
+      providerPayload?.subtype === "hook_started" &&
+      providerPayload?.hook_name === "SessionStart:resume"
+    );
+  });
 
   items.push({
     type: "message",
@@ -2415,6 +2431,15 @@ export function buildAgentTraceDisplayItems(
           isGenericAgentStatusText(statusText) ||
           statusText === lastMeaningfulStatus
         ) {
+          break;
+        }
+        const isResumeStatus =
+          statusText === "Running SessionStart:resume" ||
+          statusText === "Finished SessionStart:resume";
+        if (isResumeStatus && !sawSessionResume) {
+          break;
+        }
+        if (statusText === "Initializing Claude session" && !sawSessionResume) {
           break;
         }
         lastMeaningfulStatus = statusText;

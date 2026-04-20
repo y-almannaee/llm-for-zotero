@@ -1695,6 +1695,7 @@ type AssistantMessageSnapshot = Pick<
   | "modelName"
   | "modelEntryId"
   | "modelProviderLabel"
+  | "pendingAgentTraceEvents"
   | "reasoningSummary"
   | "reasoningDetails"
   | "reasoningOpen"
@@ -1724,6 +1725,9 @@ function takeAssistantSnapshot(message: Message): AssistantMessageSnapshot {
     modelName: message.modelName,
     modelEntryId: message.modelEntryId,
     modelProviderLabel: message.modelProviderLabel,
+    pendingAgentTraceEvents: message.pendingAgentTraceEvents
+      ? message.pendingAgentTraceEvents.map((entry) => ({ ...entry, payload: { ...entry.payload } }))
+      : undefined,
     reasoningSummary: message.reasoningSummary,
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: message.reasoningOpen,
@@ -1741,6 +1745,9 @@ function restoreAssistantSnapshot(
   message.modelName = snapshot.modelName;
   message.modelEntryId = snapshot.modelEntryId;
   message.modelProviderLabel = snapshot.modelProviderLabel;
+  message.pendingAgentTraceEvents = snapshot.pendingAgentTraceEvents
+    ? snapshot.pendingAgentTraceEvents.map((entry) => ({ ...entry, payload: { ...entry.payload } }))
+    : undefined;
   message.reasoningSummary = snapshot.reasoningSummary;
   message.reasoningDetails = snapshot.reasoningDetails;
   message.reasoningOpen = snapshot.reasoningOpen;
@@ -1765,6 +1772,7 @@ function finalizeCancelledAssistantMessage(
   message.reasoningOpen = hasReasoning
     ? message.reasoningOpen !== false
     : false;
+  message.pendingAgentTraceEvents = undefined;
   message.streaming = false;
   message.webchatRunState = undefined;
   message.webchatCompletionReason = null;
@@ -3007,6 +3015,9 @@ async function buildAgentRuntimeRequest(
     modelProviderLabel: params.effectiveRequestConfig.modelProviderLabel,
     libraryID: params.item.libraryID,
     activeNoteContext: buildActiveNoteRuntimeContext(params.item),
+    metadata: {
+      forceFreshSession: params.history.length === 0,
+    },
   };
 }
 
@@ -4464,13 +4475,16 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           ? history[index - 1]
           : null;
       const agentRunId = msg.agentRunId?.trim();
+      const traceEvents = agentRunId
+        ? getCachedAgentRunEvents(agentRunId)
+        : msg.pendingAgentTraceEvents || [];
       const agentTraceEl =
         msg.runMode === "agent"
           ? renderAgentTrace({
               doc,
               message: msg,
               userMessage: previousUserMessage,
-              events: getCachedAgentRunEvents(agentRunId),
+              events: traceEvents,
               onTraceMissing: agentRunId
                 ? () => {
                     void ensureAgentRunTraceLoaded(agentRunId, body, item);

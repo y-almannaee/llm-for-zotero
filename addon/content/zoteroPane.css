@@ -1951,18 +1951,23 @@
   align-items: center;
   min-width: 0;
   width: 100%;
+  overflow: hidden;
 }
 
 .llm-history-item-title {
-  flex: 1;
+  display: block;
+  flex: 1 1 auto;
   min-width: 0;
+  max-width: 100%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .llm-history-item-preview {
+  display: block;
   min-width: 0;
+  max-width: 100%;
   width: 100%;
   color: var(--fill-secondary);
   font-size: var(--llm-fs-10);
@@ -1971,6 +1976,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
   margin-top: 2px;
+}
+
+.llm-history-item-preview mark,
+.llm-history-item-title mark {
+  white-space: nowrap;
 }
 
 .llm-history-item-delete {

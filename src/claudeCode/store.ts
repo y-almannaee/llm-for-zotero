@@ -20,6 +20,12 @@ import {
   buildDefaultClaudeGlobalConversationKey,
   buildDefaultClaudePaperConversationKey,
 } from "./constants";
+import {
+  getLastAllocatedClaudeGlobalConversationKey,
+  getLastAllocatedClaudePaperConversationKey,
+  setLastAllocatedClaudeGlobalConversationKey,
+  setLastAllocatedClaudePaperConversationKey,
+} from "./prefs";
 
 const CLAUDE_MESSAGES_TABLE = "llm_for_zotero_claude_messages";
 const CLAUDE_MESSAGES_INDEX = "llm_for_zotero_claude_messages_conversation_idx";
@@ -990,6 +996,7 @@ export async function createClaudeGlobalConversation(
   if (!normalizedLibraryID) return null;
   const nextKey = Math.max(
     buildDefaultClaudeGlobalConversationKey(normalizedLibraryID),
+    (getLastAllocatedClaudeGlobalConversationKey() || 0) + 1,
     (await getMaxClaudeConversationKey("global")) + 1,
   );
   await upsertClaudeConversationSummary({
@@ -999,6 +1006,7 @@ export async function createClaudeGlobalConversation(
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
+  setLastAllocatedClaudeGlobalConversationKey(nextKey);
   return getClaudeConversationSummary(nextKey);
 }
 
@@ -1011,6 +1019,7 @@ export async function createClaudePaperConversation(
   if (!normalizedLibraryID || !normalizedPaperItemID) return null;
   const nextKey = Math.max(
     buildDefaultClaudePaperConversationKey(normalizedPaperItemID),
+    (getLastAllocatedClaudePaperConversationKey() || 0) + 1,
     (await getMaxClaudeConversationKey("paper")) + 1,
   );
   await upsertClaudeConversationSummary({
@@ -1021,6 +1030,7 @@ export async function createClaudePaperConversation(
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
+  setLastAllocatedClaudePaperConversationKey(nextKey);
   return getClaudeConversationSummary(nextKey);
 }
 

@@ -373,6 +373,10 @@ import {
   activeClaudePaperConversationByPaper,
   buildClaudePaperStateKey,
 } from "../../claudeCode/state";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
 import { isClaudeGlobalPortalItem } from "../../claudeCode/portal";
 import {
   clearClaudeConversation,
@@ -876,6 +880,7 @@ export function setupHandlers(
   const syncConversationIdentity = () => {
     conversationKey = item ? getConversationKey(item) : null;
     activeContextPanels.set(body, () => item);
+    void retainClaudeRuntimeForBody(body, item);
     if ((body as HTMLElement).dataset?.standalone === "true") {
       activeContextPanelRawItems.set(body, item || null);
     }
@@ -3721,12 +3726,17 @@ export function setupHandlers(
       historyMenu.appendChild(loadingRow);
       return;
     }
-    const searchResults = searchActive
+    const rawSearchResults = searchActive
       ? buildHistorySearchResults(allEntries, normalizedSearchQuery)
       : [];
-    const searchResultsByKey = new Map<number, HistorySearchResult>(
-      searchResults.map((result) => [result.entry.conversationKey, result]),
-    );
+    const searchResultsByKey = new Map<number, HistorySearchResult>();
+    for (const result of rawSearchResults) {
+      const existing = searchResultsByKey.get(result.entry.conversationKey);
+      if (!existing || result.matchCount > existing.matchCount) {
+        searchResultsByKey.set(result.entry.conversationKey, result);
+      }
+    }
+    const searchResults = Array.from(searchResultsByKey.values());
     const filteredEntries = searchActive
       ? searchResults.map((result) => result.entry)
       : allEntries;
@@ -5739,11 +5749,11 @@ export function setupHandlers(
         return;
       }
 
-      // Create new session directly in whichever mode is currently active
+      // Create a truly fresh session in whichever mode is currently active.
       if (isGlobalMode()) {
-        void createAndSwitchGlobalConversation();
+        void createAndSwitchGlobalConversation(true);
       } else {
-        void createAndSwitchPaperConversation();
+        void createAndSwitchPaperConversation(true);
       }
     });
   }
@@ -5754,7 +5764,7 @@ export function setupHandlers(
       e.stopPropagation();
       if (isNoteSession()) return;
       closeHistoryNewMenu();
-      void createAndSwitchGlobalConversation();
+      void createAndSwitchGlobalConversation(true);
     });
   }
 
@@ -5765,7 +5775,7 @@ export function setupHandlers(
       if (isNoteSession()) return;
       if (historyNewPaperBtn.disabled) return;
       closeHistoryNewMenu();
-      void createAndSwitchPaperConversation();
+      void createAndSwitchPaperConversation(true);
     });
   }
 

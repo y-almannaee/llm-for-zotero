@@ -66,6 +66,7 @@ export interface Message {
   streaming?: boolean;
   pendingFinalText?: string;
   waitingAnimationStartedAt?: number;
+  pendingAgentTraceEvents?: import("../../agent/types").AgentRunEventRecord[];
   reasoningSummary?: string;
   reasoningDetails?: string;
   reasoningOpen?: boolean;

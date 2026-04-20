@@ -29,6 +29,13 @@ function getStringPref(key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+function getNumberPref(key: string): number | null {
+  const value = getZoteroPrefs()?.get?.(prefKey(key), true);
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
 function setPref(key: string, value: unknown): void {
   getZoteroPrefs()?.set?.(prefKey(key), value, true);
 }
@@ -212,4 +219,28 @@ export function removeLastUsedClaudePaperConversationKey(
   const map = getJsonPref("claudeCodePaperConversationMap");
   delete map[buildPaperConversationMapKey(libraryID, paperItemID)];
   setJsonPref("claudeCodePaperConversationMap", map);
+}
+
+export function getLastAllocatedClaudeGlobalConversationKey(): number | null {
+  return getNumberPref("claudeCodeLastAllocatedGlobalConversationKey");
+}
+
+export function setLastAllocatedClaudeGlobalConversationKey(conversationKey: number): void {
+  if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
+  const current = getLastAllocatedClaudeGlobalConversationKey() || 0;
+  const normalized = Math.floor(conversationKey);
+  if (normalized <= current) return;
+  setPref("claudeCodeLastAllocatedGlobalConversationKey", normalized);
+}
+
+export function getLastAllocatedClaudePaperConversationKey(): number | null {
+  return getNumberPref("claudeCodeLastAllocatedPaperConversationKey");
+}
+
+export function setLastAllocatedClaudePaperConversationKey(conversationKey: number): void {
+  if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
+  const current = getLastAllocatedClaudePaperConversationKey() || 0;
+  const normalized = Math.floor(conversationKey);
+  if (normalized <= current) return;
+  setPref("claudeCodeLastAllocatedPaperConversationKey", normalized);
 }

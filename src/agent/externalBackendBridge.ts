@@ -75,6 +75,12 @@ export type AgentRuntimeLike = Pick<
   }>;
   refreshSlashCommands(force?: boolean): Promise<void>;
   listEfforts(model?: string): Promise<string[]>;
+  updateRuntimeRetention(params: {
+    conversationKey: number;
+    scope?: BridgeScope;
+    mountId: string;
+    retain: boolean;
+  }): Promise<RuntimeRetentionResponse | null>;
   runExternalAction(
     name: string,
     input: unknown,
@@ -120,6 +126,12 @@ type ExternalSlashCommandDescriptor = {
 
 type ExternalEffortInfo = {
   efforts: string[];
+};
+
+type RuntimeRetentionResponse = {
+  originalConversationKey: string;
+  scopedConversationKey: string;
+  retained: boolean;
 };
 
 const EXTERNAL_ACTION_PREFIX = "cc_tool::";
@@ -503,6 +515,33 @@ function normalizeBaseUrl(url: string): string {
   return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
 }
 
+async function updateExternalRuntimeRetention(params: {
+  baseUrl: string;
+  conversationKey: number;
+  scope?: BridgeScope;
+  mountId: string;
+  retain: boolean;
+}): Promise<RuntimeRetentionResponse | null> {
+  const normalized = normalizeBaseUrl(params.baseUrl);
+  if (!normalized) return null;
+  const response = await fetch(`${normalized}/runtime-retention`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      conversationKey: params.conversationKey,
+      scopeType: params.scope?.scopeType,
+      scopeId: params.scope?.scopeId,
+      scopeLabel: params.scope?.scopeLabel,
+      mountId: params.mountId,
+      retain: params.retain,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Bridge HTTP ${response.status}`);
+  }
+  return (await response.json()) as unknown as RuntimeRetentionResponse;
+}
+
 function toExternalActionName(toolName: string): string {
   return `${EXTERNAL_ACTION_PREFIX}${toolName}`;
 }
@@ -601,6 +640,10 @@ async function runExternalBridgeTurn(
     ? probeStrippedText || "Permission probe run."
     : userTextRaw;
 
+  const requestMetadata =
+    params.request.metadata && typeof params.request.metadata === "object"
+      ? params.request.metadata
+      : undefined;
   const payload = {
     conversationKey: params.request.conversationKey,
     userText: userTextForBridge,
@@ -609,6 +652,7 @@ async function runExternalBridgeTurn(
     scopeLabel: params.scope?.scopeLabel,
     runtimeRequest: params.runtimeRequest,
     metadata: {
+      ...requestMetadata,
       runType: "chat",
       claudeConfigSource: getClaudeConfigSourcePref(),
       claudeSettingSources: getClaudeSettingSourcesByPref(),
@@ -1583,6 +1627,19 @@ export function createExternalBackendBridgeRuntime(options: {
     listSlashCommandsSync,
     refreshSlashCommands,
     listEfforts,
+    updateRuntimeRetention: async ({ conversationKey, scope, mountId, retain }) => {
+      const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
+      if (!bridgeUrl || !isClaudeBridgeActive()) {
+        return null;
+      }
+      return updateExternalRuntimeRetention({
+        baseUrl: bridgeUrl,
+        conversationKey,
+        scope,
+        mountId,
+        retain,
+      });
+    },
     runExternalAction: async (name, input, opts = {}) => {
       const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
       if (!bridgeUrl) {
