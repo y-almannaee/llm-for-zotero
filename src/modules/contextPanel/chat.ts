@@ -960,6 +960,9 @@ function formatDisplayModelName(
   if (provider.includes("(codex auth)")) {
     return `codex/${normalizedModel}`;
   }
+  if (provider.includes("(app server)")) {
+    return `codex-app/${normalizedModel}`;
+  }
   if (provider.includes("(copilot auth)")) {
     return `copilot/${normalizedModel}`;
   }
@@ -4156,6 +4159,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           ? history[index - 1]
           : null;
       const agentRunId = msg.agentRunId?.trim();
+      let agentUsesInterleavedText = false;
       const agentTraceEl =
         msg.runMode === "agent"
           ? renderAgentTrace({
@@ -4168,9 +4172,10 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
                     void ensureAgentRunTraceLoaded(agentRunId, body, item);
                   }
                 : undefined,
+              onInterleavedText: () => { agentUsesInterleavedText = true; },
             })
           : null;
-      if (hasAnswerText) {
+      if (hasAnswerText && !agentUsesInterleavedText) {
         const safeText = sanitizeText(msg.text);
         if (msg.streaming) bubble.classList.add("streaming");
         try {
@@ -4367,7 +4372,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
         bubble.insertBefore(bubbleHeaderNodes[i], bubble.firstChild);
       }
 
-      if (!hasAnswerText) {
+      if (!hasAnswerText || (agentUsesInterleavedText && msg.streaming)) {
         const typing = doc.createElement("div") as HTMLDivElement;
         typing.className = "llm-typing";
         typing.innerHTML =
