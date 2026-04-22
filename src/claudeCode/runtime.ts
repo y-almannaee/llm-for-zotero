@@ -253,16 +253,18 @@ export async function updateClaudeRuntimeRetention(
     scope?: ClaudeBridgeScope | null;
     mountId: string;
     retain: boolean;
+    probeId?: string;
   },
-): Promise<void> {
+): Promise<boolean> {
   const bridgeUrl = getBridgeUrl();
-  if (!bridgeUrl.trim()) return;
+  if (!bridgeUrl.trim()) return false;
   await getClaudeBridgeRuntime(coreRuntime).updateRuntimeRetention({
     conversationKey: params.conversationKey,
     scope: params.scope || undefined,
     mountId: params.mountId,
     retain: params.retain,
   });
+  return true;
 }
 
 export async function invalidateClaudeConversationSession(

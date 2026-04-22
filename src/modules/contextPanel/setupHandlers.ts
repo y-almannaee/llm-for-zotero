@@ -341,6 +341,7 @@ import {
   parseZoteroItemDragData,
 } from "./setupHandlers/controllers/fileIntakeController";
 import { createSendFlowController } from "./setupHandlers/controllers/sendFlowController";
+import { unregisterPanelDebugHarness } from "./debugHarness";
 import { createClearConversationController } from "./setupHandlers/controllers/clearConversationController";
 import { clearAllAgentToolCaches } from "../../agent/tools";
 import { renderShortcuts } from "./shortcuts";
@@ -1020,36 +1021,6 @@ export function setupHandlers(
       if (isClaudeConversationSystem()) {
         activeClaudeConversationModeByLibrary.set(libraryID, mode);
         setLastUsedClaudeConversationMode(libraryID, mode);
-        if (mode === "paper") {
-          const normalizedConversationKey = Number.isFinite(conversationKey)
-            ? Math.floor(conversationKey as number)
-            : 0;
-          if (normalizedConversationKey > 0 && currentBasePaperItemID > 0) {
-            rememberClaudeConversationSelection({
-              conversationKey: normalizedConversationKey,
-              kind: "paper",
-              libraryID,
-              paperItemID: Math.floor(currentBasePaperItemID),
-            });
-            void touchClaudeConversation(normalizedConversationKey, {
-              updatedAt: Date.now(),
-            });
-          }
-        } else {
-          const normalizedConversationKey = Number.isFinite(conversationKey)
-            ? Math.floor(conversationKey as number)
-            : 0;
-          if (normalizedConversationKey > 0) {
-            rememberClaudeConversationSelection({
-              conversationKey: normalizedConversationKey,
-              kind: "global",
-              libraryID,
-            });
-            void touchClaudeConversation(normalizedConversationKey, {
-              updatedAt: Date.now(),
-            });
-          }
-        }
       } else {
         activeConversationModeByLibrary.set(libraryID, mode);
         if (mode === "global") {
@@ -4443,6 +4414,14 @@ export function setupHandlers(
         );
     item = nextItem as any;
     syncConversationIdentity();
+    rememberClaudeConversationSelection({
+      conversationKey: normalizedConversationKey,
+      kind: "global",
+      libraryID,
+    });
+    void touchClaudeConversation(normalizedConversationKey, {
+      updatedAt: Date.now(),
+    });
     activeEditSession = null;
     inlineEditCleanup?.();
     setInlineEditCleanup(null);
@@ -4516,9 +4495,10 @@ export function setupHandlers(
         targetSummary = await ensureClaudePaperConversation(libraryID, paperItemID);
       }
       if (!targetSummary) return;
+      const resolvedConversationKey = Math.floor(targetSummary.conversationKey);
       item = createClaudePaperPortalItem(
         paperItem,
-        Math.floor(targetSummary.conversationKey),
+        resolvedConversationKey,
       ) as any;
     } else {
       let targetSummary =
@@ -4567,6 +4547,17 @@ export function setupHandlers(
       item = nextItem as any;
     }
     syncConversationIdentity();
+    if (isClaudeConversationSystem()) {
+      rememberClaudeConversationSelection({
+        conversationKey: Math.floor(getConversationKey(item as Zotero.Item)),
+        kind: "paper",
+        libraryID,
+        paperItemID,
+      });
+      void touchClaudeConversation(Math.floor(getConversationKey(item as Zotero.Item)), {
+        updatedAt: Date.now(),
+      });
+    }
     activeEditSession = null;
     inlineEditCleanup?.();
     setInlineEditCleanup(null);
@@ -13300,6 +13291,7 @@ export function setupHandlers(
     const observer = new MutationObserver(() => {
       if (body.isConnected) return;
       unregisterClaudeQueuedInputThreadBody(registeredClaudeQueueThreadKey, body);
+      unregisterPanelDebugHarness(body);
       activeContextPanelStateSync.delete(body);
       observer.disconnect();
       cleanupBody.__llmQueuedThreadCleanupRegistered = false;

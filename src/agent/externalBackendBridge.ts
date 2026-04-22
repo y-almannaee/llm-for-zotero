@@ -81,6 +81,7 @@ export type AgentRuntimeLike = Pick<
     scope?: BridgeScope;
     mountId: string;
     retain: boolean;
+    probeId?: string;
   }): Promise<RuntimeRetentionResponse | null>;
   invalidateSession(params: {
     conversationKey: number;
@@ -573,6 +574,7 @@ async function updateExternalRuntimeRetention(params: {
   scope?: BridgeScope;
   mountId: string;
   retain: boolean;
+  probeId?: string;
 }): Promise<RuntimeRetentionResponse | null> {
   const normalized = normalizeBaseUrl(params.baseUrl);
   if (!normalized) return null;
@@ -586,6 +588,7 @@ async function updateExternalRuntimeRetention(params: {
       scopeLabel: params.scope?.scopeLabel,
       mountId: params.mountId,
       retain: params.retain,
+      probeId: params.probeId,
     }),
   });
   if (!response.ok) {
@@ -1720,7 +1723,7 @@ export function createExternalBackendBridgeRuntime(options: {
     listSlashCommandsSync,
     refreshSlashCommands,
     listEfforts,
-    updateRuntimeRetention: async ({ conversationKey, scope, mountId, retain }) => {
+    updateRuntimeRetention: async ({ conversationKey, scope, mountId, retain, probeId }) => {
       const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
       if (!bridgeUrl) {
         return null;
@@ -1731,6 +1734,7 @@ export function createExternalBackendBridgeRuntime(options: {
         scope,
         mountId,
         retain,
+        probeId,
       });
     },
     invalidateSession: async ({ conversationKey, scope, metadata }) => {

@@ -3105,7 +3105,6 @@ async function buildAgentRuntimeRequest(
     libraryID: params.item.libraryID,
     activeNoteContext: buildActiveNoteRuntimeContext(params.item),
     metadata: {
-      forceFreshSession: params.history.length === 0,
       claudeAutoCompactEligible:
         params.effectiveRequestConfig.modelProviderLabel === "Claude Code" &&
         isClaudeAutoCompactEnabled() &&
@@ -3300,14 +3299,23 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     chatHistory.set(provisionalConversationKey, []);
   }
   const provisionalHistory = chatHistory.get(provisionalConversationKey)!;
-  const optimisticUserMessage: Message = {
+  const reuseAgentFallbackPlaceholder = runtimeMode === "agent" && skipAgentDispatch;
+  const existingFallbackUser =
+    reuseAgentFallbackPlaceholder && provisionalHistory.length >= 2
+      ? provisionalHistory[provisionalHistory.length - 2]
+      : null;
+  const existingFallbackAssistant =
+    reuseAgentFallbackPlaceholder && provisionalHistory.length >= 1
+      ? provisionalHistory[provisionalHistory.length - 1]
+      : null;
+  const optimisticUserMessage: Message = existingFallbackUser || {
     role: "user",
     text: shownQuestion,
     timestamp: Date.now(),
     runMode: runtimeMode,
     agentRunId: agentRunId || undefined,
   };
-  const optimisticAssistantMessage: Message = {
+  const optimisticAssistantMessage: Message = existingFallbackAssistant || {
     role: "assistant",
     text: "",
     timestamp: Date.now(),
@@ -3318,7 +3326,9 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     waitingAnimationStartedAt: Date.now(),
     reasoningOpen: isReasoningExpandedByDefault(),
   };
-  provisionalHistory.push(optimisticUserMessage, optimisticAssistantMessage);
+  if (!reuseAgentFallbackPlaceholder) {
+    provisionalHistory.push(optimisticUserMessage, optimisticAssistantMessage);
+  }
   const optimisticHelpers = createPanelUpdateHelpers(
     body,
     item,
@@ -3330,7 +3340,7 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
 
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
-  if (conversationKey !== provisionalConversationKey) {
+  if (conversationKey !== provisionalConversationKey && !reuseAgentFallbackPlaceholder) {
     const oldHistory = chatHistory.get(provisionalConversationKey) || [];
     if (oldHistory.length >= 2) {
       oldHistory.splice(Math.max(0, oldHistory.length - 2), 2);
@@ -3342,7 +3352,16 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     chatHistory.set(conversationKey, []);
   }
   const history = chatHistory.get(conversationKey)!;
-  const historyForLLM = history.slice();
+  const reuseOptimisticPair =
+    !reuseAgentFallbackPlaceholder &&
+    conversationKey === provisionalConversationKey &&
+    history === provisionalHistory &&
+    history.length >= 2 &&
+    history[history.length - 2] === optimisticUserMessage &&
+    history[history.length - 1] === optimisticAssistantMessage;
+  const historyForLLM = reuseOptimisticPair
+    ? history.slice(0, -2)
+    : history.slice();
   const requestFileAttachments = normalizeModelFileAttachments(attachments);
   const effectiveRequestConfig = resolveEffectiveRequestConfig({
     item,
@@ -3429,7 +3448,11 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     screenshotActiveIndex: 0,
     attachments: attachments?.length ? attachments : undefined,
   };
-  history.push(userMessage);
+  if (reuseOptimisticPair) {
+    history[history.length - 2] = userMessage;
+  } else {
+    history.push(userMessage);
+  }
   void persistConversationMessage(conversationKey, {
     role: "user",
     text: userMessage.text,

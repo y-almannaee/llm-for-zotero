@@ -80,6 +80,7 @@ import {
   retainClaudeRuntimeForBody,
   releaseClaudeRuntimeForBody,
 } from "../../claudeCode/runtimeRetention";
+import { unregisterPanelDebugHarness } from "./debugHarness";
 
 export { openStandaloneChat } from "./standaloneWindow";
 import {
@@ -249,7 +250,6 @@ export function registerReaderContextPanel() {
 
       const resolvedInitialState = resolveInitialPanelItemState(item);
       const resolvedItem = resolvedInitialState.item;
-      const basePaperItem = resolvedInitialState.basePaperItem;
 
       // If onRender already did the synchronous buildUI + setupHandlers for
       // this render cycle, skip the duplicate work.  We still run the
@@ -385,6 +385,7 @@ export function registerReaderSelectionTracking() {
           for (const [panelBody] of activeContextPanels.entries()) {
             if (!(panelBody as Element).isConnected) {
               void releaseClaudeRuntimeForBody(panelBody as Element);
+              unregisterPanelDebugHarness(panelBody as Element);
               activeContextPanels.delete(panelBody);
               activeContextPanelRawItems.delete(panelBody);
               activeContextPanelStateSync.delete(panelBody);

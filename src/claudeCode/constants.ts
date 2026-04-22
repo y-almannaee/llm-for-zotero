@@ -1,6 +1,7 @@
 export const CLAUDE_GLOBAL_CONVERSATION_KEY_BASE = 3_000_000_000;
 export const CLAUDE_PAPER_CONVERSATION_KEY_BASE = 3_500_000_000;
 export const CLAUDE_HISTORY_LIMIT = 200;
+export const CLAUDE_RUNTIME_RELEASE_GRACE_MS = 30_000;
 
 export const CLAUDE_MODEL_OPTIONS = ["sonnet", "opus", "haiku"] as const;
 export type ClaudeRuntimeModel = (typeof CLAUDE_MODEL_OPTIONS)[number];

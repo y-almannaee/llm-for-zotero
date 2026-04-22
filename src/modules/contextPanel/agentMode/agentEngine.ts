@@ -12,10 +12,11 @@ import type {
   AgentRunEventRecord,
   AgentRuntimeRequest,
 } from "../../../agent/types";
+import { consumePendingRetentionEvents } from "../../../claudeCode/runtimeRetention";
 
-function buildPendingAgentTraceEvents(): AgentRunEventRecord[] {
+function buildPendingAgentTraceEvents(body?: Element): AgentRunEventRecord[] {
   const now = Date.now();
-  return [
+  const events: AgentRunEventRecord[] = [
     {
       runId: "pending",
       seq: 1,
@@ -31,6 +32,18 @@ function buildPendingAgentTraceEvents(): AgentRunEventRecord[] {
       createdAt: now + 1,
     },
   ];
+  if (!body) return events;
+  const retentionEvents = consumePendingRetentionEvents(body);
+  for (const event of retentionEvents) {
+    events.push({
+      runId: "pending",
+      seq: events.length + 1,
+      eventType: event.type,
+      payload: event,
+      createdAt: Date.now(),
+    });
+  }
+  return events;
 }
 import type {
   AdvancedModelParams,
@@ -409,7 +422,7 @@ export async function sendAgentTurn(
       effectiveRequestConfig.modelProviderLabel === "Claude Code" ? Date.now() : undefined,
     pendingAgentTraceEvents:
       effectiveRequestConfig.modelProviderLabel === "Claude Code"
-        ? buildPendingAgentTraceEvents()
+        ? buildPendingAgentTraceEvents(body)
         : undefined,
     reasoningOpen: false,
   };
@@ -474,33 +487,39 @@ export async function sendAgentTurn(
   const agentRuntime = deps.getAgentRuntime();
   const capabilities = agentRuntime.getCapabilities(runtimeRequest);
   if (!capabilities.toolCalls) {
-    historyForRun.pop();
-    await deps.sendChatFallback({
-      body,
-      item,
-      question,
-      images,
-      model,
-      apiBase,
-      apiKey,
-      authMode,
-      providerProtocol,
-      modelEntryId,
-      modelProviderLabel,
-      reasoning,
-      advanced,
-      displayQuestion,
-      selectedTexts,
-      selectedTextSources,
-      selectedTextPaperContexts,
-      selectedTextNoteContexts,
-      paperContexts,
-      fullTextPaperContexts,
-      attachments,
-      runtimeMode: "agent",
-      skipAgentDispatch: true,
+    const fallback = await agentRuntime.runTurn({
+      request: runtimeRequest,
     });
-    return;
+    if (fallback.kind === "fallback") {
+      historyForRun.pop();
+      await deps.sendChatFallback({
+        body,
+        item,
+        question,
+        images,
+        model,
+        apiBase,
+        apiKey,
+        authMode,
+        providerProtocol,
+        modelEntryId,
+        modelProviderLabel,
+        reasoning,
+        advanced,
+        displayQuestion,
+        selectedTexts,
+        selectedTextSources,
+        selectedTextPaperContexts,
+        selectedTextNoteContexts,
+        paperContexts,
+        fullTextPaperContexts,
+        attachments,
+        runtimeMode: "agent",
+        agentRunId: fallback.runId,
+        skipAgentDispatch: true,
+      });
+      return;
+    }
   }
 
   let assistantPersisted = false;
@@ -760,9 +779,9 @@ export async function sendAgentTurn(
     await persistAssistantOnce();
     setStatusSafely(`Error: ${userFacingError.slice(0, 40)}`, "error");
   } finally {
+    deps.setPendingRequestId(conversationKey, 0);
     deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
     deps.setCurrentAbortController(conversationKey, null);
-    deps.setPendingRequestId(conversationKey, 0);
     scheduleQueueDrain?.();
   }
 }
@@ -839,7 +858,7 @@ export async function retryAgentTurn(
   assistantMessage.reasoningOpen = deps.isReasoningExpandedByDefault();
   assistantMessage.pendingAgentTraceEvents =
     assistantMessage.modelProviderLabel === "Claude Code"
-      ? buildPendingAgentTraceEvents()
+      ? buildPendingAgentTraceEvents(body)
       : undefined;
 
   const { refreshChatSafely, setStatusSafely } = deps.createPanelUpdateHelpers(
@@ -1145,9 +1164,9 @@ export async function retryAgentTurn(
     await persistAssistantOnce();
     setStatusSafely(`Error: ${userFacingError.slice(0, 40)}`, "error");
   } finally {
+    deps.setPendingRequestId(conversationKey, 0);
     deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
     deps.setCurrentAbortController(conversationKey, null);
-    deps.setPendingRequestId(conversationKey, 0);
     scheduleQueueDrain?.();
   }
 }

@@ -360,6 +360,9 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
     }
 
     const selectedProfile = deps.getSelectedProfile();
+    const shouldRetainClaudeRuntime =
+      deps.isClaudeConversationSystem() ||
+      selectedProfile?.providerLabel === "Claude Code";
     const activeModelName = (
       selectedProfile?.model ||
       deps.getCurrentModelName() ||
@@ -490,7 +493,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       : false;
 
     const forcedSkillIds = deps.consumeForcedSkillIds?.();
-    if (deps.isClaudeConversationSystem()) {
+    if (shouldRetainClaudeRuntime) {
       await deps.retainClaudeRuntime?.(deps.body, item);
     }
     const sendTask = deps.sendQuestion({
