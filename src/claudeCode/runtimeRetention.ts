@@ -3,7 +3,22 @@ import { updateClaudeRuntimeRetention, buildClaudeScope } from "./runtime";
 import { resolveConversationSystemForItem, resolveConversationBaseItem, resolveDisplayConversationKind } from "../modules/contextPanel/portalScope";
 import { getConversationKey } from "../modules/contextPanel/chat";
 
-const retainedMounts = new WeakMap<Element, { mountId: string; conversationKey: number; scopeType: string; scopeId: string }>();
+const THREAD_RELEASE_GRACE_MS = 30_000;
+
+type RetentionTarget = {
+  conversationKey: number;
+  scope: { scopeType: "paper" | "open"; scopeId: string; scopeLabel?: string };
+};
+
+type ThreadRetentionEntry = {
+  mountId: string;
+  target: RetentionTarget;
+  bodies: Set<Element>;
+  releaseTimer: ReturnType<typeof setTimeout> | null;
+};
+
+const retainedThreadKeyByBody = new WeakMap<Element, string>();
+const retainedThreads = new Map<string, ThreadRetentionEntry>();
 let nextMountOrdinal = 1;
 
 function makeMountId(): string {
@@ -12,10 +27,7 @@ function makeMountId(): string {
 
 const getCoreRuntime = () => getCoreAgentRuntime();
 
-function resolveRetentionTarget(item: any | null | undefined): {
-  conversationKey: number;
-  scope: { scopeType: "paper" | "open"; scopeId: string; scopeLabel?: string };
-} | null {
+function resolveRetentionTarget(item: any | null | undefined): RetentionTarget | null {
   if (!item) return null;
   if (resolveConversationSystemForItem(item) !== "claude_code") return null;
   const conversationKey = getConversationKey(item);
@@ -45,58 +57,80 @@ export async function retainClaudeRuntimeForBody(
   item: any | null | undefined,
 ): Promise<void> {
   const target = resolveRetentionTarget(item);
-  const previous = retainedMounts.get(body);
-  if (!target) {
-    if (previous) {
-      await updateClaudeRuntimeRetention(getCoreRuntime(), {
-        conversationKey: previous.conversationKey,
-        scope: { scopeType: previous.scopeType as "paper" | "open", scopeId: previous.scopeId },
-        mountId: previous.mountId,
-        retain: false,
-      }).catch(() => {});
-      retainedMounts.delete(body);
+  const nextThreadKey = target
+    ? `${target.scope.scopeType}:${target.scope.scopeId}:${target.conversationKey}`
+    : null;
+  const previousThreadKey = retainedThreadKeyByBody.get(body) || null;
+
+  if (previousThreadKey && previousThreadKey !== nextThreadKey) {
+    const previousEntry = retainedThreads.get(previousThreadKey);
+    if (previousEntry) {
+      previousEntry.bodies.delete(body);
+      if (!previousEntry.bodies.size && !previousEntry.releaseTimer) {
+        previousEntry.releaseTimer = setTimeout(() => {
+          const liveEntry = retainedThreads.get(previousThreadKey);
+          if (!liveEntry || liveEntry.bodies.size > 0) return;
+          retainedThreads.delete(previousThreadKey);
+          void updateClaudeRuntimeRetention(getCoreRuntime(), {
+            conversationKey: liveEntry.target.conversationKey,
+            scope: liveEntry.target.scope,
+            mountId: liveEntry.mountId,
+            retain: false,
+          }).catch(() => {});
+        }, THREAD_RELEASE_GRACE_MS);
+      }
     }
+    retainedThreadKeyByBody.delete(body);
+  }
+
+  if (!target || !nextThreadKey) {
     return;
   }
-  if (
-    previous &&
-    previous.conversationKey === target.conversationKey &&
-    previous.scopeType === target.scope.scopeType &&
-    previous.scopeId === target.scope.scopeId
-  ) {
-    return;
-  }
-  if (previous) {
+
+  let entry = retainedThreads.get(nextThreadKey);
+  if (!entry) {
+    entry = {
+      mountId: makeMountId(),
+      target,
+      bodies: new Set<Element>(),
+      releaseTimer: null,
+    };
+    retainedThreads.set(nextThreadKey, entry);
     await updateClaudeRuntimeRetention(getCoreRuntime(), {
-      conversationKey: previous.conversationKey,
-      scope: { scopeType: previous.scopeType as "paper" | "open", scopeId: previous.scopeId },
-      mountId: previous.mountId,
-      retain: false,
+      conversationKey: target.conversationKey,
+      scope: target.scope,
+      mountId: entry.mountId,
+      retain: true,
     }).catch(() => {});
+  } else {
+    entry.target = target;
+    if (entry.releaseTimer) {
+      clearTimeout(entry.releaseTimer);
+      entry.releaseTimer = null;
+    }
   }
-  const mountId = previous?.mountId || makeMountId();
-  retainedMounts.set(body, {
-    mountId,
-    conversationKey: target.conversationKey,
-    scopeType: target.scope.scopeType,
-    scopeId: target.scope.scopeId,
-  });
-  await updateClaudeRuntimeRetention(getCoreRuntime(), {
-    conversationKey: target.conversationKey,
-    scope: target.scope,
-    mountId,
-    retain: true,
-  }).catch(() => {});
+
+  entry.bodies.add(body);
+  retainedThreadKeyByBody.set(body, nextThreadKey);
 }
 
 export async function releaseClaudeRuntimeForBody(body: Element): Promise<void> {
-  const previous = retainedMounts.get(body);
-  if (!previous) return;
-  retainedMounts.delete(body);
-  await updateClaudeRuntimeRetention(getCoreRuntime(), {
-    conversationKey: previous.conversationKey,
-    scope: { scopeType: previous.scopeType as "paper" | "open", scopeId: previous.scopeId },
-    mountId: previous.mountId,
-    retain: false,
-  }).catch(() => {});
+  const previousThreadKey = retainedThreadKeyByBody.get(body) || null;
+  if (!previousThreadKey) return;
+  retainedThreadKeyByBody.delete(body);
+  const entry = retainedThreads.get(previousThreadKey);
+  if (!entry) return;
+  entry.bodies.delete(body);
+  if (entry.bodies.size > 0 || entry.releaseTimer) return;
+  entry.releaseTimer = setTimeout(() => {
+    const liveEntry = retainedThreads.get(previousThreadKey);
+    if (!liveEntry || liveEntry.bodies.size > 0) return;
+    retainedThreads.delete(previousThreadKey);
+    void updateClaudeRuntimeRetention(getCoreRuntime(), {
+      conversationKey: liveEntry.target.conversationKey,
+      scope: liveEntry.target.scope,
+      mountId: liveEntry.mountId,
+      retain: false,
+    }).catch(() => {});
+  }, THREAD_RELEASE_GRACE_MS);
 }
