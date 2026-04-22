@@ -1,4 +1,5 @@
 import { assert } from "chai";
+import { destroyCachedCodexAppServerProcess } from "../src/utils/codexAppServerProcess";
 import {
   callEmbeddings,
   callLLM,
@@ -11,6 +12,29 @@ describe("llmClient prepareChatRequest", function () {
   const originalZotero = globalThis.Zotero;
   const originalToolkit = (globalThis as typeof globalThis & { ztoolkit?: unknown })
     .ztoolkit;
+
+  class MockStdout {
+    private pending: Array<(value: string) => void> = [];
+    private queue: string[] = [];
+
+    readString(): Promise<string> {
+      if (this.queue.length) {
+        return Promise.resolve(this.queue.shift() || "");
+      }
+      return new Promise((resolve) => {
+        this.pending.push(resolve);
+      });
+    }
+
+    push(value: string) {
+      const next = this.pending.shift();
+      if (next) {
+        next(value);
+        return;
+      }
+      this.queue.push(value);
+    }
+  }
 
   beforeEach(function () {
     const prefStore = new Map<string, unknown>();
@@ -206,35 +230,143 @@ describe("llmClient prepareChatRequest", function () {
     assert.equal(prepared.authMode, "codex_auth");
   });
 
+  it("normalizes blank codex app server apiBase values for chat requests", async function () {
+    const originalChromeUtils = (globalThis as typeof globalThis & {
+      ChromeUtils?: unknown;
+    }).ChromeUtils;
+    const originalCodexPath = globalThis.process?.env?.CODEX_PATH;
+    const stdout = new MockStdout();
+    let startedThread = false;
+
+    (
+      globalThis.Zotero.Prefs as { set: (key: string, value: unknown) => void }
+    ).set(
+      "extensions.zotero.llmforzotero.modelProviderGroups",
+      JSON.stringify([
+        {
+          id: "provider-codex-app",
+          apiBase: "",
+          apiKey: "",
+          authMode: "codex_app_server",
+          models: [
+            {
+              id: "model-1",
+              model: "gpt-5.4",
+              temperature: 0.3,
+              maxTokens: 256,
+            },
+          ],
+        },
+      ]),
+    );
+    (
+      globalThis.Zotero.Prefs as { set: (key: string, value: unknown) => void }
+    ).set(
+      "extensions.zotero.llmforzotero.modelProviderGroupsMigrationVersion",
+      3,
+    );
+
+    try {
+      if (globalThis.process?.env) {
+        globalThis.process.env.CODEX_PATH = "/mock/codex";
+      }
+
+      (
+        globalThis as typeof globalThis & {
+          ChromeUtils?: {
+            importESModule: (
+              path: string,
+            ) => { Subprocess: { call: (params: { arguments?: string[] }) => Promise<unknown> } };
+          };
+        }
+      ).ChromeUtils = {
+        importESModule: (path: string) => {
+          assert.include(path, "Subprocess");
+          return {
+            Subprocess: {
+              call: async (_params: { arguments?: string[] }) => ({
+                stdout,
+                stdin: {
+                  write: (chunk: string) => {
+                    for (const line of chunk.split("\n")) {
+                      if (!line.trim()) continue;
+                      const message = JSON.parse(line) as {
+                        id?: number;
+                        method?: string;
+                      };
+                      if (message.method === "initialize") {
+                        stdout.push(
+                          `${JSON.stringify({ id: message.id, result: {} })}\n`,
+                        );
+                        continue;
+                      }
+                      if (message.method === "thread/start") {
+                        startedThread = true;
+                        stdout.push(
+                          `${JSON.stringify({ id: message.id, result: { id: "thread-1" } })}\n`,
+                        );
+                        continue;
+                      }
+                      if (message.method === "turn/start") {
+                        stdout.push(
+                          `${JSON.stringify({ id: message.id, result: { id: "turn-1" } })}\n`,
+                        );
+                        queueMicrotask(() => {
+                          stdout.push(
+                            `${JSON.stringify({ method: "item/agentMessage/delta", params: { turnId: "turn-1", delta: "Hello" } })}\n`,
+                          );
+                          stdout.push(
+                            `${JSON.stringify({ method: "turn/completed", params: { turnId: "turn-1", status: "completed" } })}\n`,
+                          );
+                        });
+                      }
+                    }
+                  },
+                },
+                kill: () => undefined,
+              }),
+            },
+          };
+        },
+      };
+
+      const prepared = prepareChatRequest({
+        prompt: "What changed?",
+      });
+      const output = await callLLMStream(
+        {
+          prompt: "What changed?",
+        },
+        () => undefined,
+      );
+
+      assert.equal(
+        prepared.apiBase,
+        "https://chatgpt.com/backend-api/codex/responses",
+      );
+      assert.equal(prepared.authMode, "codex_app_server");
+      assert.equal(output, "Hello");
+      assert.isTrue(startedThread);
+    } finally {
+      destroyCachedCodexAppServerProcess("codex_app_server_chat");
+      if (globalThis.process?.env) {
+        if (typeof originalCodexPath === "string") {
+          globalThis.process.env.CODEX_PATH = originalCodexPath;
+        } else {
+          delete globalThis.process.env.CODEX_PATH;
+        }
+      }
+      (
+        globalThis as typeof globalThis & { ChromeUtils?: unknown }
+      ).ChromeUtils = originalChromeUtils;
+    }
+  });
+
   it("routes codex app server chat requests through the local app-server transport", async function () {
     const originalChromeUtils = (globalThis as typeof globalThis & {
       ChromeUtils?: unknown;
     }).ChromeUtils;
     const originalCodexPath = globalThis.process?.env?.CODEX_PATH;
-
-    class MockStdout {
-      private pending: Array<(value: string) => void> = [];
-      private queue: string[] = [];
-
-      readString(): Promise<string> {
-        if (this.queue.length) {
-          return Promise.resolve(this.queue.shift() || "");
-        }
-        return new Promise((resolve) => {
-          this.pending.push(resolve);
-        });
-      }
-
-      push(value: string) {
-        const next = this.pending.shift();
-        if (next) {
-          next(value);
-          return;
-        }
-        this.queue.push(value);
-      }
-    }
-
     const stdout = new MockStdout();
     let lastTurnInput: unknown = "";
 
@@ -338,6 +470,7 @@ describe("llmClient prepareChatRequest", function () {
         path: "C:\\Users\\alice\\figure.png",
       });
     } finally {
+      destroyCachedCodexAppServerProcess("codex_app_server_chat");
       if (globalThis.process?.env) {
         if (typeof originalCodexPath === "string") {
           globalThis.process.env.CODEX_PATH = originalCodexPath;

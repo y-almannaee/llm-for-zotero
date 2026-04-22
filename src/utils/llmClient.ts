@@ -256,7 +256,7 @@ function getApiConfig(overrides?: {
   const resolvedApiBase =
     overrides?.apiBase ||
     prefApiBase ||
-    (authMode === "codex_auth"
+    (authMode === "codex_auth" || authMode === "codex_app_server"
       ? DEFAULT_CODEX_API_BASE
       : authMode === "copilot_auth"
         ? DEFAULT_COPILOT_API_BASE

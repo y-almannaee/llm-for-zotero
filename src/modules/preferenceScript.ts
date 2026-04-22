@@ -748,7 +748,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           group.providerProtocol =
             selectedPreset?.defaultProtocol || "openai_chat_compat";
         }
-        if ((nextAuthMode === "codex_auth") && !group.apiBase.trim()) {
+        if (
+          (nextAuthMode === "codex_auth" ||
+            nextAuthMode === "codex_app_server") &&
+          !group.apiBase.trim()
+        ) {
           group.apiBase = DEFAULT_CODEX_API_BASE;
         }
         if (nextAuthMode === "copilot_auth" && !group.apiBase.trim()) {

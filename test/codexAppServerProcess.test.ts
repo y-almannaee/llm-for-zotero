@@ -142,6 +142,48 @@ describe("codexAppServerProcess", function () {
     );
   });
 
+  it("refreshes the turn timeout when the app-server stays active", async function () {
+    const proc = createProcess();
+
+    setTimeout(() => {
+      void (proc as unknown as {
+        handleMessage: (msg: Record<string, unknown>) => void;
+      }).handleMessage({
+        id: 9,
+        method: "item/tool/call",
+        params: {
+          callId: "call-1",
+          tool: "edit_current_note",
+          arguments: { mode: "create" },
+        },
+      });
+    }, 20);
+    setTimeout(() => {
+      void (proc as unknown as {
+        handleMessage: (msg: Record<string, unknown>) => void;
+      }).handleMessage({
+        method: "turn/completed",
+        params: {
+          turnId: "turn-active",
+          status: "completed",
+        },
+      });
+    }, 45);
+
+    proc.onRequest("item/tool/call", async () => ({
+      contentItems: [{ type: "inputText", text: "approved" }],
+      success: true,
+    }));
+
+    const result = await waitForCodexAppServerTurnCompletion({
+      proc,
+      turnId: "turn-active",
+      timeoutMs: 30,
+    });
+
+    assert.equal(result, "");
+  });
+
   it("uses CODEX_PATH when spawning on Windows", async function () {
     const originalZotero = globalThis.Zotero;
     const originalProcess = globalThis.process;
@@ -215,5 +257,100 @@ describe("codexAppServerProcess", function () {
       "/c",
       "\"C:\\Tools\\Codex\\codex.exe\" app-server",
     ]);
+  });
+
+  it("falls back to /opt/homebrew/bin/codex on macOS when PATH lookup misses it", async function () {
+    const originalZotero = globalThis.Zotero;
+    const originalProcess = globalThis.process;
+    const originalIOUtils = (
+      globalThis as typeof globalThis & { IOUtils?: unknown }
+    ).IOUtils;
+    const originalLoadSubprocessModule =
+      CodexAppServerProcess.loadSubprocessModule;
+    const originalStartReadLoop = (
+      CodexAppServerProcess.prototype as unknown as {
+        startReadLoop: () => void;
+      }
+    ).startReadLoop;
+    const originalInitialize = (
+      CodexAppServerProcess.prototype as unknown as {
+        initialize: () => Promise<void>;
+      }
+    ).initialize;
+    const calls: Array<{ command: string; arguments: string[] }> = [];
+
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      isMac: true,
+    } as unknown;
+    (globalThis as typeof globalThis & { process?: typeof process }).process = {
+      ...originalProcess,
+      env: {
+        ...originalProcess?.env,
+        HOME: "/Users/alice",
+      },
+    } as typeof process;
+    (globalThis as typeof globalThis & { IOUtils?: unknown }).IOUtils = {
+      exists: async (path: string) => path === "/opt/homebrew/bin/codex",
+    };
+    CodexAppServerProcess.loadSubprocessModule = async () => ({
+      call: async (options: { command: string; arguments: string[] }) => {
+        calls.push(options);
+        if (
+          options.command === "/bin/zsh" &&
+          options.arguments[1] === "which codex"
+        ) {
+          return {
+            stdout: {
+              readString: async () => "",
+            },
+            wait: async () => ({ exitCode: 1 }),
+          };
+        }
+        return {
+          stdin: { write: () => {} },
+          kill: () => {},
+        };
+      },
+    });
+    (
+      CodexAppServerProcess.prototype as unknown as {
+        startReadLoop: () => void;
+      }
+    ).startReadLoop = () => {};
+    (
+      CodexAppServerProcess.prototype as unknown as {
+        initialize: () => Promise<void>;
+      }
+    ).initialize = async () => {};
+
+    try {
+      const proc = await CodexAppServerProcess.spawn();
+      proc.destroy();
+    } finally {
+      (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+        originalZotero;
+      (globalThis as typeof globalThis & { process?: typeof process }).process =
+        originalProcess;
+      (globalThis as typeof globalThis & { IOUtils?: unknown }).IOUtils =
+        originalIOUtils;
+      CodexAppServerProcess.loadSubprocessModule = originalLoadSubprocessModule;
+      (
+        CodexAppServerProcess.prototype as unknown as {
+          startReadLoop: () => void;
+        }
+      ).startReadLoop = originalStartReadLoop;
+      (
+        CodexAppServerProcess.prototype as unknown as {
+          initialize: () => Promise<void>;
+        }
+      ).initialize = originalInitialize;
+    }
+
+    assert.deepEqual(calls[0], {
+      command: "/bin/zsh",
+      arguments: ["-c", "which codex"],
+    });
+    assert.equal(calls[1]?.command, "/opt/homebrew/bin/codex");
+    assert.deepEqual(calls[1]?.arguments, ["app-server"]);
   });
 });

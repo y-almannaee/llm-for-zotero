@@ -1,19 +1,27 @@
 import { getRuntimePlatformInfo } from "./runtimePlatform";
 
-const DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_MS = 60_000;
+const DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_MS = 300_000;
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
 };
 
+type ActivityHandler = () => void;
 type NotificationHandler = (params: unknown) => void;
 type RequestHandler = (params: unknown, id: number) => unknown | Promise<unknown>;
+
+function createAbortError(): Error {
+  const err = new Error("Aborted");
+  (err as { name?: string }).name = "AbortError";
+  return err;
+}
 
 export class CodexAppServerProcess {
   private proc: unknown;
   private nextId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
+  private activityHandlers = new Set<ActivityHandler>();
   private notificationHandlers = new Map<string, Set<NotificationHandler>>();
   private requestHandlers = new Map<string, Set<RequestHandler>>();
   private readLoopPromise: Promise<void> | null = null;
@@ -130,6 +138,14 @@ export class CodexAppServerProcess {
   }
 
   private handleMessage(msg: Record<string, unknown>): void {
+    for (const handler of this.activityHandlers) {
+      try {
+        handler();
+      } catch {
+        /* ignore */
+      }
+    }
+
     if ("id" in msg && msg.id !== null && msg.id !== undefined) {
       const id = msg.id as number;
       const pending = this.pendingRequests.get(id);
@@ -247,6 +263,13 @@ export class CodexAppServerProcess {
     };
   }
 
+  onActivity(handler: ActivityHandler): () => void {
+    this.activityHandlers.add(handler);
+    return () => {
+      this.activityHandlers.delete(handler);
+    };
+  }
+
   onRequest(method: string, handler: RequestHandler): () => void {
     let handlers = this.requestHandlers.get(method);
     if (!handlers) {
@@ -327,31 +350,36 @@ export function waitForCodexAppServerTurnCompletion(params: {
   return new Promise((resolve, reject) => {
     let accumulated = "";
     let settled = false;
-    const timeoutId =
-      timeoutMs > 0
-        ? setTimeout(() => {
-            if (cacheKey) {
-              destroyCachedCodexAppServerProcess(cacheKey, proc);
-            }
-            settle(() =>
-              reject(
-                new Error(
-                  `Timed out waiting for codex app-server turn completion after ${timeoutMs}ms`,
-                ),
-              ),
-            );
-          }, timeoutMs)
-        : null;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const scheduleTimeout = () => {
+      if (timeoutMs <= 0 || settled) return;
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+      }
+      timeoutId = setTimeout(() => {
+        if (cacheKey) {
+          destroyCachedCodexAppServerProcess(cacheKey, proc);
+        }
+        settle(() =>
+          reject(
+            new Error(
+              `Timed out waiting for codex app-server turn completion after ${timeoutMs}ms`,
+            ),
+          ),
+        );
+      }, timeoutMs);
+    };
     const abortHandler = () => {
       if (cacheKey) {
         destroyCachedCodexAppServerProcess(cacheKey, proc);
       }
-      settle(() => reject(new DOMException("Aborted", "AbortError")));
+      settle(() => reject(createAbortError()));
     };
 
     function settle(fn: () => void) {
       if (settled) return;
       settled = true;
+      unsubActivity();
       unsubDelta();
       unsubCompleted();
       if (timeoutId !== null) {
@@ -360,6 +388,11 @@ export function waitForCodexAppServerTurnCompletion(params: {
       signal?.removeEventListener("abort", abortHandler);
       fn();
     }
+
+    const unsubActivity = proc.onActivity(() => {
+      scheduleTimeout();
+    });
+    scheduleTimeout();
 
     // item/agentMessage/delta has no turnId — only one turn is active at a time
     const unsubDelta = proc.onNotification(
@@ -460,11 +493,18 @@ async function resolveCodexBinary(): Promise<string> {
           `${env.USERPROFILE ?? "C:\\Users\\User"}\\.cargo\\bin\\codex.exe`,
           "C:\\Program Files\\codex\\codex.exe",
         ]
-      : [
-          `${env.HOME ?? "~"}/.cargo/bin/codex`,
-          "/usr/local/bin/codex",
-          "/usr/bin/codex",
-        ];
+      : info.platform === "macos"
+        ? [
+            `${env.HOME ?? "~"}/.cargo/bin/codex`,
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            "/usr/bin/codex",
+          ]
+        : [
+            `${env.HOME ?? "~"}/.cargo/bin/codex`,
+            "/usr/local/bin/codex",
+            "/usr/bin/codex",
+          ];
 
   const IOUtils = (globalThis as any).IOUtils;
   if (IOUtils?.exists) {

@@ -2369,10 +2369,23 @@ function compactAgentTraceEvents(
 }
 
 function hasInterleavedTextAndTools(events: AgentRunEventRecord[]): boolean {
-  let seenMessageDelta = false;
+  let visibleDraftLength = 0;
   for (const entry of events) {
-    if (entry.payload.type === "message_delta") seenMessageDelta = true;
-    if (entry.payload.type === "tool_call" && seenMessageDelta) return true;
+    if (entry.payload.type === "message_delta") {
+      visibleDraftLength += (entry.payload.text || "").length;
+      continue;
+    }
+    if (entry.payload.type === "message_rollback") {
+      const rollbackLength =
+        typeof entry.payload.length === "number" && entry.payload.length > 0
+          ? entry.payload.length
+          : (entry.payload.text || "").length;
+      visibleDraftLength = Math.max(0, visibleDraftLength - rollbackLength);
+      continue;
+    }
+    if (entry.payload.type === "tool_call" && visibleDraftLength > 0) {
+      return true;
+    }
   }
   return false;
 }

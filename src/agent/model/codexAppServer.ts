@@ -19,7 +19,7 @@ import {
 import { isMultimodalRequestSupported } from "./messageBuilder";
 
 export function shouldResetCodexAppServerThreadOnError(error: unknown): boolean {
-  if (error instanceof DOMException && error.name === "AbortError") {
+  if ((error as { name?: unknown } | null | undefined)?.name === "AbortError") {
     return true;
   }
   const message = error instanceof Error ? error.message : String(error);

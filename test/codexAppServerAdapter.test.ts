@@ -44,6 +44,9 @@ describe("CodexAppServerAdapter", function () {
   });
 
   it("resets thread state when the app-server session becomes unusable", function () {
+    const abortError = new Error("Aborted");
+    (abortError as Error & { name?: string }).name = "AbortError";
+    assert.isTrue(shouldResetCodexAppServerThreadOnError(abortError));
     assert.isTrue(
       shouldResetCodexAppServerThreadOnError(
         new Error(

@@ -4372,7 +4372,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
         bubble.insertBefore(bubbleHeaderNodes[i], bubble.firstChild);
       }
 
-      if (!hasAnswerText || (agentUsesInterleavedText && msg.streaming)) {
+      if (msg.streaming || !hasAnswerText) {
         const typing = doc.createElement("div") as HTMLDivElement;
         typing.className = "llm-typing";
         typing.innerHTML =
