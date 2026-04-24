@@ -34,7 +34,7 @@ Documentation:
 - **Standalone Window Mode** — Open the LLM Assistant in its own dedicated window, separate from the Zotero reader sidebar. See [Standalone Window Mode](#standalone-window-mode).
 - **File-Based Notes** — Save research notes as Markdown files in any local directory — works with Obsidian, Logseq, or any plain markdown folder. See [File-Based Notes](#file-based-notes).
 - **Agent Mode (beta)** — LLM-for-Zotero can now act as an autonomous agent inside your Zotero library. See [Agent Mode](#agent-mode-beta) for details.
-- **Codex App Server (recommended)** — ChatGPT Plus subscribers can use Codex models (e.g. `gpt-5.4`) without an API key through the official local Codex CLI integration. The older direct backend flow remains available as a legacy option for current users. See [Codex Setup](#codex-setup-chatgpt-plus-subscribers).
+- **Codex App Server (recommended)** — ChatGPT Plus subscribers should use the new `codex app-server` auth flow for Codex models (e.g. `gpt-5.4`) without an API key. The older direct backend flow remains available as a legacy option for current users. See [Codex Setup](#codex-setup-chatgpt-plus-subscribers). Feature contributed by [@jianghao-zhang](https://github.com/jianghao-zhang) and [@boltma](https://github.com/boltma).
 - **MinerU PDF parsing** — High-fidelity PDF extraction that preserves tables, equations, and figures. See [MinerU PDF Parsing](#mineru-pdf-parsing).
 
 ---
@@ -434,12 +434,12 @@ Skills are stored as Markdown files in `{ZoteroDataDir}/llm-for-zotero/skills/`.
 
 If you have a ChatGPT Plus subscription, you can use Codex models (e.g. `gpt-5.4`) in the plugin without a separate API key by signing in through the Codex CLI.
 
-There are now two Codex-backed modes in the plugin:
+There are now two Codex-backed modes in the plugin. New users should choose **Codex App Server**.
 
 - **Codex App Server (Recommended)** - Spawns the local `codex app-server` CLI and talks to it over stdio. This is the official way to use Codex in third-party apps, and it is the preferred setup for new users.
 - **Codex Auth (Legacy)** - Uses the ChatGPT/Codex Responses backend directly. Existing users can keep using it in the next release, but new users should choose `Codex App Server`. This legacy mode is planned for deprecation in a future release after app-server validation.
 
-_Special thanks to [@jianghao-zhang](https://github.com/jianghao-zhang) for contributions to this feature._
+_Special thanks to [@jianghao-zhang](https://github.com/jianghao-zhang) and [@boltma](https://github.com/boltma) for contributing the Codex App Server integration._
 
 ### Step-by-step setup
 
@@ -533,7 +533,7 @@ When a personal API key is provided, the plugin calls the MinerU API directly (`
 
 > **Q: Is it free to use?**
 >
-> Yes, absolutely free. You only pay for API calls if you choose a paid provider. With Codex auth, ChatGPT Plus subscribers can use Codex models without a separate API key. If you find this helpful, consider leaving a ⭐ on GitHub or [buying me a coffee](https://buymeacoffee.com/yat.lok).
+> Yes, absolutely free. You only pay for API calls if you choose a paid provider. With Codex App Server auth, ChatGPT Plus subscribers can use Codex models without a separate API key. If you find this helpful, consider leaving a ⭐ on GitHub or [buying me a coffee](https://buymeacoffee.com/yat.lok).
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/1e945e57-4b99-4d25-b8d5-fb120e100b62" width="200" alt="Alipay donation QR code">
