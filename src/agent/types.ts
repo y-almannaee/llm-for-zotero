@@ -9,7 +9,10 @@ import type {
   PaperContextRef,
   SelectedTextSource,
 } from "../shared/types";
-import type { ReasoningConfig as LLMReasoningConfig } from "../utils/llmClient";
+import type {
+  ReasoningConfig as LLMReasoningConfig,
+  UsageStats,
+} from "../utils/llmClient";
 
 export type AgentRequest = {
   conversationKey: number;
@@ -237,6 +240,7 @@ export type AgentEvent =
       summary?: string;
       details?: string;
     }
+  | ({ type: "usage"; round: number } & UsageStats)
   | { type: "tool_call"; callId: string; name: string; args: unknown }
   | {
       type: "tool_result";
