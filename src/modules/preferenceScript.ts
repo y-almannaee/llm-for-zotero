@@ -72,6 +72,7 @@ import {
   getClaudeAutoCompactThresholdPercent,
   getClaudeBridgeUrl,
   getClaudeConfigSourcePref,
+  getClaudeManagedInstructionTemplatePref,
   getClaudePermissionModePref,
   getClaudeReasoningModePref,
   getClaudeRuntimeModelPref,
@@ -85,6 +86,7 @@ import {
   setClaudeAutoCompactThresholdPercent,
   setClaudeBridgeUrl,
   setClaudeCodeModeEnabled,
+  setClaudeManagedInstructionTemplatePref,
   setConversationSystemPref,
   setClaudePermissionModePref,
   setClaudeReasoningModePref,
@@ -92,6 +94,11 @@ import {
   setClaudeBlockStreamingEnabled,
 } from "../claudeCode/prefs";
 import { getClaudeProfileSignature } from "../claudeCode/projectSkills";
+import {
+  getDefaultClaudeManagedInstructionBlock,
+  readClaudeProjectManagedInstructionBlock,
+  updateClaudeProjectManagedInstructionBlock,
+} from "../claudeCode/bootstrap";
 
 type PrefKey = "systemPrompt";
 
@@ -1878,6 +1885,18 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
   const claudeTraceCopyBtn = doc.querySelector(
     `#${config.addonRef}-claude-trace-copy-path`,
   ) as HTMLButtonElement | null;
+  const claudeManagedInstructionTemplateInput = doc.querySelector(
+    `#${config.addonRef}-claude-managed-instruction-template`,
+  ) as HTMLTextAreaElement | null;
+  const claudeManagedInstructionUpdateBtn = doc.querySelector(
+    `#${config.addonRef}-claude-managed-instruction-update`,
+  ) as HTMLButtonElement | null;
+  const claudeManagedInstructionResetBtn = doc.querySelector(
+    `#${config.addonRef}-claude-managed-instruction-reset`,
+  ) as HTMLButtonElement | null;
+  const claudeManagedInstructionStatus = doc.querySelector(
+    `#${config.addonRef}-claude-managed-instruction-status`,
+  ) as HTMLSpanElement | null;
 
   if (enableAgentModeInput) {
     const prefValue = Zotero.Prefs.get(
@@ -2195,6 +2214,62 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         getAgentTraceExportPath("latest-run").replace(/[\\/]latest-run\.json$/i, ""),
       );
     });
+  }
+
+  if (claudeManagedInstructionTemplateInput) {
+    const defaultManagedBlock = getDefaultClaudeManagedInstructionBlock();
+    const syncManagedInstructionStatus = (message: string, color: string) => {
+      if (!claudeManagedInstructionStatus) return;
+      claudeManagedInstructionStatus.style.display = "inline";
+      claudeManagedInstructionStatus.style.color = color;
+      claudeManagedInstructionStatus.textContent = message;
+    };
+    const loadManagedInstructionTemplate = () => {
+      const saved = getClaudeManagedInstructionTemplatePref();
+      claudeManagedInstructionTemplateInput.value = saved || defaultManagedBlock;
+      if (!saved.trim()) {
+        void (async () => {
+          const onDisk = await readClaudeProjectManagedInstructionBlock();
+          if (!onDisk) return;
+          claudeManagedInstructionTemplateInput.value = onDisk;
+          setClaudeManagedInstructionTemplatePref(onDisk);
+        })();
+      }
+    };
+    loadManagedInstructionTemplate();
+    claudeManagedInstructionTemplateInput.addEventListener("input", () => {
+      setClaudeManagedInstructionTemplatePref(claudeManagedInstructionTemplateInput.value);
+      if (claudeManagedInstructionStatus?.style.display !== "none") {
+        syncManagedInstructionStatus(t("Template updated locally"), "var(--fill-secondary, #888)");
+      }
+    });
+    if (claudeManagedInstructionResetBtn) {
+      claudeManagedInstructionResetBtn.addEventListener("click", () => {
+        claudeManagedInstructionTemplateInput.value = defaultManagedBlock;
+        setClaudeManagedInstructionTemplatePref(defaultManagedBlock);
+        syncManagedInstructionStatus(t("Reset to default template"), "var(--fill-secondary, #888)");
+      });
+    }
+    if (claudeManagedInstructionUpdateBtn) {
+      claudeManagedInstructionUpdateBtn.addEventListener("click", async () => {
+        const template = setClaudeManagedInstructionTemplatePref(
+          claudeManagedInstructionTemplateInput.value,
+        ) || defaultManagedBlock;
+        claudeManagedInstructionUpdateBtn.disabled = true;
+        syncManagedInstructionStatus(t("Updating CLAUDE.md…"), "var(--fill-secondary, #888)");
+        try {
+          await updateClaudeProjectManagedInstructionBlock(template);
+          syncManagedInstructionStatus(t("Managed block updated"), "green");
+        } catch (error) {
+          syncManagedInstructionStatus(
+            `${t("Failed to update CLAUDE.md")}: ${(error as Error).message}`,
+            "red",
+          );
+        } finally {
+          claudeManagedInstructionUpdateBtn.disabled = false;
+        }
+      });
+    }
   }
 
   if (agentPermissionModeSelect) {

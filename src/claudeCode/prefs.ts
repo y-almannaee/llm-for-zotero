@@ -248,6 +248,16 @@ export function setClaudeAutoCompactThresholdPercent(value: number): void {
   setPref("claudeCodeAutoCompactThreshold", normalized);
 }
 
+export function getClaudeManagedInstructionTemplatePref(): string {
+  return getStringPref("claudeCodeManagedInstructionTemplate").replace(/\r\n?/g, "\n");
+}
+
+export function setClaudeManagedInstructionTemplatePref(value: string): string {
+  const normalized = String(value || "").replace(/\r\n?/g, "\n").trim();
+  setPref("claudeCodeManagedInstructionTemplate", normalized);
+  return normalized;
+}
+
 function buildLegacyPaperConversationMapKey(
   libraryID: number,
   paperItemID: number,

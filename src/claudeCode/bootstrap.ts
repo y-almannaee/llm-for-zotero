@@ -4,6 +4,7 @@ import {
   getClaudeProjectInstructionFile,
   getClaudeProjectSettingsFile,
 } from "./projectSkills";
+import { getClaudeManagedInstructionTemplatePref } from "./prefs";
 
 type IOUtilsLike = {
   exists?: (path: string) => Promise<boolean>;
@@ -56,7 +57,7 @@ function getLegacyBootstrapInstructionTemplate(): string {
   ].join("\n");
 }
 
-function getBootstrapInstructionManagedBlock(): string {
+export function getDefaultClaudeManagedInstructionBlock(): string {
   return [
     "# Claude Code in Zotero",
     "",
@@ -67,6 +68,8 @@ function getBootstrapInstructionManagedBlock(): string {
     "",
     "## Claude runtime paper guidance",
     "- Treat the user's Zotero library as the primary source of truth for library, collection, note, and paper questions. Do not default to describing the local runtime folder, plugin workspace, or project files unless the user is clearly asking about code or the runtime itself.",
+    "- Assume Claude can answer from the whole Zotero library, not only the currently open paper. For library-wide requests, reason across library metadata, collections, notes, selected papers, pinned papers, and conversation-visible retrieval results before defaulting to generic workspace exploration.",
+    "- When available, treat Zotero SQL-backed library metadata, MinerU parsed-text caches, and semantic embedding caches or retrieval indexes as valid evidence sources for whole-library questions.",
     "- For broad library questions, first reason about the active Zotero scope: current paper, selected papers, pinned papers, current library, notes, local caches, and any available retrieval indexes. Prefer answering from those sources before falling back to generic workspace exploration.",
     "- If the user's request is ambiguous between their Zotero library and the local project/runtime, prefer the Zotero interpretation unless surrounding evidence clearly points to code, files, or development work.",
     "- For summary-like requests such as summarize, key points, main idea, takeaway, overview, or authors, prefer concise synthesis grounded in the source instead of exact blockquotes.",
@@ -89,8 +92,19 @@ function getBootstrapInstructionManagedBlock(): string {
   ].join("\n");
 }
 
-function getBootstrapInstructionTemplate(): string {
-  return `${MANAGED_BEGIN_MARKER}\n${getBootstrapInstructionManagedBlock()}\n${MANAGED_END_MARKER}\n`;
+function normalizeManagedInstructionBlockContent(content: string): string {
+  return String(content || "").replace(/\r\n?/g, "\n").trim();
+}
+
+function getManagedInstructionBlockFromSettings(): string {
+  return (
+    normalizeManagedInstructionBlockContent(getClaudeManagedInstructionTemplatePref()) ||
+    getDefaultClaudeManagedInstructionBlock()
+  );
+}
+
+function getBootstrapInstructionTemplate(managedBlock = getManagedInstructionBlockFromSettings()): string {
+  return `${MANAGED_BEGIN_MARKER}\n${managedBlock}\n${MANAGED_END_MARKER}\n`;
 }
 
 async function writeIfMissing(path: string, content: string): Promise<void> {
@@ -99,6 +113,18 @@ async function writeIfMissing(path: string, content: string): Promise<void> {
   const exists = await io.exists(path).catch(() => false);
   if (exists) return;
   await io.write(path, new TextEncoder().encode(content));
+}
+
+function extractManagedInstructionBlock(onDiskRaw: string): string | null {
+  const beginIdx = onDiskRaw.indexOf(MANAGED_BEGIN_MARKER);
+  const endIdx = onDiskRaw.indexOf(MANAGED_END_MARKER);
+  if (beginIdx < 0 || endIdx <= beginIdx) return null;
+  const content = onDiskRaw.slice(
+    beginIdx + MANAGED_BEGIN_MARKER.length,
+    endIdx,
+  );
+  const normalized = normalizeManagedInstructionBlockContent(content);
+  return normalized || null;
 }
 
 function spliceManagedInstructionBlock(onDiskRaw: string, managedBlock: string): string {
@@ -115,13 +141,40 @@ function spliceManagedInstructionBlock(onDiskRaw: string, managedBlock: string):
 }
 
 async function ensureManagedClaudeInstructionBlock(): Promise<void> {
+  await writeIfMissing(
+    getClaudeProjectInstructionFile(),
+    getBootstrapInstructionTemplate(),
+  );
+}
+
+export async function readClaudeProjectManagedInstructionBlock(): Promise<string | null> {
+  const io = getIOUtils();
+  if (!io?.exists || !io?.read) return null;
+  const path = getClaudeProjectInstructionFile();
+  const exists = await io.exists(path).catch(() => false);
+  if (!exists) return null;
+  const raw = await io.read(path).catch(() => null);
+  if (!raw) return null;
+  const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+  const current = new TextDecoder("utf-8").decode(bytes);
+  if (current.trim() === getLegacyBootstrapInstructionTemplate().trim()) {
+    return getDefaultClaudeManagedInstructionBlock();
+  }
+  return extractManagedInstructionBlock(current);
+}
+
+export async function updateClaudeProjectManagedInstructionBlock(
+  content: string,
+): Promise<void> {
   const io = getIOUtils();
   if (!io?.exists || !io?.write || !io?.read) return;
   const path = getClaudeProjectInstructionFile();
-  const managedBlock = getBootstrapInstructionManagedBlock();
+  const managedBlock =
+    normalizeManagedInstructionBlockContent(content) ||
+    getDefaultClaudeManagedInstructionBlock();
   const exists = await io.exists(path).catch(() => false);
   if (!exists) {
-    await io.write(path, new TextEncoder().encode(getBootstrapInstructionTemplate()));
+    await io.write(path, new TextEncoder().encode(getBootstrapInstructionTemplate(managedBlock)));
     return;
   }
   const raw = await io.read(path).catch(() => null);
@@ -131,7 +184,7 @@ async function ensureManagedClaudeInstructionBlock(): Promise<void> {
   const currentTrimmed = current.trim();
   const next =
     currentTrimmed === getLegacyBootstrapInstructionTemplate().trim()
-      ? getBootstrapInstructionTemplate()
+      ? getBootstrapInstructionTemplate(managedBlock)
       : spliceManagedInstructionBlock(current, managedBlock);
   if (next === current) return;
   await io.write(path, new TextEncoder().encode(next));
