@@ -5,6 +5,7 @@ import {
   FONT_SCALE_DEFAULT_PERCENT,
   FONT_SCALE_MIN_PERCENT,
   FONT_SCALE_MAX_PERCENT,
+  isUpstreamGlobalConversationKey,
 } from "./constants";
 import type { CustomShortcut, ReasoningLevelSelection } from "./types";
 import { selectedModelCache, panelFontScalePercent } from "./state";
@@ -461,7 +462,8 @@ export function getLockedGlobalConversationKey(
   const raw = getZoteroPrefs()?.get?.(prefKey, true);
   const normalized = Number(raw);
   if (!Number.isFinite(normalized) || normalized <= 0) return null;
-  return Math.floor(normalized);
+  const conversationKey = Math.floor(normalized);
+  return isUpstreamGlobalConversationKey(conversationKey) ? conversationKey : null;
 }
 
 /**

@@ -14,17 +14,21 @@ import {
 } from "../modules/contextPanel/normalizers";
 import type { StoredChatMessage } from "../utils/chatStore";
 import {
-  CLAUDE_GLOBAL_CONVERSATION_KEY_BASE,
   CLAUDE_HISTORY_LIMIT,
-  CLAUDE_PAPER_CONVERSATION_KEY_BASE,
   buildDefaultClaudeGlobalConversationKey,
   buildDefaultClaudePaperConversationKey,
+  getClaudeGlobalConversationKeyRange,
+  getClaudePaperConversationKeyRange,
 } from "./constants";
 import {
   getLastAllocatedClaudeGlobalConversationKey,
   getLastAllocatedClaudePaperConversationKey,
+  isConversationKeyInRange,
   setLastAllocatedClaudeGlobalConversationKey,
   setLastAllocatedClaudePaperConversationKey,
+  setLastUsedClaudeConversationMode,
+  setLastUsedClaudeGlobalConversationKey,
+  setLastUsedClaudePaperConversationKey,
 } from "./prefs";
 
 const CLAUDE_MESSAGES_TABLE = "llm_for_zotero_claude_messages";
@@ -70,6 +74,128 @@ function normalizeCatalogTimestamp(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return Date.now();
   return Math.floor(parsed);
+}
+
+function remapLegacyConversationKey(
+  legacyConversationKey: number,
+  kind: ClaudeConversationKind,
+  libraryID: number,
+  paperItemID?: number,
+): number | null {
+  const normalizedLegacyKey = normalizeConversationKey(legacyConversationKey);
+  const normalizedLibraryID = normalizeLibraryID(libraryID);
+  if (!normalizedLegacyKey || !normalizedLibraryID) return null;
+  if (isConversationKeyInRange(normalizedLegacyKey, kind)) return normalizedLegacyKey;
+  if (kind === "paper") {
+    const normalizedPaperItemID = normalizePaperItemID(paperItemID || 0);
+    if (!normalizedPaperItemID) return null;
+    return buildDefaultClaudePaperConversationKey(normalizedPaperItemID);
+  }
+  return buildDefaultClaudeGlobalConversationKey(normalizedLibraryID);
+}
+
+async function migrateLegacyClaudeConversationKeys(): Promise<void> {
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT conversation_key AS conversationKey,
+            library_id AS libraryID,
+            kind AS kind,
+            paper_item_id AS paperItemID,
+            updated_at AS updatedAt
+     FROM ${CLAUDE_CONVERSATIONS_TABLE}
+     ORDER BY updated_at DESC, conversation_key DESC`,
+  )) as Array<{
+    conversationKey?: unknown;
+    libraryID?: unknown;
+    kind?: unknown;
+    paperItemID?: unknown;
+    updatedAt?: unknown;
+  }> | undefined;
+  if (!rows?.length) return;
+
+  const claimedKeys = new Set<number>(
+    rows
+      .map((row) => {
+        const kind = row.kind === "paper" ? "paper" : row.kind === "global" ? "global" : null;
+        const conversationKey = normalizeConversationKey(Number(row.conversationKey));
+        return kind && conversationKey && isConversationKeyInRange(conversationKey, kind)
+          ? conversationKey
+          : null;
+      })
+      .filter((value): value is number => Number.isFinite(value)),
+  );
+  const latestModeByLibrary = new Set<number>();
+  const latestGlobalByLibrary = new Set<number>();
+  const latestPaperByState = new Set<string>();
+  for (const row of rows) {
+    const kind = row.kind === "paper" ? "paper" : row.kind === "global" ? "global" : null;
+    const legacyConversationKey = normalizeConversationKey(Number(row.conversationKey));
+    const libraryID = normalizeLibraryID(Number(row.libraryID));
+    const paperItemID = normalizePaperItemID(Number(row.paperItemID));
+    if (!kind || !legacyConversationKey || !libraryID) continue;
+
+    let targetConversationKey = remapLegacyConversationKey(
+      legacyConversationKey,
+      kind,
+      libraryID,
+      paperItemID || undefined,
+    );
+    if (!targetConversationKey) continue;
+    if (claimedKeys.has(targetConversationKey) && targetConversationKey !== legacyConversationKey) {
+      targetConversationKey = null;
+    }
+    if (!targetConversationKey) {
+      targetConversationKey = Math.max(
+        kind === "paper"
+          ? buildDefaultClaudePaperConversationKey(paperItemID || 1)
+          : buildDefaultClaudeGlobalConversationKey(libraryID),
+        ((kind === "paper"
+          ? getLastAllocatedClaudePaperConversationKey()
+          : getLastAllocatedClaudeGlobalConversationKey()) || 0) + 1,
+        (await getMaxClaudeConversationKey(kind)) + 1,
+      );
+    }
+
+    claimedKeys.add(targetConversationKey);
+    if (targetConversationKey !== legacyConversationKey) {
+      await Zotero.DB.queryAsync(
+        `UPDATE ${CLAUDE_CONVERSATIONS_TABLE}
+         SET conversation_key = ?,
+             provider_session_id = NULL,
+             scoped_conversation_key = NULL,
+             scope_type = NULL,
+             scope_id = NULL,
+             scope_label = NULL,
+             cwd = NULL
+         WHERE conversation_key = ?`,
+        [targetConversationKey, legacyConversationKey],
+      );
+      await Zotero.DB.queryAsync(
+        `UPDATE ${CLAUDE_MESSAGES_TABLE}
+         SET conversation_key = ?
+         WHERE conversation_key = ?`,
+        [targetConversationKey, legacyConversationKey],
+      );
+    }
+
+    if (!latestModeByLibrary.has(libraryID)) {
+      setLastUsedClaudeConversationMode(libraryID, kind === "paper" ? "paper" : "global");
+      latestModeByLibrary.add(libraryID);
+    }
+    if (kind === "paper" && paperItemID) {
+      const paperStateKey = `${libraryID}:${paperItemID}`;
+      if (!latestPaperByState.has(paperStateKey)) {
+        setLastUsedClaudePaperConversationKey(libraryID, paperItemID, targetConversationKey);
+        latestPaperByState.add(paperStateKey);
+      }
+      setLastAllocatedClaudePaperConversationKey(targetConversationKey);
+      continue;
+    }
+    if (!latestGlobalByLibrary.has(libraryID)) {
+      setLastUsedClaudeGlobalConversationKey(libraryID, targetConversationKey);
+      latestGlobalByLibrary.add(libraryID);
+    }
+    setLastAllocatedClaudeGlobalConversationKey(targetConversationKey);
+  }
 }
 
 export async function initClaudeCodeStore(): Promise<void> {
@@ -162,6 +288,7 @@ export async function initClaudeCodeStore(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS ${CLAUDE_CONVERSATIONS_KIND_INDEX}
        ON ${CLAUDE_CONVERSATIONS_TABLE} (library_id, kind, paper_item_id, updated_at DESC, conversation_key DESC)`,
     );
+    await migrateLegacyClaudeConversationKeys();
   });
 }
 
@@ -1031,25 +1158,20 @@ export async function ensureClaudePaperConversation(
 }
 
 async function getMaxClaudeConversationKey(kind: ClaudeConversationKind): Promise<number> {
+  const range = kind === "global"
+    ? getClaudeGlobalConversationKeyRange()
+    : getClaudePaperConversationKeyRange();
   const rows = (await Zotero.DB.queryAsync(
     `SELECT MAX(conversation_key) AS maxConversationKey
      FROM ${CLAUDE_CONVERSATIONS_TABLE}
      WHERE kind = ?
        AND conversation_key >= ?
        AND conversation_key < ?`,
-    kind === "global"
-      ? [
-          "global",
-          CLAUDE_GLOBAL_CONVERSATION_KEY_BASE,
-          CLAUDE_PAPER_CONVERSATION_KEY_BASE,
-        ]
-      : ["paper", CLAUDE_PAPER_CONVERSATION_KEY_BASE, Number.MAX_SAFE_INTEGER],
+    [kind, range.start, range.endExclusive],
   )) as Array<{ maxConversationKey?: unknown }> | undefined;
   const maxConversationKey = Number(rows?.[0]?.maxConversationKey);
   if (!Number.isFinite(maxConversationKey) || maxConversationKey <= 0) {
-    return kind === "global"
-      ? CLAUDE_GLOBAL_CONVERSATION_KEY_BASE
-      : CLAUDE_PAPER_CONVERSATION_KEY_BASE;
+    return range.start;
   }
   return Math.floor(maxConversationKey);
 }

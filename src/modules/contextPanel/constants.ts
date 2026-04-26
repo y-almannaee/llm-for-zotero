@@ -36,6 +36,10 @@ export const PAPER_CONVERSATION_KEY_BASE = 1_500_000_000;
 export const GLOBAL_CONVERSATION_KEY_BASE = 2_000_000_000;
 export const GLOBAL_HISTORY_LIMIT = 50;
 
+export function isUpstreamGlobalConversationKey(conversationKey: number): boolean {
+  return Number.isFinite(conversationKey) && Math.floor(conversationKey) >= GLOBAL_CONVERSATION_KEY_BASE && Math.floor(conversationKey) < 3_000_000_000;
+}
+
 export function formatFigureCountLabel(
   count: number,
 ): string {

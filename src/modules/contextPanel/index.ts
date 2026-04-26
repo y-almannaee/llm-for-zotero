@@ -75,6 +75,7 @@ import { getEditableSelectionFromDocument } from "./noteSelection";
 import {
   activeClaudeConversationModeByLibrary,
   activeClaudeGlobalConversationByLibrary,
+  buildClaudeLibraryStateKey,
 } from "../../claudeCode/state";
 import {
   retainClaudeRuntimeForBody,
@@ -498,7 +499,9 @@ export function registerReaderSelectionTracking() {
               const basePaperItemID = getPanelBasePaperItemID(root);
               const panelModeLock =
                 panelLibraryId && conversationSystem === "claude_code"
-                  ? activeClaudeConversationModeByLibrary.get(panelLibraryId)
+                  ? activeClaudeConversationModeByLibrary.get(
+                      buildClaudeLibraryStateKey(panelLibraryId),
+                    )
                   : panelLibraryId && conversationSystem === "upstream"
                     ? activeConversationModeByLibrary.get(panelLibraryId)
                     : null;
@@ -507,7 +510,9 @@ export function registerReaderSelectionTracking() {
                   ? Math.floor(
                       Number(
                         (conversationSystem === "claude_code"
-                          ? activeClaudeGlobalConversationByLibrary.get(panelLibraryId)
+                          ? activeClaudeGlobalConversationByLibrary.get(
+                              buildClaudeLibraryStateKey(panelLibraryId),
+                            )
                           : activeGlobalConversationByLibrary.get(panelLibraryId)) || 0,
                       ),
                     )

@@ -28,6 +28,7 @@ import {
   ACTION_LAYOUT_MODEL_WRAP_MIN_CHARS,
   ACTION_LAYOUT_MODEL_FULL_MAX_LINES,
   GLOBAL_HISTORY_LIMIT,
+  isUpstreamGlobalConversationKey,
   PREFERENCES_PANE_ID,
   MAX_UPLOAD_PDF_SIZE_BYTES,
 } from "./constants";
@@ -390,6 +391,7 @@ import {
   activeClaudeConversationModeByLibrary,
   activeClaudeGlobalConversationByLibrary,
   activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
   buildClaudePaperStateKey,
 } from "../../claudeCode/state";
 import {
@@ -881,9 +883,12 @@ export function setupHandlers(
             }) ||
             getLastUsedClaudeGlobalConversationKey(libraryID) ||
             0
-          : getLockedGlobalConversationKey(libraryID) ||
-            activeGlobalConversationByLibrary.get(libraryID) ||
-            0;
+          : (() => {
+              const lockedKey = getLockedGlobalConversationKey(libraryID);
+              if (lockedKey !== null) return lockedKey;
+              const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+              return isUpstreamGlobalConversationKey(activeKey) ? Math.floor(activeKey) : 0;
+            })();
       if (nextConversationKey > 0) {
         await switchGlobalConversation(nextConversationKey);
       } else {
@@ -1034,7 +1039,7 @@ export function setupHandlers(
     }
     if (item && libraryID > 0 && mode && !noteSession) {
       if (isClaudeConversationSystem()) {
-        activeClaudeConversationModeByLibrary.set(libraryID, mode);
+        activeClaudeConversationModeByLibrary.set(buildClaudeLibraryStateKey(libraryID), mode);
         setLastUsedClaudeConversationMode(libraryID, mode);
       } else {
         activeConversationModeByLibrary.set(libraryID, mode);
@@ -4238,7 +4243,7 @@ export function setupHandlers(
           activeGlobalKey = Math.floor(item.id);
         } else {
           const remembered = Number(
-            activeClaudeGlobalConversationByLibrary.get(libraryID) ||
+            activeClaudeGlobalConversationByLibrary.get(buildClaudeLibraryStateKey(libraryID)) ||
               getLastUsedClaudeGlobalConversationKey(libraryID) ||
               0,
           );
@@ -4435,14 +4440,16 @@ export function setupHandlers(
         );
     item = nextItem as any;
     syncConversationIdentity();
-    rememberClaudeConversationSelection({
-      conversationKey: normalizedConversationKey,
-      kind: "global",
-      libraryID,
-    });
-    void touchClaudeConversation(normalizedConversationKey, {
-      updatedAt: Date.now(),
-    });
+    if (isClaudeConversationSystem()) {
+      rememberClaudeConversationSelection({
+        conversationKey: normalizedConversationKey,
+        kind: "global",
+        libraryID,
+      });
+      void touchClaudeConversation(normalizedConversationKey, {
+        updatedAt: Date.now(),
+      });
+    }
     activeEditSession = null;
     inlineEditCleanup?.();
     setInlineEditCleanup(null);
@@ -4762,7 +4769,9 @@ export function setupHandlers(
         return Boolean(summary && (summary.userTurnCount || 0) === 0);
       };
       let candidateDraftKey = Number(
-        activeClaudeGlobalConversationByLibrary.get(libraryID) ||
+        activeClaudeGlobalConversationByLibrary.get(
+          buildClaudeLibraryStateKey(libraryID),
+        ) ||
           getLastUsedClaudeGlobalConversationKey(libraryID) ||
           0,
       );
@@ -4945,13 +4954,17 @@ export function setupHandlers(
     const conversationKey = pending.conversationKey;
     if (isClaudeConversationSystem()) {
       const rememberedKey = Number(
-        activeClaudeGlobalConversationByLibrary.get(pending.libraryID) || 0,
+        activeClaudeGlobalConversationByLibrary.get(
+          buildClaudeLibraryStateKey(pending.libraryID),
+        ) || 0,
       );
       if (
         Number.isFinite(rememberedKey) &&
         Math.floor(rememberedKey) === conversationKey
       ) {
-        activeClaudeGlobalConversationByLibrary.delete(pending.libraryID);
+        activeClaudeGlobalConversationByLibrary.delete(
+          buildClaudeLibraryStateKey(pending.libraryID),
+        );
       }
       const persistedKey = Number(
         getLastUsedClaudeGlobalConversationKey(pending.libraryID) || 0,
@@ -4989,7 +5002,10 @@ export function setupHandlers(
           libraryID: pending.libraryID,
           kind: "global",
           scopeType: "open",
-          scopeId: String(Math.floor(pending.libraryID)),
+          scopeId: buildClaudeScope({
+            libraryID: Math.floor(pending.libraryID),
+            kind: "global",
+          }).scopeId,
           scopeLabel: "Open Chat",
         });
       } catch (err) {
@@ -5502,7 +5518,9 @@ export function setupHandlers(
       await switchToHistoryTarget(fallbackTarget);
       if (fallbackTarget.kind === "paper") {
         if (isClaudeConversationSystem()) {
-          activeClaudeGlobalConversationByLibrary.delete(libraryID);
+          activeClaudeGlobalConversationByLibrary.delete(
+            buildClaudeLibraryStateKey(libraryID),
+          );
         } else {
           activeGlobalConversationByLibrary.delete(libraryID);
           const lockedKey = getLockedGlobalConversationKey(libraryID);
@@ -5567,7 +5585,11 @@ export function setupHandlers(
       if (!forceFresh) {
         const currentCandidate = isGlobalMode()
           ? getConversationKey(item)
-          : Number(activeClaudeGlobalConversationByLibrary.get(libraryID) || 0);
+          : Number(
+              activeClaudeGlobalConversationByLibrary.get(
+                buildClaudeLibraryStateKey(libraryID),
+              ) || 0,
+            );
         const normalizedCurrentCandidate = Number.isFinite(currentCandidate)
           ? Math.floor(currentCandidate)
           : 0;
@@ -5621,10 +5643,13 @@ export function setupHandlers(
         if (status) setStatus(status, t("Failed to create conversation"), "error");
         return;
       }
-      activeClaudeGlobalConversationByLibrary.set(libraryID, targetConversationKey);
+      activeClaudeGlobalConversationByLibrary.set(
+        buildClaudeLibraryStateKey(libraryID),
+        targetConversationKey,
+      );
     } else {
       if (!forceFresh) {
-        const currentCandidate = isGlobalMode()
+        const currentCandidate = isGlobalMode() && isUpstreamGlobalConversationKey(Number(getConversationKey(item) || 0))
           ? getConversationKey(item)
           : Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
         const normalizedCurrentCandidate = Number.isFinite(currentCandidate)
@@ -5976,9 +6001,12 @@ export function setupHandlers(
             libraryID,
             kind: "global",
           }) || getLastUsedClaudeGlobalConversationKey(libraryID) || 0
-        : getLockedGlobalConversationKey(libraryID) ||
-          activeGlobalConversationByLibrary.get(libraryID) ||
-          0;
+        : (() => {
+            const lockedKey = getLockedGlobalConversationKey(libraryID);
+            if (lockedKey !== null) return lockedKey;
+            const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+            return isUpstreamGlobalConversationKey(activeKey) ? Math.floor(activeKey) : 0;
+          })();
       if (targetGlobalKey > 0) {
         void switchGlobalConversation(targetGlobalKey);
       } else {

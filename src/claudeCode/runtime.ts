@@ -18,6 +18,7 @@ import {
 import {
   activeClaudeGlobalConversationByLibrary,
   activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
   buildClaudePaperStateKey,
 } from "./state";
 import {
@@ -58,6 +59,7 @@ import {
   type ClaudeRuntimeModel,
 } from "./constants";
 import { dbg } from "../utils/debugLogger";
+import { getClaudeProfileSignature } from "./projectSkills";
 
 export type ClaudeBridgeActionDescriptor = {
   name: string;
@@ -163,16 +165,17 @@ export function buildClaudeScope(params: {
   paperItemID?: number;
   paperTitle?: string;
 }): ClaudeBridgeScope {
+  const profileSignature = getClaudeProfileSignature();
   if (params.kind === "paper" && params.paperItemID) {
     return {
       scopeType: "paper",
-      scopeId: `${Math.floor(params.libraryID)}:${Math.floor(params.paperItemID)}`,
+      scopeId: `${profileSignature}:${Math.floor(params.libraryID)}:${Math.floor(params.paperItemID)}`,
       scopeLabel: params.paperTitle || undefined,
     };
   }
   return {
     scopeType: "open",
-    scopeId: String(Math.floor(params.libraryID)),
+    scopeId: `${profileSignature}:${Math.floor(params.libraryID)}`,
     scopeLabel: "Open Chat",
   };
 }
@@ -465,7 +468,8 @@ export function rememberClaudeConversationSelection(
     );
     return;
   }
-  activeClaudeGlobalConversationByLibrary.set(summary.libraryID, summary.conversationKey);
+  const libraryKey = buildClaudeLibraryStateKey(summary.libraryID);
+  activeClaudeGlobalConversationByLibrary.set(libraryKey, summary.conversationKey);
   setLastUsedClaudeGlobalConversationKey(summary.libraryID, summary.conversationKey);
 }
 
@@ -482,8 +486,9 @@ export function resolveRememberedClaudeConversationKey(params: {
       null
     );
   }
+  const libraryKey = buildClaudeLibraryStateKey(params.libraryID);
   return (
-    activeClaudeGlobalConversationByLibrary.get(params.libraryID) ||
+    activeClaudeGlobalConversationByLibrary.get(libraryKey) ||
     getLastUsedClaudeGlobalConversationKey(params.libraryID) ||
     null
   );

@@ -17,6 +17,8 @@ import {
 } from "../../claudeCode/prefs";
 import {
   appendClaudeConversationMessage,
+  buildClaudeScope,
+  captureClaudeSessionInfo,
   deleteClaudeConversationTurnMessages,
   getClaudeBridgeRuntime,
   isClaudeConversationSystemActive,
@@ -155,6 +157,7 @@ import {
 import {
   isGlobalPortalItem,
   resolveActiveNoteSession,
+  resolveConversationBaseItem,
   resolveConversationSystemForItem,
   resolveDisplayConversationKind,
 } from "./portalScope";
@@ -3804,6 +3807,25 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
+    if (resolveConversationSystemForItem(item) === "claude_code") {
+      const conversationKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      await captureClaudeSessionInfo(
+        conversationKey,
+        buildClaudeScope({
+          libraryID: Number(item.libraryID || baseItem?.libraryID || 0),
+          kind: conversationKind === "global" ? "global" : "paper",
+          paperItemID:
+            conversationKind === "paper"
+              ? Number(baseItem?.id || 0) || undefined
+              : undefined,
+          paperTitle:
+            conversationKind === "paper"
+              ? String(baseItem?.getField?.("title") || "").trim() || undefined
+              : undefined,
+        }),
+      ).catch(() => null);
+    }
 
     // After the response is saved, kick off a background LLM summary of the
     // older history so it is ready for the next request.

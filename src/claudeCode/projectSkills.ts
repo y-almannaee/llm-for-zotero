@@ -100,8 +100,33 @@ function getHomeDir(): string {
   throw new Error("Cannot resolve home directory for Claude runtime root");
 }
 
+export function getClaudeProfileDir(): string {
+  const profileDir = (Zotero as unknown as { Profile?: { dir?: string } }).Profile?.dir?.trim();
+  if (profileDir) return profileDir;
+  throw new Error("Cannot resolve Zotero profile directory for Claude runtime root");
+}
+
+export function buildClaudeProfileSignature(profileDir: string): string {
+  const normalized = profileDir.trim().replace(/\\/g, "/");
+  let hash = 2166136261;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash ^= normalized.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `profile-${(hash >>> 0).toString(16)}`;
+}
+
+export function getClaudeProfileSignature(): string {
+  return buildClaudeProfileSignature(getClaudeProfileDir());
+}
+
 export function getClaudeRuntimeRootDir(): string {
-  return joinLocalPath(getHomeDir(), "Zotero", "agent-runtime");
+  return joinLocalPath(
+    getHomeDir(),
+    "Zotero",
+    "agent-runtime",
+    getClaudeProfileSignature(),
+  );
 }
 
 export function getClaudeProjectDir(): string {

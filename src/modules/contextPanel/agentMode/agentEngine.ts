@@ -13,6 +13,11 @@ import type {
   AgentRuntimeRequest,
 } from "../../../agent/types";
 import { consumePendingRetentionEvents } from "../../../claudeCode/runtimeRetention";
+import { captureClaudeSessionInfo, buildClaudeScope } from "../../../claudeCode/runtime";
+import {
+  resolveConversationBaseItem,
+  resolveDisplayConversationKind,
+} from "../portalScope";
 
 function buildPendingAgentTraceEvents(body?: Element): AgentRunEventRecord[] {
   const now = Date.now();
@@ -778,6 +783,25 @@ export async function sendAgentTurn(
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
+    if (deps.getConversationSystem?.() === "claude_code") {
+      const conversationKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      await captureClaudeSessionInfo(
+        conversationKey,
+        buildClaudeScope({
+          libraryID: Number(item.libraryID || baseItem?.libraryID || 0),
+          kind: conversationKind === "global" ? "global" : "paper",
+          paperItemID:
+            conversationKind === "paper"
+              ? Number(baseItem?.id || 0) || undefined
+              : undefined,
+          paperTitle:
+            conversationKind === "paper"
+              ? String(baseItem?.getField?.("title") || "").trim() || undefined
+              : undefined,
+        }),
+      ).catch(() => null);
+    }
     setStatusSafely("Ready", "ready");
   } catch (err) {
     const isCancelled =
@@ -1176,6 +1200,25 @@ export async function retryAgentTurn(
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
+    if (deps.getConversationSystem?.() === "claude_code") {
+      const conversationKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      await captureClaudeSessionInfo(
+        conversationKey,
+        buildClaudeScope({
+          libraryID: Number(item.libraryID || baseItem?.libraryID || 0),
+          kind: conversationKind === "global" ? "global" : "paper",
+          paperItemID:
+            conversationKind === "paper"
+              ? Number(baseItem?.id || 0) || undefined
+              : undefined,
+          paperTitle:
+            conversationKind === "paper"
+              ? String(baseItem?.getField?.("title") || "").trim() || undefined
+              : undefined,
+        }),
+      ).catch(() => null);
+    }
     setStatusSafely("Ready", "ready");
   } catch (err) {
     const isCancelled =

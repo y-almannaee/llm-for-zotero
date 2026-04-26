@@ -49,7 +49,8 @@ function getLegacyBootstrapInstructionTemplate(): string {
     DEFAULT_SYSTEM_PROMPT,
     "",
     "## Config model",
-    "- Project config is shared by all Zotero Claude runtimes launched from this installation.",
+    "- Project config is shared by all Claude runtimes within the current Zotero profile.",
+    "- Different Zotero profiles use different Claude runtime roots and different local conversation folders.",
     "- Local config is scoped to the current conversation runtime folder.",
     "- Put shared Zotero skills in `.claude/skills/` or `.claude/commands/` under the runtime root.",
   ].join("\n");
@@ -81,7 +82,8 @@ function getBootstrapInstructionManagedBlock(): string {
     "- Default to the shortest path that can produce a correct answer.",
     "",
     "## Config model",
-    "- Project config is shared by all Zotero Claude runtimes launched from this installation.",
+    "- Project config is shared by all Claude runtimes within the current Zotero profile.",
+    "- Different Zotero profiles use different Claude runtime roots and different local conversation folders.",
     "- Local config is scoped to the current conversation runtime folder.",
     "- Put shared Zotero skills in `.claude/skills/` or `.claude/commands/` under the runtime root.",
   ].join("\n");

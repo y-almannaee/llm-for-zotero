@@ -91,6 +91,7 @@ import {
   setClaudeRuntimeModelPref,
   setClaudeBlockStreamingEnabled,
 } from "../claudeCode/prefs";
+import { getClaudeProfileSignature } from "../claudeCode/projectSkills";
 
 type PrefKey = "systemPrompt";
 
@@ -2021,7 +2022,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       getServices()?.dirsvc?.get?.("Home", getNsIFile())?.path?.trim() ||
       (Zotero as unknown as { Profile?: { dir?: string } }).Profile?.dir?.trim() ||
       ".";
-    const runtimeRoot = joinLocalPath(home, "Zotero", "agent-runtime");
+    const runtimeRoot = joinLocalPath(home, "Zotero", "agent-runtime", getClaudeProfileSignature());
     const scopesRoot = joinLocalPath(runtimeRoot, "scopes");
     const conversationSystem = getConversationSystemPref();
     if (conversationSystem !== "claude_code") {
@@ -2066,7 +2067,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       getServices()?.dirsvc?.get?.("Home", getNsIFile())?.path?.trim() ||
       (Zotero as unknown as { Profile?: { dir?: string } }).Profile?.dir?.trim() ||
       "";
-    const runtimeRoot = joinLocalPath(home || ".", "Zotero", "agent-runtime");
+    const runtimeRoot = joinLocalPath(home || ".", "Zotero", "agent-runtime", getClaudeProfileSignature());
     const projectClaudeDir = joinLocalPath(runtimeRoot, ".claude");
     const localConversationDir = joinLocalPath(
       runtimeRoot,

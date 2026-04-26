@@ -1,6 +1,7 @@
 import {
   GLOBAL_CONVERSATION_KEY_BASE,
   PAPER_CONVERSATION_KEY_BASE,
+  isUpstreamGlobalConversationKey,
 } from "./constants";
 import { normalizePositiveInt } from "./normalizers";
 import {
@@ -41,6 +42,7 @@ import {
   activeClaudeConversationModeByLibrary,
   activeClaudeGlobalConversationByLibrary,
   activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
   buildClaudePaperStateKey,
 } from "../../claudeCode/state";
 
@@ -379,7 +381,7 @@ function resolvePreferredConversationMode(
 ): "global" | "paper" {
   if (system === "claude_code") {
     const rememberedMode =
-      activeClaudeConversationModeByLibrary.get(libraryID) ||
+      activeClaudeConversationModeByLibrary.get(buildClaudeLibraryStateKey(libraryID)) ||
       getLastUsedClaudeConversationMode(libraryID);
     return rememberedMode === "global" ? "global" : "paper";
   }
@@ -397,19 +399,19 @@ function resolveGlobalConversationKey(
   if (system === "claude_code") {
     return Math.floor(
       Number(
-        activeClaudeGlobalConversationByLibrary.get(libraryID) ||
+        activeClaudeGlobalConversationByLibrary.get(buildClaudeLibraryStateKey(libraryID)) ||
           getLastUsedClaudeGlobalConversationKey(libraryID) ||
           buildDefaultClaudeGlobalConversationKey(libraryID),
       ),
     );
   }
-  return Math.floor(
-    Number(
-      getLockedGlobalConversationKey(libraryID) ||
-        activeGlobalConversationByLibrary.get(libraryID) ||
-        GLOBAL_CONVERSATION_KEY_BASE,
-    ),
-  );
+  const lockedKey = getLockedGlobalConversationKey(libraryID);
+  if (lockedKey !== null) return lockedKey;
+  const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+  if (isUpstreamGlobalConversationKey(activeKey)) {
+    return Math.floor(activeKey);
+  }
+  return GLOBAL_CONVERSATION_KEY_BASE;
 }
 
 export function resolveInitialPanelItemState(

@@ -33,6 +33,11 @@ declare namespace _ZoteroTypes {
       "agentPermissionMode": string;
       "conversationSystem": string;
       "claudeCodeConversationModeMap": string;
+      "claudeCodeGlobalConversationMap": string;
+      "claudeCodePaperConversationMap": string;
+      "claudeCodeLastAllocatedConversationKeyMap": string;
+      "claudeCodeLastAllocatedGlobalConversationKey": number;
+      "claudeCodeLastAllocatedPaperConversationKey": number;
       "claudeCodeModel": string;
       "claudeCodeReasoning": string;
       "claudeCodeBlockStreaming": boolean;

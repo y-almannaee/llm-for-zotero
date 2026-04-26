@@ -184,6 +184,19 @@ function normalizeCatalogTimestamp(value: unknown): number {
   return Math.floor(parsed);
 }
 
+function isUpstreamGlobalConversationKey(conversationKey: number): boolean {
+  return Number.isFinite(conversationKey) && conversationKey >= GLOBAL_CONVERSATION_KEY_BASE && conversationKey < 3_000_000_000;
+}
+
+async function purgeInvalidGlobalConversationCatalog(): Promise<void> {
+  await Zotero.DB.queryAsync(
+    `DELETE FROM ${GLOBAL_CONVERSATIONS_TABLE}
+     WHERE conversation_key < ?
+        OR conversation_key >= ?`,
+    [GLOBAL_CONVERSATION_KEY_BASE, 3_000_000_000],
+  );
+}
+
 async function reconcileGlobalConversationCatalog(): Promise<void> {
   const libraryID = resolveUserLibraryID();
   const rows = (await Zotero.DB.queryAsync(
@@ -201,10 +214,11 @@ async function reconcileGlobalConversationCatalog(): Promise<void> {
      LEFT JOIN ${GLOBAL_CONVERSATIONS_TABLE} gc
        ON gc.conversation_key = m.conversation_key
      WHERE m.conversation_key >= ?
+       AND m.conversation_key < ?
        AND gc.conversation_key IS NULL
      GROUP BY m.conversation_key
      ORDER BY m.conversation_key ASC`,
-    [GLOBAL_CONVERSATION_KEY_BASE],
+    [GLOBAL_CONVERSATION_KEY_BASE, 3_000_000_000],
   )) as ConversationCatalogSeedRow[] | undefined;
 
   for (const row of rows || []) {
@@ -278,6 +292,7 @@ async function reconcileLegacyPaperV1ConversationCatalog(): Promise<void> {
 }
 
 export async function reconcileConversationCatalogs(): Promise<void> {
+  await purgeInvalidGlobalConversationCatalog();
   await reconcileGlobalConversationCatalog();
   await reconcileLegacyPaperV1ConversationCatalog();
 }
@@ -1594,7 +1609,7 @@ export async function ensureGlobalConversationExists(
 ): Promise<void> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   const normalizedKey = normalizeConversationKey(conversationKey);
-  if (!normalizedLibraryID || !normalizedKey) return;
+  if (!normalizedLibraryID || !normalizedKey || !isUpstreamGlobalConversationKey(normalizedKey)) return;
   await Zotero.DB.queryAsync(
     `INSERT OR IGNORE INTO ${GLOBAL_CONVERSATIONS_TABLE}
       (conversation_key, library_id, created_at, title)
@@ -1613,7 +1628,10 @@ export async function createGlobalConversation(
   return await Zotero.DB.executeTransaction(async () => {
     const rows = (await Zotero.DB.queryAsync(
       `SELECT MAX(conversation_key) AS maxConversationKey
-       FROM ${GLOBAL_CONVERSATIONS_TABLE}`,
+       FROM ${GLOBAL_CONVERSATIONS_TABLE}
+       WHERE conversation_key >= ?
+         AND conversation_key < ?`,
+      [GLOBAL_CONVERSATION_KEY_BASE, 3_000_000_000],
     )) as Array<{ maxConversationKey?: unknown }> | undefined;
     const maxConversationKey = Number(rows?.[0]?.maxConversationKey);
     const nextConversationKey = Number.isFinite(maxConversationKey)
@@ -1652,11 +1670,13 @@ export async function listGlobalConversations(
      LEFT JOIN ${CHAT_MESSAGES_TABLE} m
        ON m.conversation_key = gc.conversation_key
      WHERE gc.library_id = ?
+       AND gc.conversation_key >= ?
+       AND gc.conversation_key < ?
      GROUP BY gc.conversation_key, gc.library_id, gc.created_at, gc.title
      ${includeEmpty ? "" : "HAVING SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) > 0"}
      ORDER BY lastActivityAt DESC, gc.conversation_key DESC
      LIMIT ?`,
-    [normalizedLibraryID, normalizedLimit],
+    [normalizedLibraryID, GLOBAL_CONVERSATION_KEY_BASE, 3_000_000_000, normalizedLimit],
   )) as GlobalConversationSummaryRow[] | undefined;
 
   if (!rows?.length) return [];
@@ -1673,7 +1693,7 @@ export async function getGlobalConversationUserTurnCount(
   conversationKey: number,
 ): Promise<number> {
   const normalizedKey = normalizeConversationKey(conversationKey);
-  if (!normalizedKey) return 0;
+  if (!normalizedKey || !isUpstreamGlobalConversationKey(normalizedKey)) return 0;
   const rows = (await Zotero.DB.queryAsync(
     `SELECT SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS userTurnCount
      FROM ${CHAT_MESSAGES_TABLE}
@@ -1700,11 +1720,13 @@ export async function getLatestEmptyGlobalConversation(
      LEFT JOIN ${CHAT_MESSAGES_TABLE} m
        ON m.conversation_key = gc.conversation_key
      WHERE gc.library_id = ?
+       AND gc.conversation_key >= ?
+       AND gc.conversation_key < ?
      GROUP BY gc.conversation_key, gc.library_id, gc.created_at, gc.title
      HAVING SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) = 0
      ORDER BY gc.created_at DESC, gc.conversation_key DESC
      LIMIT 1`,
-    [normalizedLibraryID],
+    [normalizedLibraryID, GLOBAL_CONVERSATION_KEY_BASE, 3_000_000_000],
   )) as GlobalConversationSummaryRow[] | undefined;
   if (!rows?.length) return null;
   return toGlobalConversationSummary(rows[0]);
@@ -1714,7 +1736,7 @@ export async function getGlobalConversation(
   conversationKey: number,
 ): Promise<GlobalConversationSummary | null> {
   const normalizedKey = normalizeConversationKey(conversationKey);
-  if (!normalizedKey) return null;
+  if (!normalizedKey || !isUpstreamGlobalConversationKey(normalizedKey)) return null;
   const rows = (await Zotero.DB.queryAsync(
     `SELECT gc.conversation_key AS conversationKey,
             gc.library_id AS libraryID,

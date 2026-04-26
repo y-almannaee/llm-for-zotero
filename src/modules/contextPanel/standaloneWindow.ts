@@ -1,4 +1,4 @@
-import { config, GLOBAL_CONVERSATION_KEY_BASE } from "./constants";
+import { config, GLOBAL_CONVERSATION_KEY_BASE, isUpstreamGlobalConversationKey } from "./constants";
 import {
   activeContextPanels,
   activeContextPanelRawItems,
@@ -87,6 +87,7 @@ import {
 import {
   activeClaudeGlobalConversationByLibrary,
   activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
   buildClaudePaperStateKey,
 } from "../../claudeCode/state";
 import {
@@ -2439,12 +2440,16 @@ export function openStandaloneChat(options?: {
               if (isClaudeConversationSystem()) {
                 await deleteClaudeConversation(key);
                 const rememberedKey =
-                  activeClaudeGlobalConversationByLibrary.get(currentLibraryID);
+                  activeClaudeGlobalConversationByLibrary.get(
+                    buildClaudeLibraryStateKey(currentLibraryID),
+                  );
                 if (
                   rememberedKey !== undefined &&
                   Number(rememberedKey) === key
                 ) {
-                  activeClaudeGlobalConversationByLibrary.delete(currentLibraryID);
+                  activeClaudeGlobalConversationByLibrary.delete(
+                    buildClaudeLibraryStateKey(currentLibraryID),
+                  );
                 }
                 const persistedKey = getLastUsedClaudeGlobalConversationKey(
                   currentLibraryID,
@@ -2538,7 +2543,10 @@ export function openStandaloneChat(options?: {
                 if (standaloneMode === "open") {
                   const currentLibraryID = getCurrentLibraryScopeID();
                   if (isClaudeConversationSystem()) {
-                    activeClaudeGlobalConversationByLibrary.set(currentLibraryID, fallbackKey);
+                    activeClaudeGlobalConversationByLibrary.set(
+                      buildClaudeLibraryStateKey(currentLibraryID),
+                      fallbackKey,
+                    );
                   } else {
                     activeGlobalConversationByLibrary.set(currentLibraryID, fallbackKey);
                   }
@@ -2567,7 +2575,10 @@ export function openStandaloneChat(options?: {
                   if (newKey && !cancelled) {
                     activeConversationKey = newKey;
                     if (isClaudeConversationSystem()) {
-                      activeClaudeGlobalConversationByLibrary.set(currentLibraryID, newKey);
+                      activeClaudeGlobalConversationByLibrary.set(
+                        buildClaudeLibraryStateKey(currentLibraryID),
+                        newKey,
+                      );
                     } else {
                       activeGlobalConversationByLibrary.set(currentLibraryID, newKey);
                     }
@@ -2646,7 +2657,10 @@ export function openStandaloneChat(options?: {
         if (standaloneMode === "open") {
           const currentLibraryID = getCurrentLibraryScopeID();
           if (isClaudeConversationSystem()) {
-            activeClaudeGlobalConversationByLibrary.set(currentLibraryID, key);
+            activeClaudeGlobalConversationByLibrary.set(
+              buildClaudeLibraryStateKey(currentLibraryID),
+              key,
+            );
           } else {
             activeGlobalConversationByLibrary.set(currentLibraryID, key);
           }
@@ -2709,7 +2723,7 @@ export function openStandaloneChat(options?: {
         }
         if (!forceFresh) {
           const currentKey = Number(activeConversationKey || 0);
-          if (Number.isFinite(currentKey) && currentKey > 0) {
+          if (isUpstreamGlobalConversationKey(currentKey)) {
             try {
               const turnCount = await getGlobalConversationUserTurnCount(currentKey);
               if (turnCount === 0) {
@@ -2833,7 +2847,10 @@ export function openStandaloneChat(options?: {
             if (!newKey || cancelled) return;
             activeConversationKey = newKey;
             if (isClaudeConversationSystem()) {
-              activeClaudeGlobalConversationByLibrary.set(currentLibraryID, newKey);
+              activeClaudeGlobalConversationByLibrary.set(
+                buildClaudeLibraryStateKey(currentLibraryID),
+                newKey,
+              );
             } else {
               activeGlobalConversationByLibrary.set(currentLibraryID, newKey);
             }
@@ -2936,7 +2953,10 @@ export function openStandaloneChat(options?: {
                 : createGlobalPortalItem(libraryID, conversationKey);
             activeConversationKey = conversationKey;
             if (nextSystem === "claude_code") {
-              activeClaudeGlobalConversationByLibrary.set(libraryID, conversationKey);
+              activeClaudeGlobalConversationByLibrary.set(
+                buildClaudeLibraryStateKey(libraryID),
+                conversationKey,
+              );
             } else {
               activeGlobalConversationByLibrary.set(libraryID, conversationKey);
             }
@@ -2971,11 +2991,12 @@ export function openStandaloneChat(options?: {
             return;
           }
 
-          const rememberedUpstreamKey = Number(
-            getLockedGlobalConversationKey(libraryID) ||
-              activeGlobalConversationByLibrary.get(libraryID) ||
-              0,
-          );
+          const rememberedUpstreamKey = (() => {
+            const lockedKey = getLockedGlobalConversationKey(libraryID);
+            if (lockedKey !== null) return lockedKey;
+            const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+            return isUpstreamGlobalConversationKey(activeKey) ? Math.floor(activeKey) : 0;
+          })();
           const targetKey = Number.isFinite(rememberedUpstreamKey) && rememberedUpstreamKey > 0
             ? Math.floor(rememberedUpstreamKey)
             : GLOBAL_CONVERSATION_KEY_BASE;
@@ -3122,7 +3143,10 @@ export function openStandaloneChat(options?: {
           if (!key) return;
           activeConversationKey = key;
           if (isClaudeConversationSystem()) {
-            activeClaudeGlobalConversationByLibrary.set(currentLibraryID, key);
+            activeClaudeGlobalConversationByLibrary.set(
+              buildClaudeLibraryStateKey(currentLibraryID),
+              key,
+            );
           } else {
             activeGlobalConversationByLibrary.set(currentLibraryID, key);
           }

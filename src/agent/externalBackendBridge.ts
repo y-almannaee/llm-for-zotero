@@ -4,6 +4,7 @@ import {
   getClaudeCustomInstructionPref,
   getConversationSystemPref,
 } from "../claudeCode/prefs";
+import { getClaudeProfileSignature } from "../claudeCode/projectSkills";
 import { dbg, dbgError } from "../utils/debugLogger";
 import type { AgentRuntime } from "./runtime";
 import {
@@ -260,7 +261,9 @@ async function buildClaudeProviderIdentityStack(): Promise<string[]> {
   const sources = getClaudeSettingSourcesByPref();
   const configSource = getClaudeConfigSourcePref();
   const bridgeUrl = normalizeBaseUrl(getClaudeBridgeUrl());
+  const profileSignature = getClaudeProfileSignature();
   return [
+    `profile:${profileSignature}`,
     `configSource:${configSource}`,
     `settingSources:${sources.join(",")}`,
     `bridgeUrl:${bridgeUrl}`,
@@ -513,11 +516,12 @@ function resolvePaperScopeFromRequest(request: AgentRuntimeRequest): BridgeScope
       ? String(titleItem.getField("title") || "").trim() || undefined
       : undefined;
 
-  const scopeId = `${libraryID ?? 0}:${paperItemId}`;
+  const scopeId = `${getClaudeProfileSignature()}:${libraryID ?? 0}:${paperItemId}`;
   return { scopeType: "paper", scopeId, scopeLabel };
 }
 
 function resolveBridgeScope(request: AgentRuntimeRequest): BridgeScope {
+  const profileSignature = getClaudeProfileSignature();
   const explicitType = normalizeScopeType(
     (request as unknown as { scopeType?: unknown }).scopeType,
   );
@@ -547,7 +551,7 @@ function resolveBridgeScope(request: AgentRuntimeRequest): BridgeScope {
       : 0;
   return {
     scopeType: "open",
-    scopeId: String(libraryID),
+    scopeId: `${profileSignature}:${libraryID}`,
     scopeLabel: "Open Chat",
   };
 }
