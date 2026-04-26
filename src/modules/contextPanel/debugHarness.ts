@@ -40,6 +40,7 @@ type HarnessPanelInfo = {
   runtimeMode: HarnessRuntimeMode;
   providerLabel: string | null;
   isConnected: boolean;
+  isStandalone: boolean;
 };
 
 type HarnessEntry = {
@@ -177,15 +178,20 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
 
 function getActiveHarnessEntry(): { body: Element; entry: HarnessEntry } | null {
   const entries = Array.from(harnessEntries.entries());
+  let fallback: { body: Element; entry: HarnessEntry } | null = null;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const [body, entry] = entries[index]!;
     if (!body.isConnected) {
       harnessEntries.delete(body);
       continue;
     }
-    return { body, entry };
+    const candidate = { body, entry };
+    if (entry.getInfo().isStandalone) {
+      return candidate;
+    }
+    fallback = fallback || candidate;
   }
-  return null;
+  return fallback;
 }
 
 async function writeHarnessResult(result: Record<string, unknown>): Promise<void> {

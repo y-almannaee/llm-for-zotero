@@ -42,6 +42,10 @@ import {
   clearConversation as clearStoredConversation,
   deleteGlobalConversation,
   deletePaperConversation,
+  getGlobalConversationUserTurnCount,
+  getLatestEmptyGlobalConversation,
+  getPaperConversation,
+  listPaperConversations,
   loadConversation,
 } from "../../utils/chatStore";
 import { removeConversationAttachmentFiles } from "./attachmentStorage";
@@ -95,6 +99,8 @@ import {
   createClaudePaperConversation,
   deleteClaudeConversation,
   getClaudeConversationSummary,
+  listClaudeGlobalConversations,
+  listClaudePaperConversations,
   loadClaudeConversation,
   upsertClaudeConversationSummary,
 } from "../../claudeCode/store";
@@ -2664,6 +2670,150 @@ export function openStandaloneChat(options?: {
         }
       });
 
+      const resolveStandaloneGlobalConversation = async (
+        forceFresh = false,
+      ): Promise<number> => {
+        const currentLibraryID = getCurrentLibraryScopeID();
+        if (!currentLibraryID) return 0;
+        if (isClaudeConversationSystem()) {
+          if (!forceFresh) {
+            const currentKey = Number(activeConversationKey || 0);
+            if (Number.isFinite(currentKey) && currentKey > 0) {
+              try {
+                const currentSummary = await getClaudeConversationSummary(currentKey);
+                if (currentSummary && (currentSummary.userTurnCount || 0) === 0) {
+                  return Math.floor(currentKey);
+                }
+              } catch (err) {
+                ztoolkit.log("LLM: standalone failed to inspect active Claude global draft", err);
+              }
+            }
+            try {
+              const summaries = await listClaudeGlobalConversations(
+                currentLibraryID,
+                50,
+              );
+              const latestEmpty = summaries.find(
+                (summary) => (summary.userTurnCount || 0) === 0,
+              );
+              if (latestEmpty?.conversationKey) {
+                return Math.floor(latestEmpty.conversationKey);
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to list Claude global drafts", err);
+            }
+          }
+          return Number(
+            (await createClaudeGlobalConversation(currentLibraryID))?.conversationKey || 0,
+          );
+        }
+        if (!forceFresh) {
+          const currentKey = Number(activeConversationKey || 0);
+          if (Number.isFinite(currentKey) && currentKey > 0) {
+            try {
+              const turnCount = await getGlobalConversationUserTurnCount(currentKey);
+              if (turnCount === 0) {
+                return Math.floor(currentKey);
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to inspect active global draft", err);
+            }
+          }
+          try {
+            const latestEmpty = await getLatestEmptyGlobalConversation(currentLibraryID);
+            if (latestEmpty?.conversationKey) {
+              return Math.floor(latestEmpty.conversationKey);
+            }
+          } catch (err) {
+            ztoolkit.log("LLM: standalone failed to load latest global draft", err);
+          }
+        }
+        return await createGlobalConversation(currentLibraryID);
+      };
+
+      const resolveStandalonePaperConversation = async (
+        forceFresh = false,
+      ): Promise<{ conversationKey: number; sessionVersion?: number }> => {
+        if (!currentBasePaperItem) {
+          return { conversationKey: 0 };
+        }
+        const paperLibraryID = getCurrentPaperLibraryID();
+        const paperId = Number(currentBasePaperItem.id || 0);
+        if (!paperLibraryID || !paperId) {
+          return { conversationKey: 0 };
+        }
+        if (isClaudeConversationSystem()) {
+          if (!forceFresh) {
+            const currentKey = Number(activeConversationKey || 0);
+            if (Number.isFinite(currentKey) && currentKey > 0) {
+              try {
+                const currentSummary = await getClaudeConversationSummary(currentKey);
+                if (
+                  currentSummary &&
+                  currentSummary.kind === "paper" &&
+                  (currentSummary.userTurnCount || 0) === 0
+                ) {
+                  return { conversationKey: Math.floor(currentKey) };
+                }
+              } catch (err) {
+                ztoolkit.log("LLM: standalone failed to inspect active Claude paper draft", err);
+              }
+            }
+            try {
+              const summaries = await listClaudePaperConversations(
+                paperLibraryID,
+                paperId,
+                50,
+              );
+              const emptyEntry = summaries.find(
+                (summary) => (summary.userTurnCount || 0) === 0,
+              );
+              if (emptyEntry?.conversationKey) {
+                return { conversationKey: Math.floor(emptyEntry.conversationKey) };
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to list Claude paper drafts", err);
+            }
+          }
+          return {
+            conversationKey: Number(
+              (await createClaudePaperConversation(paperLibraryID, paperId))
+                ?.conversationKey || 0,
+            ),
+          };
+        }
+        if (!forceFresh) {
+          const currentKey = Number(activeConversationKey || 0);
+          if (Number.isFinite(currentKey) && currentKey > 0) {
+            try {
+              const currentSummary = await getPaperConversation(currentKey);
+              if (currentSummary && currentSummary.userTurnCount === 0) {
+                return { conversationKey: Math.floor(currentKey) };
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to inspect active paper draft", err);
+            }
+          }
+          try {
+            const summaries = await listPaperConversations(paperLibraryID, paperId, 50);
+            const emptyEntry = summaries.find((summary) => summary.userTurnCount === 0);
+            if (emptyEntry?.conversationKey) {
+              return {
+                conversationKey: Math.floor(emptyEntry.conversationKey),
+                sessionVersion: emptyEntry.sessionVersion,
+              };
+            }
+          } catch (err) {
+            ztoolkit.log("LLM: standalone failed to list paper drafts", err);
+          }
+        }
+        const summary = await createPaperConversation(paperLibraryID, paperId);
+        return {
+          conversationKey: Number(summary?.conversationKey || 0),
+          sessionVersion: summary?.sessionVersion,
+        };
+      };
+
       // Icon strip handlers — new chat
       iconNewChat.addEventListener("click", async () => {
         try {
@@ -2679,9 +2829,7 @@ export function openStandaloneChat(options?: {
 
           if (standaloneMode === "open") {
             const currentLibraryID = getCurrentLibraryScopeID();
-            const newKey = isClaudeConversationSystem()
-              ? Number((await createClaudeGlobalConversation(currentLibraryID))?.conversationKey || 0)
-              : await createGlobalConversation(currentLibraryID);
+            const newKey = await resolveStandaloneGlobalConversation(false);
             if (!newKey || cancelled) return;
             activeConversationKey = newKey;
             if (isClaudeConversationSystem()) {
@@ -2698,20 +2846,8 @@ export function openStandaloneChat(options?: {
             await renderSidebar();
           } else {
             if (currentBasePaperItem) {
-              const paperId = Number(currentBasePaperItem.id || 0);
-              let newKey = 0;
-              let sessionVersion: number | undefined;
-              if (isClaudeConversationSystem()) {
-                const summary = await createClaudePaperConversation(
-                  getCurrentPaperLibraryID(),
-                  paperId,
-                );
-                newKey = Number(summary?.conversationKey || 0);
-              } else {
-                const summary = await createPaperConversation(getCurrentPaperLibraryID(), paperId);
-                newKey = Number(summary?.conversationKey || 0);
-                sessionVersion = summary?.sessionVersion;
-              }
+              const { conversationKey: newKey, sessionVersion } =
+                await resolveStandalonePaperConversation(false);
               if (!newKey || cancelled) return;
               const newItem = buildStandalonePortalItem({
                 mode: "paper",
@@ -2810,9 +2946,7 @@ export function openStandaloneChat(options?: {
           };
 
           if (forceFresh) {
-            const newKey = nextSystem === "claude_code"
-              ? Number((await createClaudeGlobalConversation(libraryID))?.conversationKey || 0)
-              : await createGlobalConversation(libraryID);
+            const newKey = await resolveStandaloneGlobalConversation(true);
             if (switchSeq !== systemSwitchSeq) return;
             if (newKey > 0) {
               mountOpenConversation(newKey);
@@ -2859,19 +2993,9 @@ export function openStandaloneChat(options?: {
         currentPaperItem = resolved.item || currentPaperItem;
         if (forceFresh) {
           const paperItem = currentBasePaperItem;
-          const paperLibraryID = getCurrentPaperLibraryID();
-          const paperId = Number(paperItem?.id || 0);
-          if (!paperItem || !paperLibraryID || !paperId) return;
-          let newKey = 0;
-          let sessionVersion: number | undefined;
-          if (nextSystem === "claude_code") {
-            const summary = await createClaudePaperConversation(paperLibraryID, paperId);
-            newKey = Number(summary?.conversationKey || 0);
-          } else {
-            const summary = await createPaperConversation(paperLibraryID, paperId);
-            newKey = Number(summary?.conversationKey || 0);
-            sessionVersion = summary?.sessionVersion;
-          }
+          if (!paperItem) return;
+          const { conversationKey: newKey, sessionVersion } =
+            await resolveStandalonePaperConversation(true);
           if (switchSeq !== systemSwitchSeq) return;
           if (!newKey) return;
           const freshItem = nextSystem === "claude_code"

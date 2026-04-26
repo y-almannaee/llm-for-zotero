@@ -10840,6 +10840,7 @@ export function setupHandlers(
       runtimeMode: getCurrentRuntimeMode(),
       providerLabel: getSelectedProfile()?.providerLabel || null,
       isConnected: body.isConnected,
+      isStandalone: (body as HTMLElement).dataset?.standalone === "true",
     }),
   });
   ztoolkit.log("LLM: panel debug harness ready", harnessPaths);
