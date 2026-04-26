@@ -469,7 +469,7 @@ _Special thanks to [@jianghao-zhang](https://github.com/jianghao-zhang) and [@bo
      - Click **Test Connection** to verify.
    - **Legacy fallback for existing users**
      - **Auth Mode** → `Codex Auth (Legacy)`
-     - **API URL** → `https://chatgpt.com/backend-api/codex/responses`
+     - **Codex CLI Path** → leave the path blank for auto-detection, enter `wsl.exe` to force the default distro, enter `wsl.exe -d Ubuntu-22.04` to choose a distro, or enter a WSL path such as `/home/<user>/.local/bin/codex`.
      - **Model** → a Codex model (e.g. `gpt-5.4`)
      - Existing users can keep this configuration unchanged in the next release while `Codex App Server` is validated as the long-term replacement.
 

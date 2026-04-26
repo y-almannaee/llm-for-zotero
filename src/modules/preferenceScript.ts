@@ -71,6 +71,7 @@ import {
 } from "../utils/notesDirectoryConfig";
 import { testMineruConnection } from "../utils/mineruClient";
 import { registerMineruManagerScript } from "./mineruManagerScript";
+import { getRuntimePlatformInfo } from "../utils/runtimePlatform";
 
 type PrefKey = "systemPrompt";
 
@@ -94,6 +95,19 @@ const LEGACY_CODEX_API_HELPER_TEXT =
   "Legacy direct backend URL. Usually uses https://chatgpt.com/backend-api/codex/responses. Existing users can keep it in this release, but new users should use Codex App Server. Planned for deprecation in a future release after app-server validation.";
 const CODEX_APP_SERVER_PROTOCOL_HELPER_TEXT =
   "Uses Codex responses with the local codex app-server transport.";
+const CODEX_APP_SERVER_PATH_HELPER_TEXT_WINDOWS =
+  "Optional. Leave blank to auto-detect (Windows or WSL). Or enter a path/launcher such as C:\\nvm4w\\nodejs\\codex.cmd, wsl.exe, wsl.exe -d Ubuntu-22.04, or a WSL path such as /home/<user>/.local/bin/codex.";
+const CODEX_APP_SERVER_PATH_HELPER_TEXT_MACOS =
+  "Optional. Leave blank to auto-detect. Or enter an absolute path such as /opt/homebrew/bin/codex or /usr/local/bin/codex.";
+const CODEX_APP_SERVER_PATH_HELPER_TEXT_LINUX =
+  "Optional. Leave blank to auto-detect. Or enter an absolute path such as /usr/local/bin/codex or ~/.local/bin/codex.";
+
+function getCodexAppServerPathHelperText(): string {
+  const platform = getRuntimePlatformInfo().platform;
+  if (platform === "windows") return CODEX_APP_SERVER_PATH_HELPER_TEXT_WINDOWS;
+  if (platform === "macos") return CODEX_APP_SERVER_PATH_HELPER_TEXT_MACOS;
+  return CODEX_APP_SERVER_PATH_HELPER_TEXT_LINUX;
+}
 const LEGACY_CODEX_AUTH_PROTOCOL_HELPER_TEXT =
   "Uses Codex responses with the legacy direct backend transport.";
 const COPILOT_API_HELPER_TEXT =
@@ -998,9 +1012,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         group.authMode === "codex_auth"
           ? t(LEGACY_CODEX_API_HELPER_TEXT)
           : group.authMode === "codex_app_server"
-            ? t(
-                "Optional. Leave blank to auto-detect Windows or WSL codex, or enter a path/launcher such as C:\\nvm4w\\nodejs\\codex.cmd, wsl.exe, wsl.exe -d Ubuntu-22.04, or /home/<user>/.local/bin/codex.",
-              )
+            ? t(getCodexAppServerPathHelperText())
             : group.authMode === "copilot_auth"
               ? t(COPILOT_API_HELPER_TEXT)
               : getPresetSelectHelperText(selectedPresetId),

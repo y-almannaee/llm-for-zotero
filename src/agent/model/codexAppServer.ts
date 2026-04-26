@@ -69,6 +69,9 @@ export class CodexAppServerAdapter implements AgentModelAdapter {
     const request = params.request;
     const codexPath = resolveCodexAppServerBinaryPath(request.apiBase);
     if (this.codexPath !== codexPath) {
+      destroyCachedCodexAppServerProcess(this.processKey, undefined, {
+        codexPath: this.codexPath,
+      });
       this.threadId = null;
       this.codexPath = codexPath;
     }
