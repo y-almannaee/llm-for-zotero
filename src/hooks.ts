@@ -9,8 +9,11 @@ import {
   registerReaderSelectionTracking,
   openStandaloneChat,
 } from "./modules/contextPanel";
+import { resolveActiveLibraryID } from "./modules/contextPanel/portalScope";
 import { invalidatePaperSearchCache } from "./modules/contextPanel/paperSearch";
 import { initChatStore } from "./utils/chatStore";
+import { initClaudeCodeStore } from "./claudeCode/store";
+import { ensureClaudeProjectBootstrap } from "./claudeCode/bootstrap";
 import {
   initAttachmentRefStore,
   reconcileNoteAttachmentRefsFromNoteContent,
@@ -49,6 +52,16 @@ async function onStartup() {
     await initChatStore();
   } catch (err) {
     ztoolkit.log("LLM: Failed to initialize chat store", err);
+  }
+  try {
+    await initClaudeCodeStore();
+  } catch (err) {
+    ztoolkit.log("LLM: Failed to initialize Claude Code store", err);
+  }
+  try {
+    await ensureClaudeProjectBootstrap();
+  } catch (err) {
+    ztoolkit.log("LLM: Failed to bootstrap Claude project config", err);
   }
   try {
     await initAgentSubsystem();
@@ -129,7 +142,22 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
     key.setAttribute("modifiers", "accel,shift");
     key.setAttribute("key", "L");
     key.setAttribute("oncommand", "void(0)");
-    key.addEventListener("command", () => openStandaloneChat());
+    key.addEventListener("command", () => {
+      let initialItem: Zotero.Item | null = null;
+      try {
+        const pane = Zotero.getActiveZoteroPane?.() as
+          | { getSelectedItems?: () => Zotero.Item[] }
+          | undefined;
+        initialItem = pane?.getSelectedItems?.()?.[0] || null;
+      } catch {
+        void 0;
+      }
+      if (!initialItem && resolveActiveLibraryID()) {
+        openStandaloneChat();
+        return;
+      }
+      openStandaloneChat({ initialItem });
+    });
     keyset.appendChild(key);
   }
 }

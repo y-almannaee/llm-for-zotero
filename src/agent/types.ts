@@ -233,6 +233,13 @@ export type ToolSpec = {
 };
 
 export type AgentEvent =
+  | {
+      type: "provider_event";
+      providerType?: string;
+      sessionId?: string;
+      payload?: Record<string, unknown>;
+      ts?: number;
+    }
   | { type: "status"; text: string }
   | {
       type: "reasoning";
@@ -273,6 +280,20 @@ export type AgentEvent =
     }
   | { type: "message_delta"; text: string }
   | { type: "message_rollback"; length: number; text: string }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      cacheCreationInputTokens?: number;
+      cacheReadInputTokens?: number;
+      contextTokens: number;
+      contextWindow?: number;
+      contextWindowIsAuthoritative?: boolean;
+      percentage?: number;
+      sessionId?: string;
+      model?: string;
+    }
+  | { type: "context_compacted"; automatic?: boolean }
   | { type: "fallback"; reason: string }
   | { type: "final"; text: string };
 
@@ -385,12 +406,14 @@ export type AgentRuntimeRequest = AgentRequest & {
   item?: Zotero.Item | null;
   history?: ChatMessage[];
   authMode?: ModelProviderAuthMode;
+  claudeEffortLevel?: "low" | "medium" | "high" | "xhigh" | "max";
   systemPrompt?: string;
   /** Optional user-defined instructions injected between persona and tool guidance */
   customInstructions?: string;
   modelProviderLabel?: string;
   libraryID?: number;
   activeNoteContext?: ActiveNoteContext;
+  metadata?: Record<string, unknown>;
 };
 
 export type AgentRuntimeOutcome =

@@ -28,6 +28,7 @@ import {
   ACTION_LAYOUT_MODEL_WRAP_MIN_CHARS,
   ACTION_LAYOUT_MODEL_FULL_MAX_LINES,
   GLOBAL_HISTORY_LIMIT,
+  isUpstreamGlobalConversationKey,
   PREFERENCES_PANE_ID,
   MAX_UPLOAD_PDF_SIZE_BYTES,
 } from "./constants";
@@ -52,6 +53,7 @@ import {
   setPendingRequestId,
   getPendingRequestId,
   getAbortController,
+  setAbortController,
   isRequestPending,
   panelFontScalePercent,
   setPanelFontScalePercent,
@@ -62,8 +64,8 @@ import {
   chatHistory,
   loadedConversationKeys,
   currentRequestId,
-  activeGlobalConversationByLibrary,
   activeConversationModeByLibrary,
+  activeGlobalConversationByLibrary,
   activePaperConversationByPaper,
   draftInputCache,
   activeContextPanels,
@@ -107,6 +109,7 @@ import {
   getAvailableModelEntries,
   getStringPref,
   getAgentModeEnabled,
+  getClaudeCodeModeEnabled,
   getSelectedModelEntryForItem,
   applyPanelFontScale,
   getAdvancedModelParamsForEntry,
@@ -274,7 +277,11 @@ import {
   type PaperScopedActionCollectionCandidate,
   type PaperScopedActionProfile,
 } from "./paperScopeCommand";
-import { getAgentApi, initAgentSubsystem } from "../../agent/index";
+import {
+  getAgentApi,
+  getCoreAgentRuntime,
+  initAgentSubsystem,
+} from "../../agent/index";
 import type { ActionRequestContext } from "../../agent/actions";
 import { renderPendingActionCard } from "./agentTrace/render";
 import type {
@@ -286,6 +293,7 @@ import {
   createPaperPortalItem,
   isGlobalPortalItem,
   resolveActiveNoteSession,
+  resolveConversationSystemForItem,
   resolveDisplayConversationKind,
   resolveConversationBaseItem,
   resolveInitialPanelItemState,
@@ -347,7 +355,149 @@ import {
 import { createSendFlowController } from "./setupHandlers/controllers/sendFlowController";
 import { createClearConversationController } from "./setupHandlers/controllers/clearConversationController";
 import { clearAllAgentToolCaches } from "../../agent/tools";
+import { renderShortcuts } from "./shortcuts";
 import { loadConversationHistoryScope } from "./historyLoader";
+import { loadClaudeConversationHistoryScope } from "../../claudeCode/historyLoader";
+import {
+  buildClaudeScope,
+  getClaudeRuntimeModelEntries,
+  getSelectedClaudeRuntimeEntry,
+  invalidateAllClaudeHotRuntimes,
+  invalidateClaudeConversationSession,
+  listClaudeEfforts,
+  rememberClaudeConversationSelection,
+  resolveRememberedClaudeConversationKey,
+  refreshClaudeSlashCommands,
+  touchClaudeConversation,
+} from "../../claudeCode/runtime";
+import {
+  getClaudeReasoningModePref,
+  getConversationSystemPref,
+  getLastUsedClaudeGlobalConversationKey,
+  setClaudeCodeModeEnabled,
+  setConversationSystemPref,
+  getLastUsedClaudePaperConversationKey,
+  removeLastUsedClaudeGlobalConversationKey,
+  removeLastUsedClaudePaperConversationKey,
+  setClaudeReasoningModePref,
+  setClaudeRuntimeModelPref,
+  setLastUsedClaudeConversationMode,
+} from "../../claudeCode/prefs";
+import {
+  activeClaudeConversationModeByLibrary,
+  activeClaudeGlobalConversationByLibrary,
+  activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
+  buildClaudePaperStateKey,
+} from "../../claudeCode/state";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
+import {
+  isClaudeGlobalPortalItem,
+  isClaudePaperPortalItem,
+} from "../../claudeCode/portal";
+import {
+  clearClaudeConversation,
+  createClaudeGlobalConversation,
+  createClaudePaperConversation,
+  deleteClaudeConversation,
+  ensureClaudePaperConversation,
+  getClaudeConversationSummary,
+  listClaudeGlobalConversations,
+  listClaudePaperConversations,
+  loadClaudeConversation,
+  setClaudeConversationTitle,
+  touchClaudeConversationTitle,
+  upsertClaudeConversationSummary,
+} from "../../claudeCode/store";
+import {
+  createClaudeGlobalPortalItem,
+  createClaudePaperPortalItem,
+} from "../../claudeCode/portal";
+
+type QueuedClaudeInput = {
+  id: number;
+  text: string;
+};
+
+let queuedClaudeInputSeq = 0;
+const queuedClaudeInputsByClaudeThread = new Map<string, QueuedClaudeInput[]>();
+const queuedClaudeThreadBodies = new Map<string, Set<Element>>();
+
+function getClaudeQueuedInputThreadKey(item: Zotero.Item | null | undefined): string | null {
+  if (!item) return null;
+  if (isClaudeGlobalPortalItem(item)) {
+    const libraryID = Number(item.libraryID);
+    const conversationKey = Number(item.id);
+    if (!Number.isFinite(libraryID) || !Number.isFinite(conversationKey)) return null;
+    return `claude:global:${Math.floor(libraryID)}:${Math.floor(conversationKey)}`;
+  }
+  if (isClaudePaperPortalItem(item)) {
+    const libraryID = Number(item.libraryID);
+    const paperItemID = Number(item.__llmClaudePaperPortalBaseItemID);
+    const conversationKey = Number(item.id);
+    if (
+      !Number.isFinite(libraryID) ||
+      !Number.isFinite(paperItemID) ||
+      !Number.isFinite(conversationKey)
+    ) {
+      return null;
+    }
+    return `claude:paper:${Math.floor(libraryID)}:${Math.floor(paperItemID)}:${Math.floor(conversationKey)}`;
+  }
+  return null;
+}
+
+function registerClaudeQueuedInputThreadBody(
+  threadKey: string | null,
+  body: Element,
+): void {
+  if (!threadKey) return;
+  const existing = queuedClaudeThreadBodies.get(threadKey) || new Set<Element>();
+  existing.add(body);
+  queuedClaudeThreadBodies.set(threadKey, existing);
+}
+
+function unregisterClaudeQueuedInputThreadBody(
+  threadKey: string | null,
+  body: Element,
+): void {
+  if (!threadKey) return;
+  const existing = queuedClaudeThreadBodies.get(threadKey);
+  if (!existing) return;
+  existing.delete(body);
+  if (!existing.size) {
+    queuedClaudeThreadBodies.delete(threadKey);
+  }
+}
+
+function syncClaudeQueuedInputThreadBodies(threadKey: string | null): void {
+  if (!threadKey) return;
+  const bodies = queuedClaudeThreadBodies.get(threadKey);
+  if (!bodies?.size) return;
+  for (const body of bodies) {
+    try {
+      activeContextPanelStateSync.get(body)?.();
+    } catch (_err) {
+      void _err;
+    }
+  }
+}
+
+function scheduleClaudeQueuedInputThreadDrain(threadKey: string | null): void {
+  if (!threadKey) return;
+  const bodies = queuedClaudeThreadBodies.get(threadKey);
+  if (!bodies?.size) return;
+  for (const body of bodies) {
+    const schedule = (body as any).__llmScheduleClaudeQueueDrain as (() => void) | undefined;
+    if (typeof schedule === "function") {
+      schedule();
+      return;
+    }
+  }
+}
 
 /** Monotonic counter incremented every time setupHandlers rebuilds a panel. */
 let setupHandlersGeneration = 0;
@@ -366,9 +516,20 @@ export function setupHandlers(
   initialItem?: Zotero.Item | null,
   hooks?: SetupHandlersHooks,
 ) {
-  const resolvedInitialState = resolveInitialPanelItemState(initialItem);
+  const existingPanelRoot = body.querySelector("#llm-main") as HTMLElement | null;
+  const preferredConversationSystem =
+    existingPanelRoot?.dataset?.conversationSystem === "claude_code"
+      ? "claude_code"
+      : existingPanelRoot?.dataset?.conversationSystem === "upstream"
+        ? "upstream"
+        : resolveConversationSystemForItem(initialItem);
+  const resolvedInitialState = resolveInitialPanelItemState(initialItem, {
+    conversationSystem: preferredConversationSystem,
+  });
   let item = resolvedInitialState.item;
   let basePaperItem = resolvedInitialState.basePaperItem;
+  const buildPaperStateKey = (libraryID: number, paperItemID: number): string =>
+    `${Math.floor(libraryID)}:${Math.floor(paperItemID)}`;
   const resolveLibraryIdFromItem = (
     targetItem: Zotero.Item | null | undefined,
   ): number => {
@@ -413,6 +574,8 @@ export function setupHandlers(
     historyUndo,
     historyUndoText,
     historyUndoBtn,
+    claudeSystemToggleBtn,
+    claudeSystemToggleIcon,
     selectTextBtn,
     screenshotBtn,
     uploadBtn,
@@ -442,6 +605,7 @@ export function setupHandlers(
     actionPicker,
     actionPickerList,
     actionHitlPanel,
+    queueBar,
     responseMenu,
     responseMenuCopyBtn,
     responseMenuNoteBtn,
@@ -478,6 +642,15 @@ export function setupHandlers(
   panelRoot.dataset.handlersAttached = thisGen;
 
   activeContextPanels.set(body, () => item);
+  let registeredClaudeQueueThreadKey: string | null = null;
+  const syncQueuedThreadRegistration = () => {
+    const nextThreadKey = getClaudeQueuedInputThreadKey(item);
+    if (registeredClaudeQueueThreadKey === nextThreadKey) return;
+    unregisterClaudeQueuedInputThreadBody(registeredClaudeQueueThreadKey, body);
+    registeredClaudeQueueThreadKey = nextThreadKey;
+    registerClaudeQueuedInputThreadBody(registeredClaudeQueueThreadKey, body);
+  };
+  syncQueuedThreadRegistration();
 
   // Disconnect previous ResizeObservers to prevent accumulation across
   // successive setupHandlers calls (each call creates fresh observers).
@@ -487,19 +660,41 @@ export function setupHandlers(
     delete (body as any).__llmResizeObservers;
   }
 
+  let renderQueuedClaudeInputs: () => void = () => {};
+  let scheduleClaudeQueueDrain: () => void = () => {};
+  let isClaudeQueueSendAvailable: () => boolean = () => false;
+  let queueClaudeInput: (text: string) => void = () => {};
+
+  const syncRequestUiForCurrentConversation = () => {
+    const activeConversationKey = item ? getConversationKey(item) : null;
+    const isClaudeUi = panelRoot.dataset.conversationSystem === "claude_code";
+    const isCurrentConversationPending =
+      activeConversationKey !== null &&
+      Number.isFinite(activeConversationKey) &&
+      isRequestPending(activeConversationKey);
+    if (sendBtn) {
+      sendBtn.style.display = isCurrentConversationPending ? "none" : "";
+      sendBtn.disabled = !item;
+      sendBtn.title = "Send";
+    }
+    if (cancelBtn) {
+      cancelBtn.style.display = isCurrentConversationPending ? "" : "none";
+    }
+    if (inputBox) {
+      inputBox.disabled = isClaudeUi
+        ? !item
+        : isCurrentConversationPending
+          ? true
+          : !item;
+    }
+    renderQueuedClaudeInputs();
+  };
+
   // buildUI() wipes body.textContent whenever onAsyncRender fires (item
   // navigation), which destroys the cancel/send button DOM mid-stream.
-  // Re-apply the generating state immediately so the user never sees a stale
-  // idle UI while a request is still running in the background.
-  // Only lock the UI if the CURRENT conversation has a pending request.
-  const earlyConversationKey = item ? getConversationKey(item) : null;
-  if (earlyConversationKey !== null && isRequestPending(earlyConversationKey)) {
-    if (sendBtn) sendBtn.style.display = "none";
-    if (cancelBtn) cancelBtn.style.display = "";
-    if (inputBox) inputBox.disabled = true;
-    // History controls are intentionally left enabled so the user can
-    // switch conversations or create new ones while a request is in flight.
-  }
+  // Re-apply the current conversation's request state immediately so a panel
+  // switch never inherits stale send/cancel UI from another conversation.
+  syncRequestUiForCurrentConversation();
 
   const panelDoc = body.ownerDocument;
   if (!panelDoc) {
@@ -529,6 +724,19 @@ export function setupHandlers(
     resolveDisplayConversationKind(item) === "global";
   const isPaperMode = () =>
     resolveDisplayConversationKind(item) === "paper";
+  let currentConversationSystem: "upstream" | "claude_code" =
+    panelRoot.dataset.conversationSystem === "claude_code"
+      ? "claude_code"
+      : resolveConversationSystemForItem(item) || "upstream";
+  const getConversationSystem = (): "upstream" | "claude_code" =>
+    currentConversationSystem;
+  const isClaudeConversationSystem = () =>
+    getConversationSystem() === "claude_code";
+  const isClaudeModeAvailable = () => getClaudeCodeModeEnabled();
+  const getPreferredTargetSystem = (): "upstream" | "claude_code" =>
+    isClaudeModeAvailable() && getConversationSystemPref() === "claude_code"
+      ? "claude_code"
+      : "upstream";
   const getCurrentLibraryID = (): number => {
     const fromItem =
       item && Number.isFinite(item.libraryID) && item.libraryID > 0
@@ -539,11 +747,39 @@ export function setupHandlers(
   };
   const getCurrentRuntimeMode = (): ChatRuntimeMode => {
     if (!item) return "chat";
+    if (isClaudeConversationSystem()) return "agent";
     const key = getConversationKey(item);
     return selectedRuntimeModeCache.get(key) || "chat";
   };
   const updateRuntimeModeButton = () => {
     if (!runtimeModeBtn) return;
+    const indicator = runtimeModeBtn.querySelector(
+      ".llm-agent-toggle-indicator",
+    ) as HTMLSpanElement | null;
+    if (isClaudeConversationSystem()) {
+      runtimeModeBtn.style.display = "";
+      const label = runtimeModeBtn.querySelector(
+        ".llm-agent-toggle-label",
+      ) as HTMLSpanElement | null;
+      if (label) {
+        label.textContent = "Claude Code";
+      }
+      runtimeModeBtn.classList.remove("llm-agent-toggle-enabled");
+      runtimeModeBtn.classList.add("llm-runtime-mode-static");
+      runtimeModeBtn.dataset.mode = "agent";
+      runtimeModeBtn.title = "Claude Code";
+      runtimeModeBtn.setAttribute("aria-label", "Claude Code");
+      runtimeModeBtn.setAttribute("aria-pressed", "false");
+      runtimeModeBtn.setAttribute("aria-disabled", "true");
+      runtimeModeBtn.disabled = true;
+      if (indicator) indicator.style.display = "none";
+      panelRoot.dataset.runtimeMode = "agent";
+      return;
+    }
+    runtimeModeBtn.classList.remove("llm-runtime-mode-static");
+    runtimeModeBtn.removeAttribute("aria-disabled");
+    runtimeModeBtn.disabled = false;
+    if (indicator) indicator.style.display = "";
     const agentFeatureEnabled = getAgentModeEnabled();
     // [webchat] Agent mode not available in webchat — hide toggle
     let webChatActive = false;
@@ -552,7 +788,6 @@ export function setupHandlers(
     const shouldHide = !agentFeatureEnabled || webChatActive;
     runtimeModeBtn.style.display = shouldHide ? "none" : "";
     if (shouldHide) {
-      // Force chat mode when the feature is hidden so state stays consistent.
       if (item) selectedRuntimeModeCache.set(getConversationKey(item), "chat");
       panelRoot.dataset.runtimeMode = "chat";
       return;
@@ -578,9 +813,143 @@ export function setupHandlers(
     panelRoot.dataset.runtimeMode = mode;
   };
   const setCurrentRuntimeMode = (mode: ChatRuntimeMode) => {
-    if (!item) return;
+    if (!item || isClaudeConversationSystem()) {
+      updateRuntimeModeButton();
+      return;
+    }
     selectedRuntimeModeCache.set(getConversationKey(item), mode);
     updateRuntimeModeButton();
+  };
+  const updateClaudeSystemToggle = () => {
+    if (!claudeSystemToggleBtn || !claudeSystemToggleIcon) return;
+    const available = isClaudeModeAvailable() && !isNoteSession();
+    claudeSystemToggleBtn.style.display = available ? "inline-flex" : "none";
+    if (!available) return;
+    const active = isClaudeConversationSystem();
+    claudeSystemToggleBtn.dataset.active = active ? "true" : "false";
+    claudeSystemToggleBtn.setAttribute("aria-pressed", active ? "true" : "false");
+    claudeSystemToggleBtn.title = active ? "Switch to upstream mode" : "Switch to Claude Code mode";
+    claudeSystemToggleBtn.setAttribute(
+      "aria-label",
+      active ? "Switch to upstream mode" : "Switch to Claude Code mode",
+    );
+    claudeSystemToggleIcon.innerHTML = active
+      ? `<svg height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z" fill="#D97757" fill-rule="evenodd"></path></svg>`
+      : `<svg fill="currentColor" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"></path></svg>`;
+  };
+  let claudeWarmupInFlight: Promise<void> | null = null;
+  const warmClaudeModeCaches = () => {
+    if (!isClaudeModeAvailable() || isNoteSession()) return;
+    if (claudeWarmupInFlight) return;
+    const coreRuntime = getCoreAgentRuntime();
+    claudeWarmupInFlight = Promise.allSettled([
+      refreshClaudeSlashCommands(coreRuntime, false),
+      listClaudeEfforts(coreRuntime, getSelectedClaudeRuntimeEntry().model),
+    ]).finally(() => {
+      claudeWarmupInFlight = null;
+    }).then(() => undefined);
+  };
+  const switchConversationSystem = async (
+    nextSystem: "upstream" | "claude_code",
+    options?: { forceFresh?: boolean },
+  ) => {
+    if (!item || isNoteSession()) return;
+    if (nextSystem === getConversationSystem()) return;
+    const libraryID = getCurrentLibraryID();
+    if (!libraryID) return;
+    const forceFresh = options?.forceFresh === true;
+    persistDraftInputForCurrentConversation();
+    setConversationSystemPref(nextSystem);
+    currentConversationSystem = nextSystem;
+    panelRoot.dataset.conversationSystem = nextSystem;
+    updateClaudeSystemToggle();
+    if (nextSystem === "claude_code") {
+      warmClaudeModeCaches();
+    }
+    if (isGlobalMode()) {
+      if (forceFresh) {
+        await createAndSwitchGlobalConversation(true);
+        return;
+      }
+      const nextConversationKey =
+        nextSystem === "claude_code"
+          ? resolveRememberedClaudeConversationKey({
+              libraryID,
+              kind: "global",
+            }) ||
+            getLastUsedClaudeGlobalConversationKey(libraryID) ||
+            0
+          : (() => {
+              const lockedKey = getLockedGlobalConversationKey(libraryID);
+              if (lockedKey !== null) return lockedKey;
+              const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+              return isUpstreamGlobalConversationKey(activeKey) ? Math.floor(activeKey) : 0;
+            })();
+      if (nextConversationKey > 0) {
+        await switchGlobalConversation(nextConversationKey);
+      } else {
+        await createAndSwitchGlobalConversation();
+      }
+      return;
+    }
+    if (forceFresh) {
+      const rawBaseItem = resolveCurrentPaperBaseItem();
+      if (!rawBaseItem) return;
+      const resolvedState = resolveInitialPanelItemState(rawBaseItem, {
+        conversationSystem: nextSystem,
+      });
+      item = resolvedState.item || item;
+      basePaperItem = resolvedState.basePaperItem || basePaperItem;
+      syncConversationIdentity();
+      await createAndSwitchPaperConversation(true);
+      return;
+    }
+    const rawBaseItem = resolveCurrentPaperBaseItem();
+    if (!rawBaseItem) return;
+    const resolvedState = resolveInitialPanelItemState(rawBaseItem, {
+      conversationSystem: nextSystem,
+    });
+    item = resolvedState.item || item;
+    basePaperItem = resolvedState.basePaperItem || basePaperItem;
+    syncConversationIdentity();
+    if (nextSystem === "claude_code") {
+      warmClaudeModeCaches();
+    }
+    await ensureConversationLoaded(item as Zotero.Item);
+    const shortcutMode =
+      resolveDisplayConversationKind(item as Zotero.Item) === "global"
+        ? "library"
+        : "paper";
+    await renderShortcuts(body, item as Zotero.Item, shortcutMode);
+    restoreDraftInputForCurrentConversation();
+    refreshChatPreservingScroll();
+    resetComposePreviewUI();
+    updateModelButton();
+    updateReasoningButton();
+    updateClaudeSystemToggle();
+    void refreshGlobalHistoryHeader();
+  };
+  const ensureClaudeConversationCatalogEntry = async (params: {
+    conversationKey: number;
+    libraryID: number;
+    kind: "global" | "paper";
+    paperItemID?: number;
+  }) => {
+    const existing = await getClaudeConversationSummary(params.conversationKey);
+    if (existing) return existing;
+    await upsertClaudeConversationSummary({
+      conversationKey: params.conversationKey,
+      libraryID: params.libraryID,
+      kind: params.kind,
+      paperItemID: params.paperItemID,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    return getClaudeConversationSummary(params.conversationKey);
+  };
+  const isClaudeConversationDraft = async (conversationKey: number) => {
+    const summary = await getClaudeConversationSummary(conversationKey);
+    return Boolean(summary && (summary.userTurnCount || 0) === 0);
   };
   const resolveCurrentNoteParentItem = (): Zotero.Item | null => {
     const noteSession = resolveCurrentNoteSession();
@@ -624,6 +993,12 @@ export function setupHandlers(
     item ? getConversationKey(item) : null;
   const syncConversationIdentity = () => {
     conversationKey = item ? getConversationKey(item) : null;
+    activeContextPanels.set(body, () => item);
+    syncQueuedThreadRegistration();
+    void retainClaudeRuntimeForBody(body, item);
+    if ((body as HTMLElement).dataset?.standalone === "true") {
+      activeContextPanelRawItems.set(body, item || null);
+    }
     panelRoot.dataset.itemId =
       Number.isFinite(conversationKey) && (conversationKey as number) > 0
         ? `${conversationKey}`
@@ -635,6 +1010,9 @@ export function setupHandlers(
       ? resolveDisplayConversationKind(item)
       : null;
     panelRoot.dataset.conversationKind = mode || "";
+    currentConversationSystem =
+      resolveConversationSystemForItem(item) || currentConversationSystem;
+    panelRoot.dataset.conversationSystem = currentConversationSystem;
     const currentBasePaperItemID =
       mode === "paper" ? Number(resolveCurrentPaperBaseItem()?.id || 0) : 0;
     panelRoot.dataset.basePaperItemId =
@@ -656,31 +1034,37 @@ export function setupHandlers(
       historyToggleBtn.style.display = noteSession ? "none" : "";
     }
     if (item && libraryID > 0 && mode && !noteSession) {
-      activeConversationModeByLibrary.set(libraryID, mode);
-      if (mode === "global") {
-        activeGlobalConversationByLibrary.set(libraryID, item.id);
-      } else if (
-        Number.isFinite(conversationKey) &&
-        (conversationKey as number) > 0 &&
-        Number.isFinite(currentBasePaperItemID) &&
-        currentBasePaperItemID > 0
-      ) {
-        const normalizedConversationKey = Math.floor(conversationKey as number);
-        const paperStateKey = buildPaperStateKey(
-          libraryID,
-          Math.floor(currentBasePaperItemID),
-        );
-        activePaperConversationByPaper.set(
-          paperStateKey,
-          normalizedConversationKey,
-        );
-        setLastUsedPaperConversationKey(
-          libraryID,
-          Math.floor(currentBasePaperItemID),
-          normalizedConversationKey,
-        );
+      if (isClaudeConversationSystem()) {
+        activeClaudeConversationModeByLibrary.set(buildClaudeLibraryStateKey(libraryID), mode);
+        setLastUsedClaudeConversationMode(libraryID, mode);
+      } else {
+        activeConversationModeByLibrary.set(libraryID, mode);
+        if (mode === "global") {
+          activeGlobalConversationByLibrary.set(libraryID, item.id);
+        } else if (
+          Number.isFinite(conversationKey) &&
+          (conversationKey as number) > 0 &&
+          Number.isFinite(currentBasePaperItemID) &&
+          currentBasePaperItemID > 0
+        ) {
+          const normalizedConversationKey = Math.floor(conversationKey as number);
+          const paperStateKey = buildPaperStateKey(
+            libraryID,
+            Math.floor(currentBasePaperItemID),
+          );
+          activePaperConversationByPaper.set(
+            paperStateKey,
+            normalizedConversationKey,
+          );
+          setLastUsedPaperConversationKey(
+            libraryID,
+            Math.floor(currentBasePaperItemID),
+            normalizedConversationKey,
+          );
+        }
       }
     }
+    syncRequestUiForCurrentConversation();
     if (historyModeIndicator) {
       // Keep historyModeIndicator (which is the clock history button) accessible.
       // Its label is static "Conversation history" — no text update needed.
@@ -711,52 +1095,103 @@ export function setupHandlers(
         );
       }
     }
+    if (inputBox && !noteSession) {
+      inputBox.placeholder =
+        mode === "global"
+          ? t("Ask anything... Type / for actions, @ to add papers")
+          : t("Ask about this paper... Type / for actions, @ to add papers");
+    }
     // Lock button: visible only in open-chat mode; reflect lock state
     if (modeLockBtn) {
-      modeLockBtn.style.display =
-        mode === "global" && !noteSession ? "flex" : "none";
-      const libraryID = getCurrentLibraryID();
-      const lockedKey =
-        libraryID > 0 ? getLockedGlobalConversationKey(libraryID) : null;
-      const currentKey =
-        conversationKey !== null ? Math.floor(conversationKey as number) : null;
-      const isLocked =
-        lockedKey !== null && currentKey !== null && lockedKey === currentKey;
-      modeLockBtn.dataset.locked = isLocked ? "true" : "false";
-      modeLockBtn.title = isLocked
-        ? "Unlock library chat default"
-        : "Lock library chat as default";
-      modeLockBtn.setAttribute(
-        "aria-label",
-        isLocked ? "Unlock library chat default" : "Lock library chat as default",
-      );
+      if (isClaudeConversationSystem()) {
+        modeLockBtn.style.display = "none";
+        modeLockBtn.dataset.locked = "false";
+        modeLockBtn.title = "";
+        modeLockBtn.setAttribute("aria-label", "");
+      } else {
+        modeLockBtn.style.display =
+          mode === "global" && !noteSession ? "flex" : "none";
+        const libraryID = getCurrentLibraryID();
+        const lockedKey =
+          libraryID > 0 ? getLockedGlobalConversationKey(libraryID) : null;
+        const currentKey =
+          conversationKey !== null ? Math.floor(conversationKey as number) : null;
+        const isLocked =
+          lockedKey !== null && currentKey !== null && lockedKey === currentKey;
+        modeLockBtn.dataset.locked = isLocked ? "true" : "false";
+        modeLockBtn.title = isLocked
+          ? "Unlock library chat default"
+          : "Lock library chat as default";
+        modeLockBtn.setAttribute(
+          "aria-label",
+          isLocked ? "Unlock library chat default" : "Lock library chat as default",
+        );
+      }
     }
     updateRuntimeModeButton();
+    updateClaudeSystemToggle();
   };
   syncConversationIdentity();
+  if (getConversationSystem() === "claude_code") {
+    warmClaudeModeCaches();
+  }
 
   // Keep the agent mode toggle in sync when the preference is changed in the
   // Preferences window (which runs in a separate window context).
+  let cleanupPrefObservers: (() => void) | null = null;
   {
     const agentPrefKey = `${config.prefsPrefix}.enableAgentMode`;
-    let observerId: symbol | undefined;
+    const claudeModePrefKey = `${config.prefsPrefix}.enableClaudeCodeMode`;
+    let agentObserverId: symbol | undefined;
+    let claudeObserverId: symbol | undefined;
+    const unregister = (observerId: symbol | undefined) => {
+      if (observerId === undefined) return;
+      try {
+        (Zotero as any).Prefs.unregisterObserver(observerId);
+      } catch {
+        void 0;
+      }
+    };
+    cleanupPrefObservers = () => {
+      unregister(agentObserverId);
+      unregister(claudeObserverId);
+      agentObserverId = undefined;
+      claudeObserverId = undefined;
+    };
     const onAgentPrefChange = () => {
       if (!(body as Element).isConnected) {
-        // Panel is gone – clean up the observer.
-        try {
-          if (observerId !== undefined)
-            (Zotero as any).Prefs.unregisterObserver(observerId);
-        } catch {
-          // no-op
-        }
+        cleanupPrefObservers?.();
         return;
       }
       updateRuntimeModeButton();
     };
+    const onClaudeModePrefChange = () => {
+      if (!(body as Element).isConnected) {
+        cleanupPrefObservers?.();
+        return;
+      }
+      if (!getClaudeCodeModeEnabled()) {
+        void releaseClaudeRuntimeForBody(body);
+        void invalidateAllClaudeHotRuntimes(getCoreAgentRuntime()).catch((err: unknown) => {
+          ztoolkit.log("LLM: Failed to invalidate all Claude hot runtimes", err);
+        });
+        setConversationSystemPref("upstream");
+        if (isClaudeConversationSystem()) {
+          void switchConversationSystem("upstream");
+          return;
+        }
+      }
+      updateClaudeSystemToggle();
+    };
     try {
-      observerId = (Zotero as any).Prefs.registerObserver(
+      agentObserverId = (Zotero as any).Prefs.registerObserver(
         agentPrefKey,
         onAgentPrefChange,
+        true,
+      );
+      claudeObserverId = (Zotero as any).Prefs.registerObserver(
+        claudeModePrefKey,
+        onClaudeModePrefChange,
         true,
       );
     } catch {
@@ -1020,6 +1455,10 @@ export function setupHandlers(
       return;
     }
     const targetBubble = bubble || findAssistantBubbleFromSelection();
+    if (targetBubble?.closest(".llm-agent-reasoning")) {
+      hideSelectionPopup();
+      return;
+    }
     if (!targetBubble) {
       hideSelectionPopup();
       return;
@@ -1167,6 +1606,10 @@ export function setupHandlers(
       hideSelectionPopup();
       return;
     }
+    if (target && target.closest("summary.llm-agent-reasoning-summary")) {
+      hideSelectionPopup();
+      return;
+    }
     const bubble = target?.closest(
       ".llm-bubble.assistant",
     ) as HTMLElement | null;
@@ -1293,6 +1736,7 @@ export function setupHandlers(
           const targetNoteSession = resolveActiveNoteSession(targetItem);
           if (
             isGlobalPortalItem(targetItem) ||
+            isClaudeGlobalPortalItem(targetItem) ||
             targetNoteSession?.noteKind === "standalone"
           ) {
             const libraryID =
@@ -1417,7 +1861,7 @@ export function setupHandlers(
         e.preventDefault();
         e.stopPropagation();
         if (!item) return;
-        await ensureConversationLoaded(item);
+        await ensureConversationLoaded(item as Zotero.Item);
         const conversationKey = getConversationKey(item);
         const history = chatHistory.get(conversationKey) || [];
         const payload = buildChatHistoryNotePayload(history);
@@ -1800,7 +2244,7 @@ export function setupHandlers(
     t("Edit target changed. Please edit latest prompt again.");
   const getLatestEditablePair = async () => {
     if (!item) return null;
-    await ensureConversationLoaded(item);
+    await ensureConversationLoaded(item as Zotero.Item);
     const key = getConversationKey(item);
     const history = chatHistory.get(key) || [];
     const pair = findLatestRetryPair(history);
@@ -2721,6 +3165,7 @@ export function setupHandlers(
     applySelectedTextPreview(body, textContextKey);
   };
   const syncConversationPanelState = () => {
+    syncRequestUiForCurrentConversation();
     restoreDraftInputForCurrentConversation();
     updatePaperPreview();
     updateFilePreview();
@@ -3171,10 +3616,15 @@ export function setupHandlers(
     entry: ConversationHistoryEntry,
   ): Promise<HistorySearchDocument> => {
     const titleText = normalizeHistorySearchText(entry.title);
-    const messages = await loadConversation(
-      entry.conversationKey,
-      PERSISTED_HISTORY_LIMIT,
-    );
+    const messages = isClaudeConversationSystem()
+      ? await loadClaudeConversation(
+          entry.conversationKey,
+          PERSISTED_HISTORY_LIMIT,
+        )
+      : await loadConversation(
+          entry.conversationKey,
+          PERSISTED_HISTORY_LIMIT,
+        );
     const candidates: HistorySearchTextCandidate[] = [];
     if (titleText) {
       candidates.push({
@@ -3371,12 +3821,17 @@ export function setupHandlers(
       historyMenu.appendChild(loadingRow);
       return;
     }
-    const searchResults = searchActive
+    const rawSearchResults = searchActive
       ? buildHistorySearchResults(allEntries, normalizedSearchQuery)
       : [];
-    const searchResultsByKey = new Map<number, HistorySearchResult>(
-      searchResults.map((result) => [result.entry.conversationKey, result]),
-    );
+    const searchResultsByKey = new Map<number, HistorySearchResult>();
+    for (const result of rawSearchResults) {
+      const existing = searchResultsByKey.get(result.entry.conversationKey);
+      if (!existing || result.matchCount > existing.matchCount) {
+        searchResultsByKey.set(result.entry.conversationKey, result);
+      }
+    }
+    const searchResults = Array.from(searchResultsByKey.values());
     const filteredEntries = searchActive
       ? searchResults.map((result) => result.entry)
       : allEntries;
@@ -3658,58 +4113,118 @@ export function setupHandlers(
     if (libraryID && paperItem) {
       const paperItemID = Number(paperItem.id || 0);
       if (paperItemID > 0) {
-        let summaries: Awaited<ReturnType<typeof loadConversationHistoryScope>> =
-          [];
         try {
-          summaries = await loadConversationHistoryScope({
-            mode: "paper",
-            libraryID,
-            paperItemID,
-            limit: GLOBAL_HISTORY_LIMIT,
-          });
+          if (isClaudeConversationSystem()) {
+            const activePaperKey =
+              !isGlobalMode() && item && Number.isFinite(getConversationKey(item))
+                ? Math.floor(getConversationKey(item))
+                : 0;
+            if (activePaperKey > 0) {
+              await ensureClaudeConversationCatalogEntry({
+                conversationKey: activePaperKey,
+                libraryID,
+                kind: "paper",
+                paperItemID,
+              });
+            }
+            const summaries = await loadClaudeConversationHistoryScope({
+              libraryID,
+              kind: "paper",
+              paperItemID,
+              limit: GLOBAL_HISTORY_LIMIT,
+            });
+            if (requestId !== globalHistoryLoadSeq) return;
+            const seenPaperKeys = new Set<number>();
+            for (const summary of summaries) {
+              const conversationKey = Number(summary.conversationKey);
+              const summaryPaperItemID = Number(summary.paperItemID);
+              if (
+                !Number.isFinite(conversationKey) ||
+                conversationKey <= 0 ||
+                !Number.isFinite(summaryPaperItemID) ||
+                summaryPaperItemID !== paperItemID
+              ) {
+                continue;
+              }
+              const normalizedKey = Math.floor(conversationKey);
+              if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
+              if (seenPaperKeys.has(normalizedKey)) continue;
+              seenPaperKeys.add(normalizedKey);
+              const lastActivity = Number(
+                summary.lastActivityAt || summary.createdAt || 0,
+              );
+              const isDraft = Boolean(summary.isDraft);
+              paperEntries.push({
+                kind: "paper",
+                section: "paper",
+                sectionTitle: "Paper Chat",
+                conversationKey: normalizedKey,
+                title: summary.title,
+                timestampText: isDraft
+                  ? "Draft"
+                  : formatGlobalHistoryTimestamp(lastActivity) || "Paper chat",
+                deletable: true,
+                isDraft,
+                isPendingDelete: false,
+                lastActivityAt: Number.isFinite(lastActivity)
+                  ? Math.floor(lastActivity)
+                  : 0,
+                paperItemID,
+              });
+            }
+          } else {
+            const summaries = await loadConversationHistoryScope({
+              mode: "paper",
+              libraryID,
+              paperItemID,
+              limit: GLOBAL_HISTORY_LIMIT,
+            });
+            if (requestId !== globalHistoryLoadSeq) return;
+            const seenPaperKeys = new Set<number>();
+            for (const summary of summaries) {
+              const conversationKey = Number(summary.conversationKey);
+              const sessionVersion = Number(summary.sessionVersion);
+              const summaryPaperItemID = Number(summary.paperItemID);
+              if (
+                !Number.isFinite(conversationKey) ||
+                conversationKey <= 0 ||
+                !Number.isFinite(sessionVersion) ||
+                sessionVersion <= 0 ||
+                !Number.isFinite(summaryPaperItemID) ||
+                summaryPaperItemID !== paperItemID
+              ) {
+                continue;
+              }
+              const normalizedKey = Math.floor(conversationKey);
+              if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
+              if (seenPaperKeys.has(normalizedKey)) continue;
+              seenPaperKeys.add(normalizedKey);
+              const lastActivity = Number(
+                summary.lastActivityAt || summary.createdAt || 0,
+              );
+              const isDraft = Boolean(summary.isDraft);
+              paperEntries.push({
+                kind: "paper",
+                section: "paper",
+                sectionTitle: "Paper Chat",
+                conversationKey: normalizedKey,
+                title: summary.title,
+                timestampText: isDraft
+                  ? "Draft"
+                  : formatGlobalHistoryTimestamp(lastActivity) || "Paper chat",
+                deletable: true,
+                isDraft,
+                isPendingDelete: false,
+                lastActivityAt: Number.isFinite(lastActivity)
+                  ? Math.floor(lastActivity)
+                  : 0,
+                paperItemID,
+                sessionVersion: Math.floor(sessionVersion),
+              });
+            }
+          }
         } catch (err) {
           ztoolkit.log("LLM: Failed to load paper history entries", err);
-        }
-        if (requestId !== globalHistoryLoadSeq) return;
-        const seenPaperKeys = new Set<number>();
-        for (const summary of summaries) {
-          const conversationKey = Number(summary.conversationKey);
-          const sessionVersion = Number(summary.sessionVersion);
-          const summaryPaperItemID = Number(summary.paperItemID);
-          if (
-            !Number.isFinite(conversationKey) ||
-            conversationKey <= 0 ||
-            !Number.isFinite(sessionVersion) ||
-            sessionVersion <= 0 ||
-            !Number.isFinite(summaryPaperItemID) ||
-            summaryPaperItemID !== paperItemID
-          ) {
-            continue;
-          }
-          const normalizedKey = Math.floor(conversationKey);
-          if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
-          if (seenPaperKeys.has(normalizedKey)) continue;
-          seenPaperKeys.add(normalizedKey);
-          const lastActivity = Number(summary.lastActivityAt || summary.createdAt || 0);
-          const isDraft = Boolean(summary.isDraft);
-          paperEntries.push({
-            kind: "paper",
-            section: "paper",
-            sectionTitle: "Paper Chat",
-            conversationKey: normalizedKey,
-            title: summary.title,
-            timestampText: isDraft
-              ? "Draft"
-              : formatGlobalHistoryTimestamp(lastActivity) || "Paper chat",
-            deletable: true,
-            isDraft,
-            isPendingDelete: false,
-            lastActivityAt: Number.isFinite(lastActivity)
-              ? Math.floor(lastActivity)
-              : 0,
-            paperItemID: paperItemID,
-            sessionVersion: Math.floor(sessionVersion),
-          });
         }
         paperEntries.sort((a, b) => {
           if (b.lastActivityAt !== a.lastActivityAt) {
@@ -3721,64 +4236,137 @@ export function setupHandlers(
     }
 
     if (libraryID) {
-      let activeGlobalKey = 0;
-      if (isGlobalMode() && item && Number.isFinite(item.id) && item.id > 0) {
-        activeGlobalKey = Math.floor(item.id);
-      } else {
-        const remembered = Number(
-          activeGlobalConversationByLibrary.get(libraryID),
-        );
-        if (Number.isFinite(remembered) && remembered > 0) {
-          activeGlobalKey = Math.floor(remembered);
+      if (isClaudeConversationSystem()) {
+        let activeGlobalKey = 0;
+        if (isGlobalMode() && item && Number.isFinite(item.id) && item.id > 0) {
+          activeGlobalKey = Math.floor(item.id);
+        } else {
+          const remembered = Number(
+            activeClaudeGlobalConversationByLibrary.get(buildClaudeLibraryStateKey(libraryID)) ||
+              getLastUsedClaudeGlobalConversationKey(libraryID) ||
+              0,
+          );
+          if (Number.isFinite(remembered) && remembered > 0) {
+            activeGlobalKey = Math.floor(remembered);
+          }
         }
-      }
-      if (activeGlobalKey > 0) {
+        if (activeGlobalKey > 0) {
+          try {
+            await ensureClaudeConversationCatalogEntry({
+              conversationKey: activeGlobalKey,
+              libraryID,
+              kind: "global",
+            });
+          } catch (err) {
+            ztoolkit.log("LLM: Failed to ensure active Claude history row", err);
+          }
+        }
+        if (requestId !== globalHistoryLoadSeq) return;
+
+        let historyEntries = [] as Array<
+          Awaited<ReturnType<typeof getClaudeConversationSummary>> extends infer T
+            ? T extends null
+              ? never
+              : T
+            : never
+        >;
         try {
-          await ensureGlobalConversationExists(libraryID, activeGlobalKey);
+          historyEntries = await listClaudeGlobalConversations(
+            libraryID,
+            GLOBAL_HISTORY_LIMIT,
+          );
         } catch (err) {
-          ztoolkit.log("LLM: Failed to ensure active global history row", err);
+          ztoolkit.log("LLM: Failed to load Claude global history entries", err);
         }
-      }
-      if (requestId !== globalHistoryLoadSeq) return;
+        if (requestId !== globalHistoryLoadSeq) return;
 
-      let historyEntries: Awaited<ReturnType<typeof loadConversationHistoryScope>> =
-        [];
-      try {
-        historyEntries = await loadConversationHistoryScope({
-          mode: "open",
-          libraryID,
-          limit: GLOBAL_HISTORY_LIMIT,
-        });
-      } catch (err) {
-        ztoolkit.log("LLM: Failed to load global history entries", err);
-      }
-      if (requestId !== globalHistoryLoadSeq) return;
+        const seenGlobalKeys = new Set<number>();
+        for (const entry of historyEntries) {
+          const conversationKey = Number(entry.conversationKey);
+          if (!Number.isFinite(conversationKey) || conversationKey <= 0) continue;
+          const normalizedKey = Math.floor(conversationKey);
+          if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
+          if (seenGlobalKeys.has(normalizedKey)) continue;
+          seenGlobalKeys.add(normalizedKey);
+          const lastActivity = Number(entry.updatedAt || entry.createdAt || 0);
+          const isDraft = entry.userTurnCount <= 0;
+          globalEntries.push({
+            kind: "global",
+            section: "open",
+            sectionTitle: "Library Chat",
+            conversationKey: normalizedKey,
+            title: entry.title || (isDraft ? "New Claude chat" : ""),
+            timestampText: isDraft
+              ? "Draft"
+              : formatGlobalHistoryTimestamp(lastActivity) || "Standalone chat",
+            deletable: true,
+            isDraft,
+            isPendingDelete: false,
+            lastActivityAt: Number.isFinite(lastActivity)
+              ? Math.floor(lastActivity)
+              : 0,
+          });
+        }
+      } else {
+        let activeGlobalKey = 0;
+        if (isGlobalMode() && item && Number.isFinite(item.id) && item.id > 0) {
+          activeGlobalKey = Math.floor(item.id);
+        } else {
+          const remembered = Number(
+            activeGlobalConversationByLibrary.get(libraryID),
+          );
+          if (Number.isFinite(remembered) && remembered > 0) {
+            activeGlobalKey = Math.floor(remembered);
+          }
+        }
+        if (activeGlobalKey > 0) {
+          try {
+            await ensureGlobalConversationExists(libraryID, activeGlobalKey);
+          } catch (err) {
+            ztoolkit.log("LLM: Failed to ensure active global history row", err);
+          }
+        }
+        if (requestId !== globalHistoryLoadSeq) return;
 
-      const seenGlobalKeys = new Set<number>();
-      for (const entry of historyEntries) {
-        const conversationKey = Number(entry.conversationKey);
-        if (!Number.isFinite(conversationKey) || conversationKey <= 0) continue;
-        const normalizedKey = Math.floor(conversationKey);
-        if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
-        if (seenGlobalKeys.has(normalizedKey)) continue;
-        seenGlobalKeys.add(normalizedKey);
-        const lastActivity = Number(entry.lastActivityAt || entry.createdAt || 0);
-        globalEntries.push({
-          kind: "global",
-          section: "open",
-          sectionTitle: "Library Chat",
-          conversationKey: normalizedKey,
-          title: entry.title,
-          timestampText: entry.isDraft
-            ? "Draft"
-            : formatGlobalHistoryTimestamp(lastActivity) || "Standalone chat",
-          deletable: true,
-          isDraft: Boolean(entry.isDraft),
-          isPendingDelete: false,
-          lastActivityAt: Number.isFinite(lastActivity)
-            ? Math.floor(lastActivity)
-            : 0,
-        });
+        let historyEntries: Awaited<ReturnType<typeof loadConversationHistoryScope>> =
+          [];
+        try {
+          historyEntries = await loadConversationHistoryScope({
+            mode: "open",
+            libraryID,
+            limit: GLOBAL_HISTORY_LIMIT,
+          });
+        } catch (err) {
+          ztoolkit.log("LLM: Failed to load global history entries", err);
+        }
+        if (requestId !== globalHistoryLoadSeq) return;
+
+        const seenGlobalKeys = new Set<number>();
+        for (const entry of historyEntries) {
+          const conversationKey = Number(entry.conversationKey);
+          if (!Number.isFinite(conversationKey) || conversationKey <= 0) continue;
+          const normalizedKey = Math.floor(conversationKey);
+          if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
+          if (seenGlobalKeys.has(normalizedKey)) continue;
+          seenGlobalKeys.add(normalizedKey);
+          const lastActivity = Number(entry.lastActivityAt || entry.createdAt || 0);
+          globalEntries.push({
+            kind: "global",
+            section: "open",
+            sectionTitle: "Library Chat",
+            conversationKey: normalizedKey,
+            title: entry.title,
+            timestampText: entry.isDraft
+              ? "Draft"
+              : formatGlobalHistoryTimestamp(lastActivity) || "Standalone chat",
+            deletable: true,
+            isDraft: Boolean(entry.isDraft),
+            isPendingDelete: false,
+            lastActivityAt: Number.isFinite(lastActivity)
+              ? Math.floor(lastActivity)
+              : 0,
+          });
+        }
       }
 
       const dedupedGlobalEntries: ConversationHistoryEntry[] = [];
@@ -3800,43 +4388,20 @@ export function setupHandlers(
       globalEntries.splice(0, globalEntries.length, ...dedupedGlobalEntries);
     }
 
-    // In the sidepanel, only show paper chat history — library chat is standalone-only
-    const isStandalonePanel = (body as HTMLElement).dataset?.standalone === "true";
-    const allEntries = isStandalonePanel
-      ? [...paperEntries, ...globalEntries]
-      : paperEntries;
+    const activeHistorySection = isGlobalMode() ? "open" : "paper";
+    const allEntries = activeHistorySection === "paper" ? paperEntries : globalEntries;
     const visibleEntries = allEntries.filter(
       (entry) => !pendingHistoryDeletionKeys.has(entry.conversationKey),
     );
-    const visibleSections = [
-      {
-        section: "paper" as const,
-        latestActivity: paperEntries.reduce(
-          (max, entry) => Math.max(max, entry.lastActivityAt || 0),
-          0,
-        ),
-      },
-      {
-        section: "open" as const,
-        latestActivity: globalEntries.reduce(
-          (max, entry) => Math.max(max, entry.lastActivityAt || 0),
-          0,
-        ),
-      },
-    ]
-      .filter((entry) =>
-        visibleEntries.some((row) => row.section === entry.section),
-      )
-      .sort((a, b) => {
-        if (b.latestActivity !== a.latestActivity) {
-          return b.latestActivity - a.latestActivity;
-        }
-        if (a.section === b.section) return 0;
-        return a.section === "paper" ? -1 : 1;
-      });
-    latestConversationHistory = visibleSections.flatMap((section) =>
-      visibleEntries.filter((entry) => entry.section === section.section),
-    );
+    latestConversationHistory = [...visibleEntries].sort((a, b) => {
+      if (b.lastActivityAt !== a.lastActivityAt) {
+        return b.lastActivityAt - a.lastActivityAt;
+      }
+      if (a.isDraft !== b.isDraft) {
+        return a.isDraft ? 1 : -1;
+      }
+      return b.conversationKey - a.conversationKey;
+    });
 
     titleStatic.style.display = "none";
     historyBar.style.display = "inline-flex";
@@ -3860,12 +4425,31 @@ export function setupHandlers(
       ? Math.floor(nextConversationKey)
       : 0;
     if (normalizedConversationKey <= 0) return;
-    const nextItem = createGlobalPortalItem(
-      libraryID,
-      normalizedConversationKey,
-    );
-    item = nextItem;
+    if (isClaudeConversationSystem()) {
+      await ensureClaudeConversationCatalogEntry({
+        conversationKey: normalizedConversationKey,
+        libraryID,
+        kind: "global",
+      });
+    }
+    const nextItem = isClaudeConversationSystem()
+      ? createClaudeGlobalPortalItem(libraryID, normalizedConversationKey)
+      : createGlobalPortalItem(
+          libraryID,
+          normalizedConversationKey,
+        );
+    item = nextItem as any;
     syncConversationIdentity();
+    if (isClaudeConversationSystem()) {
+      rememberClaudeConversationSelection({
+        conversationKey: normalizedConversationKey,
+        kind: "global",
+        libraryID,
+      });
+      void touchClaudeConversation(normalizedConversationKey, {
+        updatedAt: Date.now(),
+      });
+    }
     activeEditSession = null;
     inlineEditCleanup?.();
     setInlineEditCleanup(null);
@@ -3878,7 +4462,7 @@ export function setupHandlers(
     closeExportMenu();
     closeHistoryNewMenu();
     closeHistoryMenu();
-    await ensureConversationLoaded(item);
+    await ensureConversationLoaded(item as Zotero.Item);
     restoreDraftInputForCurrentConversation();
     refreshChatPreservingScroll();
     resetComposePreviewUI();
@@ -3899,51 +4483,109 @@ export function setupHandlers(
     if (!Number.isFinite(paperItemID) || paperItemID <= 0) return;
 
     const requestedConversationKey = Number(nextConversationKey || 0);
-    let targetSummary =
-      Number.isFinite(requestedConversationKey) && requestedConversationKey > 0
-        ? await getPaperConversation(Math.floor(requestedConversationKey))
-        : null;
-    if (targetSummary && targetSummary.paperItemID !== paperItemID) {
-      targetSummary = null;
-    }
-    if (!targetSummary) {
-      const rememberedConversationKey = Number(
-        activePaperConversationByPaper.get(
-          buildPaperStateKey(libraryID, paperItemID),
-        ) ||
-          getLastUsedPaperConversationKey(libraryID, paperItemID) ||
-          0,
-      );
+    if (isClaudeConversationSystem()) {
+      let targetSummary =
+        Number.isFinite(requestedConversationKey) && requestedConversationKey > 0
+          ? await getClaudeConversationSummary(Math.floor(requestedConversationKey))
+          : null;
       if (
-        Number.isFinite(rememberedConversationKey) &&
-        rememberedConversationKey > 0
+        targetSummary &&
+        (targetSummary.kind !== "paper" ||
+          Number(targetSummary.paperItemID || 0) !== paperItemID)
       ) {
-        const rememberedSummary = await getPaperConversation(
-          Math.floor(rememberedConversationKey),
+        targetSummary = null;
+      }
+      if (!targetSummary) {
+        const rememberedConversationKey = Number(
+          resolveRememberedClaudeConversationKey({
+            libraryID,
+            kind: "paper",
+            paperItemID,
+          }) || 0,
         );
         if (
-          rememberedSummary &&
-          rememberedSummary.paperItemID === paperItemID
+          Number.isFinite(rememberedConversationKey) &&
+          rememberedConversationKey > 0
         ) {
-          targetSummary = rememberedSummary;
+          const rememberedSummary = await getClaudeConversationSummary(
+            Math.floor(rememberedConversationKey),
+          );
+          if (
+            rememberedSummary &&
+            rememberedSummary.kind === "paper" &&
+            Number(rememberedSummary.paperItemID || 0) === paperItemID
+          ) {
+            targetSummary = rememberedSummary;
+          }
         }
       }
-    }
-    if (!targetSummary) {
-      targetSummary = await ensurePaperV1Conversation(libraryID, paperItemID);
-    }
-    if (!targetSummary) return;
-    const normalizedConversationKey = Math.floor(targetSummary.conversationKey);
-    const nextItem =
-      normalizedConversationKey === paperItemID
-        ? paperItem
-        : createPaperPortalItem(
-            paperItem,
-            normalizedConversationKey,
-            targetSummary.sessionVersion,
+      if (!targetSummary) {
+        targetSummary = await ensureClaudePaperConversation(libraryID, paperItemID);
+      }
+      if (!targetSummary) return;
+      const resolvedConversationKey = Math.floor(targetSummary.conversationKey);
+      item = createClaudePaperPortalItem(
+        paperItem,
+        resolvedConversationKey,
+      ) as any;
+    } else {
+      let targetSummary =
+        Number.isFinite(requestedConversationKey) && requestedConversationKey > 0
+          ? await getPaperConversation(Math.floor(requestedConversationKey))
+          : null;
+      if (targetSummary && targetSummary.paperItemID !== paperItemID) {
+        targetSummary = null;
+      }
+      if (!targetSummary) {
+        const rememberedConversationKey = Number(
+          activePaperConversationByPaper.get(
+            buildPaperStateKey(libraryID, paperItemID),
+          ) ||
+            getLastUsedPaperConversationKey(libraryID, paperItemID) ||
+            0,
+        );
+        if (
+          Number.isFinite(rememberedConversationKey) &&
+          rememberedConversationKey > 0
+        ) {
+          const rememberedSummary = await getPaperConversation(
+            Math.floor(rememberedConversationKey),
           );
-    item = nextItem;
+          if (
+            rememberedSummary &&
+            rememberedSummary.paperItemID === paperItemID
+          ) {
+            targetSummary = rememberedSummary;
+          }
+        }
+      }
+      if (!targetSummary) {
+        targetSummary = await ensurePaperV1Conversation(libraryID, paperItemID);
+      }
+      if (!targetSummary) return;
+      const normalizedConversationKey = Math.floor(targetSummary.conversationKey);
+      const nextItem =
+        normalizedConversationKey === paperItemID
+          ? paperItem
+          : createPaperPortalItem(
+              paperItem,
+              normalizedConversationKey,
+              targetSummary.sessionVersion,
+            );
+      item = nextItem as any;
+    }
     syncConversationIdentity();
+    if (isClaudeConversationSystem()) {
+      rememberClaudeConversationSelection({
+        conversationKey: Math.floor(getConversationKey(item as Zotero.Item)),
+        kind: "paper",
+        libraryID,
+        paperItemID,
+      });
+      void touchClaudeConversation(Math.floor(getConversationKey(item as Zotero.Item)), {
+        updatedAt: Date.now(),
+      });
+    }
     activeEditSession = null;
     inlineEditCleanup?.();
     setInlineEditCleanup(null);
@@ -3956,7 +4598,7 @@ export function setupHandlers(
     closeExportMenu();
     closeHistoryNewMenu();
     closeHistoryMenu();
-    await ensureConversationLoaded(item);
+    await ensureConversationLoaded(item as Zotero.Item);
     restoreDraftInputForCurrentConversation();
     refreshChatPreservingScroll();
     resetComposePreviewUI();
@@ -3981,6 +4623,56 @@ export function setupHandlers(
     paperItemID: number,
     deletedConversationKey: number,
   ): Promise<HistorySwitchTarget> => {
+    if (isClaudeConversationSystem()) {
+      let summaries: Awaited<ReturnType<typeof listClaudePaperConversations>> = [];
+      try {
+        summaries = await listClaudePaperConversations(
+          libraryID,
+          paperItemID,
+          GLOBAL_HISTORY_LIMIT,
+        );
+      } catch (err) {
+        ztoolkit.log(
+          "LLM: Failed to load fallback Claude paper history candidates",
+          err,
+        );
+      }
+      for (const summary of summaries) {
+        const candidateKey = Number(summary.conversationKey);
+        if (!Number.isFinite(candidateKey) || candidateKey <= 0) continue;
+        const normalizedKey = Math.floor(candidateKey);
+        if (normalizedKey === deletedConversationKey) continue;
+        if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
+        return { kind: "paper", conversationKey: normalizedKey };
+      }
+      let createdSummary: Awaited<ReturnType<typeof createClaudePaperConversation>> = null;
+      try {
+        createdSummary = await createClaudePaperConversation(libraryID, paperItemID);
+      } catch (err) {
+        ztoolkit.log("LLM: Failed to create fallback Claude paper conversation", err);
+      }
+      if (createdSummary?.conversationKey) {
+        return {
+          kind: "paper",
+          conversationKey: Math.floor(createdSummary.conversationKey),
+        };
+      }
+      const ensured = await ensureClaudePaperConversation(libraryID, paperItemID);
+      if (ensured?.conversationKey) {
+        const normalizedKey = Math.floor(ensured.conversationKey);
+        if (
+          normalizedKey === deletedConversationKey ||
+          pendingHistoryDeletionKeys.has(normalizedKey)
+        ) {
+          return null;
+        }
+        return {
+          kind: "paper",
+          conversationKey: normalizedKey,
+        };
+      }
+      return null;
+    }
     let summaries: Awaited<ReturnType<typeof listPaperConversations>> = [];
     try {
       summaries = await listPaperConversations(
@@ -4037,6 +4729,74 @@ export function setupHandlers(
     libraryID: number,
     deletedConversationKey: number,
   ): Promise<HistorySwitchTarget> => {
+    if (isClaudeConversationSystem()) {
+      let remainingHistorical: Awaited<ReturnType<typeof listClaudeGlobalConversations>> = [];
+      try {
+        remainingHistorical = await listClaudeGlobalConversations(
+          libraryID,
+          GLOBAL_HISTORY_LIMIT,
+        );
+      } catch (err) {
+        ztoolkit.log(
+          "LLM: Failed to load fallback Claude global history candidates",
+          err,
+        );
+      }
+      for (const entry of remainingHistorical) {
+        const candidateKey = Number(entry.conversationKey);
+        if (!Number.isFinite(candidateKey) || candidateKey <= 0) continue;
+        const normalizedKey = Math.floor(candidateKey);
+        if (normalizedKey === deletedConversationKey) continue;
+        if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
+        return { kind: "global", conversationKey: normalizedKey };
+      }
+      const isEmptyDraft = async (conversationKey: number): Promise<boolean> => {
+        if (!Number.isFinite(conversationKey) || conversationKey <= 0) return false;
+        const normalizedKey = Math.floor(conversationKey);
+        if (normalizedKey === deletedConversationKey) return false;
+        if (pendingHistoryDeletionKeys.has(normalizedKey)) return false;
+        const summary = await getClaudeConversationSummary(normalizedKey);
+        return Boolean(summary && (summary.userTurnCount || 0) === 0);
+      };
+      let candidateDraftKey = Number(
+        activeClaudeGlobalConversationByLibrary.get(
+          buildClaudeLibraryStateKey(libraryID),
+        ) ||
+          getLastUsedClaudeGlobalConversationKey(libraryID) ||
+          0,
+      );
+      if (!(await isEmptyDraft(candidateDraftKey))) {
+        candidateDraftKey = 0;
+        for (const summary of remainingHistorical) {
+          const candidateKey = Number(summary.conversationKey);
+          if (await isEmptyDraft(candidateKey)) {
+            candidateDraftKey = Math.floor(candidateKey);
+            break;
+          }
+        }
+      }
+      if (candidateDraftKey > 0) {
+        return {
+          kind: "global",
+          conversationKey: Math.floor(candidateDraftKey),
+        };
+      }
+      let createdDraftKey = 0;
+      try {
+        createdDraftKey = Number(
+          (await createClaudeGlobalConversation(libraryID))?.conversationKey || 0,
+        );
+      } catch (err) {
+        ztoolkit.log("LLM: Failed to create fallback Claude draft conversation", err);
+      }
+      if (createdDraftKey > 0) {
+        return {
+          kind: "global",
+          conversationKey: Math.floor(createdDraftKey),
+        };
+      }
+      return null;
+    }
     let remainingHistorical: Awaited<
       ReturnType<typeof listGlobalConversations>
     > = [];
@@ -4060,17 +4820,6 @@ export function setupHandlers(
       if (pendingHistoryDeletionKeys.has(normalizedKey)) continue;
       return { kind: "global", conversationKey: normalizedKey };
     }
-    const paperItem = resolveCurrentPaperBaseItem();
-    const paperItemID = Number(paperItem?.id || 0);
-    if (paperItemID > 0) {
-      const paperTarget = await resolveFallbackAfterPaperDelete(
-        libraryID,
-        paperItemID,
-        deletedConversationKey,
-      );
-      if (paperTarget) return paperTarget;
-    }
-
     const isEmptyDraft = async (conversationKey: number): Promise<boolean> => {
       if (!Number.isFinite(conversationKey) || conversationKey <= 0)
         return false;
@@ -4139,23 +4888,116 @@ export function setupHandlers(
     clearConversationSummaryFromCache(conversationKey);
   };
 
+  const invalidateClaudeConversationForDeletion = async (
+    conversationKey: number,
+    summary?: {
+      libraryID?: number;
+      kind?: "global" | "paper";
+      paperItemID?: number;
+      scopeType?: string;
+      scopeId?: string;
+      scopeLabel?: string;
+    } | null,
+  ): Promise<void> => {
+    if (!isClaudeConversationSystem()) return;
+    const libraryID = Number(summary?.libraryID || 0);
+    const kind = summary?.kind;
+    if (!Number.isFinite(libraryID) || libraryID <= 0 || !kind) {
+      return;
+    }
+    const scope =
+      summary?.scopeType === "paper" || summary?.scopeType === "open"
+        ? {
+            scopeType: summary.scopeType as "paper" | "open",
+            scopeId: String(summary.scopeId || ""),
+            scopeLabel:
+              typeof summary.scopeLabel === "string" && summary.scopeLabel.trim()
+                ? summary.scopeLabel.trim()
+                : undefined,
+          }
+        : buildClaudeScope({
+            libraryID: Math.floor(libraryID),
+            kind,
+            paperItemID:
+              kind === "paper" ? Number(summary?.paperItemID || 0) || undefined : undefined,
+          });
+    await invalidateClaudeConversationSession(getCoreAgentRuntime(), {
+      conversationKey,
+      scope,
+    });
+  };
+
   const finalizeGlobalConversationDeletion = async (
     pending: PendingHistoryDeletion,
   ): Promise<void> => {
     const conversationKey = pending.conversationKey;
-    const rememberedKey = Number(
-      activeGlobalConversationByLibrary.get(pending.libraryID),
-    );
-    if (
-      Number.isFinite(rememberedKey) &&
-      Math.floor(rememberedKey) === conversationKey
-    ) {
-      activeGlobalConversationByLibrary.delete(pending.libraryID);
+    if (isClaudeConversationSystem()) {
+      const rememberedKey = Number(
+        activeClaudeGlobalConversationByLibrary.get(
+          buildClaudeLibraryStateKey(pending.libraryID),
+        ) || 0,
+      );
+      if (
+        Number.isFinite(rememberedKey) &&
+        Math.floor(rememberedKey) === conversationKey
+      ) {
+        activeClaudeGlobalConversationByLibrary.delete(
+          buildClaudeLibraryStateKey(pending.libraryID),
+        );
+      }
+      const persistedKey = Number(
+        getLastUsedClaudeGlobalConversationKey(pending.libraryID) || 0,
+      );
+      if (
+        Number.isFinite(persistedKey) &&
+        Math.floor(persistedKey) === conversationKey
+      ) {
+        removeLastUsedClaudeGlobalConversationKey(pending.libraryID);
+      }
+    } else {
+      const rememberedKey = Number(
+        activeGlobalConversationByLibrary.get(pending.libraryID),
+      );
+      const lockedKey = getLockedGlobalConversationKey(pending.libraryID);
+      if (
+        Number.isFinite(lockedKey) &&
+        lockedKey !== null &&
+        Math.floor(lockedKey) === conversationKey
+      ) {
+        setLockedGlobalConversationKey(pending.libraryID, null);
+      }
+      if (
+        Number.isFinite(rememberedKey) &&
+        Math.floor(rememberedKey) === conversationKey
+      ) {
+        activeGlobalConversationByLibrary.delete(pending.libraryID);
+      }
     }
     clearPendingDeletionCaches(conversationKey);
     let hasError = false;
+    if (isClaudeConversationSystem()) {
+      try {
+        await invalidateClaudeConversationForDeletion(conversationKey, {
+          libraryID: pending.libraryID,
+          kind: "global",
+          scopeType: "open",
+          scopeId: buildClaudeScope({
+            libraryID: Math.floor(pending.libraryID),
+            kind: "global",
+          }).scopeId,
+          scopeLabel: "Open Chat",
+        });
+      } catch (err) {
+        hasError = true;
+        ztoolkit.log("LLM: Failed to invalidate deleted Claude global conversation", err);
+      }
+    }
     try {
-      await clearStoredConversation(conversationKey);
+      if (isClaudeConversationSystem()) {
+        await clearClaudeConversation(conversationKey);
+      } else {
+        await clearStoredConversation(conversationKey);
+      }
     } catch (err) {
       hasError = true;
       ztoolkit.log("LLM: Failed to clear deleted history conversation", err);
@@ -4176,7 +5018,11 @@ export function setupHandlers(
       );
     }
     try {
-      await deleteGlobalConversation(conversationKey);
+      if (isClaudeConversationSystem()) {
+        await deleteClaudeConversation(conversationKey);
+      } else {
+        await deleteGlobalConversation(conversationKey);
+      }
     } catch (err) {
       hasError = true;
       ztoolkit.log("LLM: Failed to delete global history conversation", err);
@@ -4197,34 +5043,86 @@ export function setupHandlers(
     const conversationKey = pending.conversationKey;
     let paperItemID = Number(pending.paperItemID || 0);
     if (!paperItemID) {
-      const summary = await getPaperConversation(conversationKey);
-      paperItemID = Number(summary?.paperItemID || 0);
+      if (isClaudeConversationSystem()) {
+        const summary = await getClaudeConversationSummary(conversationKey);
+        paperItemID = Number(summary?.paperItemID || 0);
+      } else {
+        const summary = await getPaperConversation(conversationKey);
+        paperItemID = Number(summary?.paperItemID || 0);
+      }
     }
     if (paperItemID > 0) {
-      const paperStateKey = buildPaperStateKey(pending.libraryID, paperItemID);
-      const rememberedConversationKey = Number(
-        activePaperConversationByPaper.get(paperStateKey) || 0,
-      );
-      if (
-        Number.isFinite(rememberedConversationKey) &&
-        Math.floor(rememberedConversationKey) === conversationKey
-      ) {
-        activePaperConversationByPaper.delete(paperStateKey);
-      }
-      const persistedConversationKey = Number(
-        getLastUsedPaperConversationKey(pending.libraryID, paperItemID) || 0,
-      );
-      if (
-        Number.isFinite(persistedConversationKey) &&
-        Math.floor(persistedConversationKey) === conversationKey
-      ) {
-        removeLastUsedPaperConversationKey(pending.libraryID, paperItemID);
+      if (isClaudeConversationSystem()) {
+        const paperStateKey = buildClaudePaperStateKey(
+          pending.libraryID,
+          paperItemID,
+        );
+        const rememberedConversationKey = Number(
+          activeClaudePaperConversationByPaper.get(paperStateKey) || 0,
+        );
+        if (
+          Number.isFinite(rememberedConversationKey) &&
+          Math.floor(rememberedConversationKey) === conversationKey
+        ) {
+          activeClaudePaperConversationByPaper.delete(paperStateKey);
+        }
+        const persistedConversationKey = Number(
+          getLastUsedClaudePaperConversationKey(
+            pending.libraryID,
+            paperItemID,
+          ) || 0,
+        );
+        if (
+          Number.isFinite(persistedConversationKey) &&
+          Math.floor(persistedConversationKey) === conversationKey
+        ) {
+          removeLastUsedClaudePaperConversationKey(
+            pending.libraryID,
+            paperItemID,
+          );
+        }
+      } else {
+        const paperStateKey = buildPaperStateKey(pending.libraryID, paperItemID);
+        const rememberedConversationKey = Number(
+          activePaperConversationByPaper.get(paperStateKey) || 0,
+        );
+        if (
+          Number.isFinite(rememberedConversationKey) &&
+          Math.floor(rememberedConversationKey) === conversationKey
+        ) {
+          activePaperConversationByPaper.delete(paperStateKey);
+        }
+        const persistedConversationKey = Number(
+          getLastUsedPaperConversationKey(pending.libraryID, paperItemID) || 0,
+        );
+        if (
+          Number.isFinite(persistedConversationKey) &&
+          Math.floor(persistedConversationKey) === conversationKey
+        ) {
+          removeLastUsedPaperConversationKey(pending.libraryID, paperItemID);
+        }
       }
     }
     clearPendingDeletionCaches(conversationKey);
     let hasError = false;
+    if (isClaudeConversationSystem()) {
+      try {
+        await invalidateClaudeConversationForDeletion(conversationKey, {
+          libraryID: pending.libraryID,
+          kind: "paper",
+          paperItemID,
+        });
+      } catch (err) {
+        hasError = true;
+        ztoolkit.log("LLM: Failed to invalidate deleted Claude paper conversation", err);
+      }
+    }
     try {
-      await clearStoredConversation(conversationKey);
+      if (isClaudeConversationSystem()) {
+        await clearClaudeConversation(conversationKey);
+      } else {
+        await clearStoredConversation(conversationKey);
+      }
     } catch (err) {
       hasError = true;
       ztoolkit.log("LLM: Failed to clear deleted paper conversation", err);
@@ -4242,7 +5140,11 @@ export function setupHandlers(
       ztoolkit.log("LLM: Failed to remove deleted paper attachment files", err);
     }
     try {
-      await deletePaperConversation(conversationKey);
+      if (isClaudeConversationSystem()) {
+        await deleteClaudeConversation(conversationKey);
+      } else {
+        await deletePaperConversation(conversationKey);
+      }
     } catch (err) {
       hasError = true;
       ztoolkit.log(
@@ -4350,7 +5252,7 @@ export function setupHandlers(
       if (status) setStatus(status, t("Delete target changed"), "error");
       return;
     }
-    await ensureConversationLoaded(item);
+    await ensureConversationLoaded(item as Zotero.Item);
     if (!item || getConversationKey(item) !== target.conversationKey) {
       if (status) setStatus(status, t("Delete target changed"), "error");
       return;
@@ -4427,10 +5329,21 @@ export function setupHandlers(
       libraryID: pending.libraryID,
       title: pending.title,
     });
-    if (pending.kind === "global") {
-      await finalizeGlobalConversationDeletion(pending);
-    } else {
-      await finalizePaperConversationDeletion(pending);
+    const originalSystem = getConversationSystemPref();
+    const targetSystem = pending.conversationSystem;
+    if (originalSystem !== targetSystem) {
+      setConversationSystemPref(targetSystem);
+    }
+    try {
+      if (pending.kind === "global") {
+        await finalizeGlobalConversationDeletion(pending);
+      } else {
+        await finalizePaperConversationDeletion(pending);
+      }
+    } finally {
+      if (originalSystem !== targetSystem) {
+        setConversationSystemPref(originalSystem === "claude_code" ? "claude_code" : "upstream");
+      }
     }
     pendingHistoryDeletionKeys.delete(pending.conversationKey);
     await refreshGlobalHistoryHeader();
@@ -4515,7 +5428,9 @@ export function setupHandlers(
     const nextTitle = promptConversationRename(entry);
     if (!nextTitle) return;
     try {
-      if (entry.kind === "paper") {
+      if (isClaudeConversationSystem()) {
+        await setClaudeConversationTitle(entry.conversationKey, nextTitle);
+      } else if (entry.kind === "paper") {
         await setPaperConversationTitle(entry.conversationKey, nextTitle);
       } else {
         await setGlobalConversationTitle(entry.conversationKey, nextTitle);
@@ -4581,7 +5496,21 @@ export function setupHandlers(
       }
       await switchToHistoryTarget(fallbackTarget);
       if (fallbackTarget.kind === "paper") {
-        activeGlobalConversationByLibrary.delete(libraryID);
+        if (isClaudeConversationSystem()) {
+          activeClaudeGlobalConversationByLibrary.delete(
+            buildClaudeLibraryStateKey(libraryID),
+          );
+        } else {
+          activeGlobalConversationByLibrary.delete(libraryID);
+          const lockedKey = getLockedGlobalConversationKey(libraryID);
+          if (
+            Number.isFinite(lockedKey) &&
+            lockedKey !== null &&
+            Math.floor(lockedKey) === entry.conversationKey
+          ) {
+            setLockedGlobalConversationKey(libraryID, null);
+          }
+        }
       }
     }
 
@@ -4590,6 +5519,7 @@ export function setupHandlers(
       kind: entry.kind,
       conversationKey: entry.conversationKey,
       libraryID,
+      conversationSystem: isClaudeConversationSystem() ? "claude_code" : "upstream",
       paperItemID: entry.paperItemID,
       title: entry.title,
       wasActive,
@@ -4616,10 +5546,8 @@ export function setupHandlers(
       setStatus(status, t("Conversation deleted. Undo available."), "ready");
   };
 
-  const createAndSwitchGlobalConversation = async () => {
+  const createAndSwitchGlobalConversation = async (forceFresh = false) => {
     if (!item || isNoteSession()) return;
-    // Allow creating new conversations even if another is generating.
-    // The user wants to start a fresh conversation while the other runs.
     closeHistoryNewMenu();
     const libraryID = getCurrentLibraryID();
     if (!libraryID) {
@@ -4632,56 +5560,127 @@ export function setupHandlers(
     let targetConversationKey = 0;
     let reuseReason: "active-draft" | "latest-draft" | null = null;
 
-    const currentCandidate = isGlobalMode()
-      ? getConversationKey(item)
-      : Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
-    const normalizedCurrentCandidate = Number.isFinite(currentCandidate)
-      ? Math.floor(currentCandidate)
-      : 0;
-    if (normalizedCurrentCandidate > 0) {
-      try {
-        const turnCount = await getGlobalConversationUserTurnCount(
-          normalizedCurrentCandidate,
-        );
-        if (turnCount === 0) {
-          targetConversationKey = normalizedCurrentCandidate;
-          reuseReason = "active-draft";
+    if (isClaudeConversationSystem()) {
+      if (!forceFresh) {
+        const currentCandidate = isGlobalMode()
+          ? getConversationKey(item)
+          : Number(
+              activeClaudeGlobalConversationByLibrary.get(
+                buildClaudeLibraryStateKey(libraryID),
+              ) || 0,
+            );
+        const normalizedCurrentCandidate = Number.isFinite(currentCandidate)
+          ? Math.floor(currentCandidate)
+          : 0;
+        if (normalizedCurrentCandidate > 0) {
+          try {
+            const currentSummary = await getClaudeConversationSummary(
+              normalizedCurrentCandidate,
+            );
+            if (currentSummary && (currentSummary.userTurnCount || 0) === 0) {
+              targetConversationKey = normalizedCurrentCandidate;
+              reuseReason = "active-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to inspect active Claude candidate for draft reuse",
+              err,
+            );
+          }
         }
-      } catch (err) {
-        ztoolkit.log(
-          "LLM: Failed to inspect active candidate for draft reuse",
-          err,
-        );
-      }
-    }
-
-    if (targetConversationKey <= 0) {
-      try {
-        const latestEmpty = await getLatestEmptyGlobalConversation(libraryID);
-        const latestEmptyKey = Number(latestEmpty?.conversationKey || 0);
-        if (Number.isFinite(latestEmptyKey) && latestEmptyKey > 0) {
-          targetConversationKey = Math.floor(latestEmptyKey);
-          reuseReason = "latest-draft";
+        if (targetConversationKey <= 0) {
+          try {
+            const summaries = await listClaudeGlobalConversations(
+              libraryID,
+              GLOBAL_HISTORY_LIMIT,
+            );
+            const latestEmpty = summaries.find((summary) => (summary.userTurnCount || 0) === 0);
+            const latestEmptyKey = Number(latestEmpty?.conversationKey || 0);
+            if (Number.isFinite(latestEmptyKey) && latestEmptyKey > 0) {
+              targetConversationKey = Math.floor(latestEmptyKey);
+              reuseReason = "latest-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to load latest empty Claude global conversation",
+              err,
+            );
+          }
         }
-      } catch (err) {
-        ztoolkit.log(
-          "LLM: Failed to load latest empty global conversation",
-          err,
-        );
       }
-    }
+      if (targetConversationKey <= 0) {
+        try {
+          targetConversationKey = Number(
+            (await createClaudeGlobalConversation(libraryID))?.conversationKey || 0,
+          );
+        } catch (err) {
+          ztoolkit.log("LLM: Failed to create new Claude global conversation", err);
+        }
+        reuseReason = null;
+      }
+      if (!targetConversationKey) {
+        if (status) setStatus(status, t("Failed to create conversation"), "error");
+        return;
+      }
+      activeClaudeGlobalConversationByLibrary.set(
+        buildClaudeLibraryStateKey(libraryID),
+        targetConversationKey,
+      );
+    } else {
+      if (!forceFresh) {
+        const currentCandidate = isGlobalMode() && isUpstreamGlobalConversationKey(Number(getConversationKey(item) || 0))
+          ? getConversationKey(item)
+          : Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+        const normalizedCurrentCandidate = Number.isFinite(currentCandidate)
+          ? Math.floor(currentCandidate)
+          : 0;
+        if (normalizedCurrentCandidate > 0) {
+          try {
+            const turnCount = await getGlobalConversationUserTurnCount(
+              normalizedCurrentCandidate,
+            );
+            if (turnCount === 0) {
+              targetConversationKey = normalizedCurrentCandidate;
+              reuseReason = "active-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to inspect active candidate for draft reuse",
+              err,
+            );
+          }
+        }
 
-    if (targetConversationKey <= 0) {
-      try {
-        targetConversationKey = await createGlobalConversation(libraryID);
-      } catch (err) {
-        ztoolkit.log("LLM: Failed to create new global conversation", err);
+        if (targetConversationKey <= 0) {
+          try {
+            const latestEmpty = await getLatestEmptyGlobalConversation(libraryID);
+            const latestEmptyKey = Number(latestEmpty?.conversationKey || 0);
+            if (Number.isFinite(latestEmptyKey) && latestEmptyKey > 0) {
+              targetConversationKey = Math.floor(latestEmptyKey);
+              reuseReason = "latest-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to load latest empty global conversation",
+              err,
+            );
+          }
+        }
       }
-      reuseReason = null;
-    }
-    if (!targetConversationKey) {
-      if (status) setStatus(status, t("Failed to create conversation"), "error");
-      return;
+
+      if (targetConversationKey <= 0) {
+        try {
+          targetConversationKey = await createGlobalConversation(libraryID);
+        } catch (err) {
+          ztoolkit.log("LLM: Failed to create new global conversation", err);
+        }
+        reuseReason = null;
+      }
+      if (!targetConversationKey) {
+        if (status) setStatus(status, t("Failed to create conversation"), "error");
+        return;
+      }
+      activeGlobalConversationByLibrary.set(libraryID, targetConversationKey);
     }
 
     ztoolkit.log("LLM: + conversation action", {
@@ -4690,7 +5689,6 @@ export function setupHandlers(
       action: reuseReason ? "reuse" : "create",
       reason: reuseReason || "new",
     });
-    activeGlobalConversationByLibrary.set(libraryID, targetConversationKey);
     await switchGlobalConversation(targetConversationKey);
     if (status) {
       setStatus(
@@ -4704,9 +5702,8 @@ export function setupHandlers(
     inputBox.focus({ preventScroll: true });
   };
 
-  const createAndSwitchPaperConversation = async () => {
+  const createAndSwitchPaperConversation = async (forceFresh = false) => {
     if (!item || isNoteSession()) return;
-    // Allow creating new paper conversations even if another is generating.
     closeHistoryNewMenu();
     const paperItem = resolveCurrentPaperBaseItem();
     if (!paperItem) {
@@ -4728,57 +5725,115 @@ export function setupHandlers(
     let targetConversationKey = 0;
     let reuseReason: "active-draft" | "existing-draft" | null = null;
 
-    // Step 1: If the currently active conversation is already empty, reuse it.
-    const currentKey = Number(getConversationKey(item) || 0);
-    if (Number.isFinite(currentKey) && currentKey > 0) {
-      try {
-        const currentSummary = await getPaperConversation(currentKey);
-        if (currentSummary && currentSummary.userTurnCount === 0) {
-          targetConversationKey = currentKey;
-          reuseReason = "active-draft";
+    if (isClaudeConversationSystem()) {
+      if (!forceFresh) {
+        const currentKey = Number(getConversationKey(item) || 0);
+        if (Number.isFinite(currentKey) && currentKey > 0) {
+          try {
+            const currentSummary = await getClaudeConversationSummary(currentKey);
+            if (
+              currentSummary &&
+              currentSummary.kind === "paper" &&
+              (currentSummary.userTurnCount || 0) === 0
+            ) {
+              targetConversationKey = currentKey;
+              reuseReason = "active-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to inspect active Claude paper conversation for draft reuse",
+              err,
+            );
+          }
         }
-      } catch (err) {
-        ztoolkit.log(
-          "LLM: Failed to inspect active paper conversation for draft reuse",
-          err,
-        );
-      }
-    }
-
-    // Step 2: Look for any other existing empty conversation for this paper.
-    if (targetConversationKey <= 0) {
-      try {
-        const summaries = await listPaperConversations(libraryID, paperItemID, 50);
-        const emptyEntry = summaries.find(
-          (s) => s.userTurnCount === 0,
-        );
-        if (emptyEntry?.conversationKey) {
-          targetConversationKey = emptyEntry.conversationKey;
-          reuseReason = "existing-draft";
+        if (targetConversationKey <= 0) {
+          try {
+            const summaries = await listClaudePaperConversations(
+              libraryID,
+              paperItemID,
+              50,
+            );
+            const emptyEntry = summaries.find(
+              (s) => (s.userTurnCount || 0) === 0,
+            );
+            if (emptyEntry?.conversationKey) {
+              targetConversationKey = emptyEntry.conversationKey;
+              reuseReason = "existing-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to list Claude paper conversations for draft reuse",
+              err,
+            );
+          }
         }
-      } catch (err) {
-        ztoolkit.log(
-          "LLM: Failed to list paper conversations for draft reuse",
-          err,
-        );
       }
-    }
+      if (targetConversationKey <= 0) {
+        let createdSummary: Awaited<ReturnType<typeof createClaudePaperConversation>> = null;
+        try {
+          createdSummary = await createClaudePaperConversation(libraryID, paperItemID);
+        } catch (err) {
+          ztoolkit.log("LLM: Failed to create new Claude paper conversation", err);
+        }
+        if (!createdSummary?.conversationKey) {
+          if (status) setStatus(status, t("Failed to create paper chat"), "error");
+          return;
+        }
+        targetConversationKey = createdSummary.conversationKey;
+        reuseReason = null;
+      }
+    } else {
+      if (!forceFresh) {
+        const currentKey = Number(getConversationKey(item) || 0);
+        if (Number.isFinite(currentKey) && currentKey > 0) {
+          try {
+            const currentSummary = await getPaperConversation(currentKey);
+            if (currentSummary && currentSummary.userTurnCount === 0) {
+              targetConversationKey = currentKey;
+              reuseReason = "active-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to inspect active paper conversation for draft reuse",
+              err,
+            );
+          }
+        }
 
-    // Step 3: No empty draft found — create a genuinely new conversation.
-    if (targetConversationKey <= 0) {
-      let createdSummary: Awaited<ReturnType<typeof createPaperConversation>> =
-        null;
-      try {
-        createdSummary = await createPaperConversation(libraryID, paperItemID);
-      } catch (err) {
-        ztoolkit.log("LLM: Failed to create new paper conversation", err);
+        if (targetConversationKey <= 0) {
+          try {
+            const summaries = await listPaperConversations(libraryID, paperItemID, 50);
+            const emptyEntry = summaries.find(
+              (s) => s.userTurnCount === 0,
+            );
+            if (emptyEntry?.conversationKey) {
+              targetConversationKey = emptyEntry.conversationKey;
+              reuseReason = "existing-draft";
+            }
+          } catch (err) {
+            ztoolkit.log(
+              "LLM: Failed to list paper conversations for draft reuse",
+              err,
+            );
+          }
+        }
       }
-      if (!createdSummary?.conversationKey) {
-        if (status) setStatus(status, t("Failed to create paper chat"), "error");
-        return;
+
+      if (targetConversationKey <= 0) {
+        let createdSummary: Awaited<ReturnType<typeof createPaperConversation>> =
+          null;
+        try {
+          createdSummary = await createPaperConversation(libraryID, paperItemID);
+        } catch (err) {
+          ztoolkit.log("LLM: Failed to create new paper conversation", err);
+        }
+        if (!createdSummary?.conversationKey) {
+          if (status) setStatus(status, t("Failed to create paper chat"), "error");
+          return;
+        }
+        targetConversationKey = createdSummary.conversationKey;
+        reuseReason = null;
       }
-      targetConversationKey = createdSummary.conversationKey;
-      reuseReason = null;
     }
 
     ztoolkit.log("LLM: + paper conversation action", {
@@ -4867,7 +5922,7 @@ export function setupHandlers(
         return;
       }
 
-      // Create new session directly in whichever mode is currently active
+      // Create a truly fresh session in whichever mode is currently active.
       if (isGlobalMode()) {
         void createAndSwitchGlobalConversation();
       } else {
@@ -4914,8 +5969,38 @@ export function setupHandlers(
     modeChipBtn.addEventListener("click", (e: Event) => {
       e.preventDefault();
       e.stopPropagation();
-      // Mode chip is non-clickable — sidepanels are paper-only,
-      // standalone is open-chat-only. No mode switching anywhere.
+      if (!item || isNoteSession()) return;
+      if (isGlobalMode()) {
+        void switchPaperConversation();
+        return;
+      }
+      const libraryID = getCurrentLibraryID();
+      const targetGlobalKey = isClaudeConversationSystem()
+        ? resolveRememberedClaudeConversationKey({
+            libraryID,
+            kind: "global",
+          }) || getLastUsedClaudeGlobalConversationKey(libraryID) || 0
+        : (() => {
+            const lockedKey = getLockedGlobalConversationKey(libraryID);
+            if (lockedKey !== null) return lockedKey;
+            const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+            return isUpstreamGlobalConversationKey(activeKey) ? Math.floor(activeKey) : 0;
+          })();
+      if (targetGlobalKey > 0) {
+        void switchGlobalConversation(targetGlobalKey);
+      } else {
+        void createAndSwitchGlobalConversation();
+      }
+    });
+  }
+
+  if (claudeSystemToggleBtn) {
+    claudeSystemToggleBtn.addEventListener("click", (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!item || isNoteSession()) return;
+      const nextSystem = isClaudeConversationSystem() ? "upstream" : "claude_code";
+      void switchConversationSystem(nextSystem, { forceFresh: true });
     });
   }
 
@@ -4954,6 +6039,7 @@ export function setupHandlers(
     modeLockBtn.addEventListener("click", (e: Event) => {
       e.preventDefault();
       e.stopPropagation();
+      if (isClaudeConversationSystem()) return;
       if (!item || isNoteSession() || !isGlobalMode()) return;
       const libraryID = getCurrentLibraryID();
       if (!libraryID) return;
@@ -5186,7 +6272,9 @@ export function setupHandlers(
   }
 
   const getModelChoices = () => {
-    const choices = getAvailableModelEntries();
+    const choices = isClaudeConversationSystem()
+      ? getClaudeRuntimeModelEntries()
+      : getAvailableModelEntries();
     const groupedChoices: Array<{
       providerLabel: string;
       entries: RuntimeModelEntry[];
@@ -5212,7 +6300,11 @@ export function setupHandlers(
 
   const getSelectedModelInfo = () => {
     const { choices, groupedChoices } = getModelChoices();
-    const selectedEntry = item ? getSelectedModelEntryForItem(item.id) : null;
+    const selectedEntry = isClaudeConversationSystem()
+      ? getSelectedClaudeRuntimeEntry()
+      : item
+        ? getSelectedModelEntryForItem(item.id)
+        : null;
     const currentModel =
       selectedEntry?.model ||
       choices[0]?.model ||
@@ -5825,6 +6917,15 @@ export function setupHandlers(
           e.preventDefault();
           e.stopPropagation();
           if (!item) return;
+          if (isClaudeConversationSystem()) {
+            clearClaudeReasoningDisplayOverride();
+            setClaudeRuntimeModelPref(entry.model);
+            setFloatingMenuOpen(modelMenu, MODEL_MENU_OPEN_CLASS, false);
+            setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
+            updateModelButton();
+            updateReasoningButton();
+            return;
+          }
           // [webchat] Remember current model before switching to webchat
           const wasWebChat = isWebChatMode();
           if (!wasWebChat && entry.authMode === "webchat") {
@@ -6004,6 +7105,10 @@ export function setupHandlers(
             entry.model,
             entry.apiBase,
             entry.apiKey,
+            entry.authMode,
+            entry.providerProtocol,
+            entry.entryId,
+            entry.providerLabel,
             retryReasoning,
             retryAdvanced,
           );
@@ -6013,6 +7118,100 @@ export function setupHandlers(
         });
         retryModelMenu.appendChild(option);
       }
+    }
+  };
+
+  type ClaudeReasoningDisplayMode =
+    | "auto"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max";
+
+  let claudeReasoningDisplayOverride: {
+    mode: ClaudeReasoningDisplayMode;
+    modelKey: string;
+  } | null = null;
+
+  const getClaudeReasoningDisplayScopeKey = () => {
+    const { selectedEntryId, currentModel } = getSelectedModelInfo();
+    return `${selectedEntryId || "claude-runtime"}::${currentModel}`;
+  };
+
+  const normalizeClaudeReasoningDisplayMode = (
+    value: unknown,
+  ): ClaudeReasoningDisplayMode | null => {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "default" || normalized === "none") return "auto";
+    if (
+      normalized === "auto" ||
+      normalized === "low" ||
+      normalized === "medium" ||
+      normalized === "high" ||
+      normalized === "xhigh" ||
+      normalized === "max"
+    ) {
+      return normalized;
+    }
+    return null;
+  };
+
+  const getClaudeReasoningDisplayMode = (): ClaudeReasoningDisplayMode => {
+    if (claudeReasoningDisplayOverride) {
+      if (
+        claudeReasoningDisplayOverride.modelKey ===
+        getClaudeReasoningDisplayScopeKey()
+      ) {
+        return claudeReasoningDisplayOverride.mode;
+      }
+      claudeReasoningDisplayOverride = null;
+    }
+    return getClaudeReasoningModePref();
+  };
+
+  const getClaudeReasoningDisplayLabel = (
+    mode: ClaudeReasoningDisplayMode,
+  ) => {
+    if (mode === "auto") return "Auto";
+    if (mode === "xhigh") return "XHigh";
+    if (mode === "max") return "Max";
+    if (mode === "high") return "High";
+    if (mode === "medium") return "Medium";
+    if (mode === "low") return "Low";
+    return "Auto";
+  };
+
+  const buildClaudeReasoningConfigForDisplayMode = (
+    mode: ClaudeReasoningDisplayMode,
+  ): LLMReasoningConfig | undefined => {
+    if (mode === "auto") return undefined;
+    return {
+      provider: "anthropic",
+      level: mode === "max" ? "xhigh" : mode,
+    };
+  };
+
+  const clearClaudeReasoningDisplayOverride = () => {
+    claudeReasoningDisplayOverride = null;
+  };
+
+  const applyClaudeResolvedReasoningDisplay = (effort: unknown) => {
+    if (!isClaudeConversationSystem()) return;
+    const mode = normalizeClaudeReasoningDisplayMode(effort);
+    if (!mode) return;
+    if (mode === getClaudeReasoningModePref()) {
+      claudeReasoningDisplayOverride = null;
+    } else {
+      claudeReasoningDisplayOverride = {
+        mode,
+        modelKey: getClaudeReasoningDisplayScopeKey(),
+      };
+    }
+    updateReasoningButton();
+    if (isFloatingMenuOpen(reasoningMenu)) {
+      rebuildReasoningMenu();
     }
   };
 
@@ -6027,6 +7226,33 @@ export function setupHandlers(
       };
     }
     const { currentModel } = getSelectedModelInfo();
+    if (isClaudeConversationSystem()) {
+      const selectedMode = getClaudeReasoningDisplayMode();
+      const options: ReasoningOption[] = [
+        { level: "low", enabled: true, label: "Low" },
+        { level: "medium", enabled: true, label: "Medium" },
+        { level: "high", enabled: true, label: "High" },
+        { level: "xhigh", enabled: true, label: "XHigh" },
+        {
+          level: "xhigh",
+          enabled: true,
+          label: "Max",
+        },
+      ];
+      const selectedLevel =
+        selectedMode === "auto"
+          ? "none"
+          : selectedMode === "max"
+            ? ("xhigh" as ReasoningLevelSelection)
+            : (selectedMode as ReasoningLevelSelection);
+      return {
+        provider: "anthropic" as const,
+        currentModel,
+        options,
+        enabledLevels: options.map((option) => option.level),
+        selectedLevel,
+      };
+    }
     const selectedProfile = getSelectedModelEntryForItem(item.id);
     const provider = detectReasoningProvider(currentModel);
     const options = getReasoningOptions(
@@ -6175,14 +7401,20 @@ export function setupHandlers(
       const { provider, currentModel, options, enabledLevels, selectedLevel } =
         getReasoningState();
       const available = enabledLevels.length > 0;
-      const resolvedReasoningLabel = available
-        ? getReasoningLevelDisplayLabel(
-            selectedLevel as LLMReasoningLevel,
-            provider,
-            currentModel,
-            options,
-          )
-        : "off";
+      const resolvedReasoningLabel = isClaudeConversationSystem()
+        ? (() => {
+            return getClaudeReasoningDisplayLabel(
+              getClaudeReasoningDisplayMode(),
+            );
+          })()
+        : available
+          ? getReasoningLevelDisplayLabel(
+              selectedLevel as LLMReasoningLevel,
+              provider,
+              currentModel,
+              options,
+            )
+          : "off";
       const active =
         available && isReasoningDisplayLabelActive(resolvedReasoningLabel);
       const reasoningLabel = resolvedReasoningLabel;
@@ -6233,9 +7465,14 @@ export function setupHandlers(
           e.preventDefault();
           e.stopPropagation();
           if (!item) return;
-          selectedReasoningCache.clear();
-          selectedReasoningCache.set(item.id, mode.level as any);
-          setLastUsedReasoningLevel(mode.level as any);
+          if (isClaudeConversationSystem()) {
+            clearClaudeReasoningDisplayOverride();
+            setClaudeReasoningModePref(mode.level === "none" ? "auto" : (mode.level as any));
+          } else {
+            selectedReasoningCache.clear();
+            selectedReasoningCache.set(item.id, mode.level as any);
+            setLastUsedReasoningLevel(mode.level as any);
+          }
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
           updateReasoningButton();
         };
@@ -6251,6 +7488,48 @@ export function setupHandlers(
       t("Reasoning level"),
       "llm-reasoning-menu-section",
     );
+    if (isClaudeConversationSystem()) {
+      const claudeModes: Array<{
+        value: "auto" | "low" | "medium" | "high" | "xhigh" | "max";
+        label: string;
+      }> = [
+        { value: "auto", label: "Auto" },
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High" },
+        { value: "xhigh", label: "XHigh" },
+        { value: "max", label: "Max" },
+      ];
+      const currentMode = getClaudeReasoningDisplayMode();
+      for (const mode of claudeModes) {
+        const option = createElement(
+          body.ownerDocument as Document,
+          "button",
+          "llm-response-menu-item llm-reasoning-option",
+          {
+            type: "button",
+            textContent:
+              currentMode === mode.value
+                ? `\u2713 ${mode.label}`
+                : mode.label,
+          },
+        );
+        const applyClaudeSelection = (e: Event) => {
+          if (!isPrimaryPointerEvent(e)) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (!item) return;
+          clearClaudeReasoningDisplayOverride();
+          setClaudeReasoningModePref(mode.value as any);
+          setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
+          updateReasoningButton();
+        };
+        option.addEventListener("pointerdown", applyClaudeSelection);
+        option.addEventListener("click", applyClaudeSelection);
+        reasoningMenu.appendChild(option);
+      }
+      return;
+    }
     if (!enabledLevels.length) {
       const offOption = createElement(
         body.ownerDocument as Document,
@@ -6266,9 +7545,14 @@ export function setupHandlers(
         e.preventDefault();
         e.stopPropagation();
         if (!item) return;
-        selectedReasoningCache.clear();
-        selectedReasoningCache.set(item.id, "none");
-        setLastUsedReasoningLevel("none");
+        if (isClaudeConversationSystem()) {
+          clearClaudeReasoningDisplayOverride();
+          setClaudeReasoningModePref("auto");
+        } else {
+          selectedReasoningCache.clear();
+          selectedReasoningCache.set(item.id, "none");
+          setLastUsedReasoningLevel("none");
+        }
         setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
         updateReasoningButton();
       };
@@ -6302,9 +7586,15 @@ export function setupHandlers(
           e.preventDefault();
           e.stopPropagation();
           if (!item) return;
-          selectedReasoningCache.clear();
-          selectedReasoningCache.set(item.id, level);
-          setLastUsedReasoningLevel(level);
+          if (isClaudeConversationSystem()) {
+            const nextMode = optionState.label === "Max" ? "max" : level;
+            clearClaudeReasoningDisplayOverride();
+            setClaudeReasoningModePref(nextMode as any);
+          } else {
+            selectedReasoningCache.clear();
+            selectedReasoningCache.set(item.id, level);
+            setLastUsedReasoningLevel(level);
+          }
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
           updateReasoningButton();
         };
@@ -6317,6 +7607,9 @@ export function setupHandlers(
       reasoningMenu.appendChild(option);
     }
   };
+
+  (body as any).__llmApplyResolvedClaudeEffort =
+    applyClaudeResolvedReasoningDisplay;
 
   const syncModelFromPrefs = () => {
     updateModelButton();
@@ -6872,6 +8165,9 @@ export function setupHandlers(
 
   const getSelectedProfile = () => {
     if (!item) return null;
+    if (isClaudeConversationSystem()) {
+      return getSelectedClaudeRuntimeEntry();
+    }
     return getSelectedModelEntryForItem(item.id);
   };
 
@@ -6879,11 +8175,19 @@ export function setupHandlers(
     entryId: string | undefined,
   ): AdvancedModelParams | undefined => {
     if (!entryId) return undefined;
+    if (isClaudeConversationSystem()) {
+      return getSelectedClaudeRuntimeEntry().advanced;
+    }
     return getAdvancedModelParamsForEntry(entryId);
   };
 
   const getSelectedReasoning = (): LLMReasoningConfig | undefined => {
     if (!item) return undefined;
+    if (isClaudeConversationSystem()) {
+      return buildClaudeReasoningConfigForDisplayMode(
+        getClaudeReasoningDisplayMode(),
+      );
+    }
     const { provider, enabledLevels, selectedLevel } = getReasoningState();
     if (provider === "unsupported" || selectedLevel === "none")
       return undefined;
@@ -7018,6 +8322,11 @@ export function setupHandlers(
     Array.from(slashMenu.querySelectorAll("[data-slash-agent-item]")).forEach(
       (el) => (el as Element).remove(),
     );
+  };
+  type ClaudeSlashMenuItem = {
+    name: string;
+    description: string;
+    argumentHint?: string;
   };
   const getVisibleSlashItems = (): HTMLButtonElement[] => {
     if (!slashMenu) return [];
@@ -7815,6 +9124,11 @@ export function setupHandlers(
    * Called from the send flow when a command chip is active.
    */
   const handleInlineCommand = async (actionName: string, params: string): Promise<void> => {
+    if (isClaudeConversationSystem()) {
+      inputBox.value = params.trim() ? `/${actionName} ${params.trim()}` : `/${actionName}`;
+      await doSend();
+      return;
+    }
     // Commands that go through agent chat for full trace visibility
     if (actionName === "library_statistics" || actionName === "literature_review") {
       if (getCurrentRuntimeMode() !== "agent" && getAgentModeEnabled()) {
@@ -7896,7 +9210,6 @@ export function setupHandlers(
     const ownerDoc = body.ownerDocument;
     if (!ownerDoc) return;
 
-    // Remove old skill items
     list
       .querySelectorAll("[data-slash-skill-item]")
       .forEach((el: Element) => el.remove());
@@ -7914,8 +9227,6 @@ export function setupHandlers(
 
     if (!filtered.length) return;
 
-    // Anchor: the "Base actions" section label (inserted by renderAgentActionsInSlashMenu),
-    // or fall back to the first base item, or list end
     const baseAnchor =
       list.querySelector("[data-slash-section='base']") ||
       list.querySelector("[data-slash-base-item]") ||
@@ -7928,13 +9239,11 @@ export function setupHandlers(
       return el;
     };
 
-    // "Skills" section label
     const sectionLabel = mkSkillEl("div", "llm-slash-menu-section");
     sectionLabel.setAttribute("aria-hidden", "true");
     sectionLabel.textContent = t("Skills");
     list.insertBefore(sectionLabel, baseAnchor);
 
-    // Skill items
     filtered.forEach((skill: AgentSkill) => {
       const btn = mkSkillEl(
         "button",
@@ -7962,7 +9271,6 @@ export function setupHandlers(
       badgeEl.textContent = t(badgeLabel);
 
       btn.append(titleEl, descEl, badgeEl);
-
       btn.addEventListener("click", (e: Event) => {
         e.preventDefault();
         e.stopPropagation();
@@ -7975,17 +9283,14 @@ export function setupHandlers(
     });
   };
 
-  /** Prepends filtered agent actions into the slash menu (agent mode only). */
   /**
    * Extracts the first sentence of a description for compact slash-menu
    * display. Falls back to the first ~80 chars if no sentence boundary is
-   * found. Preserves the full text as a tooltip (set by the caller).
+   * found. Preserves the full text as a tooltip.
    */
   const firstSentence = (text: string): string => {
     const normalized = text.replace(/\s+/g, " ").trim();
     if (!normalized) return "";
-    // Match up to and including the first sentence-terminating punctuation
-    // followed by a space or end-of-string.
     const match = /^(.+?[.!?])(?:\s|$)/.exec(normalized);
     if (match) return match[1];
     if (normalized.length <= 80) return normalized;
@@ -7994,16 +9299,85 @@ export function setupHandlers(
 
   const renderAgentActionsInSlashMenu = (query: string = "") => {
     clearAgentSlashItems();
+    const ownerDoc = body.ownerDocument;
+    const list = slashMenu?.querySelector(".llm-action-picker-list");
+    if (!ownerDoc || !list) return;
+    const firstBase = list.firstChild;
+    const mkAgentEl = (tag: string, cls: string): HTMLElement => {
+      const el = ownerDoc.createElement(tag);
+      el.className = cls;
+      el.setAttribute("data-slash-agent-item", "true");
+      return el;
+    };
+
+    if (isClaudeConversationSystem()) {
+      let commands: ClaudeSlashMenuItem[] = [];
+      try {
+        commands = getAgentApi().listSlashCommands?.() || [];
+      } catch {
+        commands = [];
+      }
+      if (!commands.length) {
+        const loading = mkAgentEl("div", "llm-slash-menu-section");
+        loading.setAttribute("aria-hidden", "true");
+        loading.textContent = t("Loading Claude commands…");
+        list.insertBefore(loading, firstBase);
+        void refreshClaudeSlashCommands(getCoreAgentRuntime(), false).then(() => {
+          renderAgentActionsInSlashMenu(query);
+        }).catch(() => {});
+        const baseLabel = mkAgentEl("div", "llm-slash-menu-section");
+        baseLabel.setAttribute("aria-hidden", "true");
+        baseLabel.textContent = t("Base actions");
+        list.insertBefore(baseLabel, firstBase);
+        return;
+      }
+      const filtered = query
+        ? commands.filter(
+            (command) =>
+              command.name.toLowerCase().includes(query) ||
+              command.description.toLowerCase().includes(query),
+          )
+        : commands;
+      if (filtered.length) {
+        const section = mkAgentEl("div", "llm-slash-menu-section");
+        section.setAttribute("aria-hidden", "true");
+        section.textContent = "Claude Code";
+        list.insertBefore(section, firstBase);
+        filtered.forEach((command) => {
+          const btn = mkAgentEl("button", "llm-action-picker-item") as HTMLButtonElement;
+          btn.type = "button";
+          btn.title = command.description;
+          const titleEl = ownerDoc.createElement("span");
+          titleEl.className = "llm-action-picker-title";
+          titleEl.textContent = `/${command.name}`;
+          btn.append(titleEl);
+          btn.addEventListener("click", (e: Event) => {
+            e.preventDefault();
+            e.stopPropagation();
+            consumeActiveActionToken();
+            closeSlashMenu();
+            void insertCommandToken({
+              name: command.name,
+              description: command.description,
+              inputSchema: { type: "object", properties: {} },
+            });
+          });
+          list.insertBefore(btn, firstBase);
+        });
+      }
+      const baseLabel = mkAgentEl("div", "llm-slash-menu-section");
+      baseLabel.setAttribute("aria-hidden", "true");
+      baseLabel.textContent = t("Base actions");
+      list.insertBefore(baseLabel, firstBase);
+      return;
+    }
+
     const chatMode: "paper" | "library" = isGlobalMode() ? "library" : "paper";
     let allActions: ActionPickerItem[] = [];
     try {
-      // initAgentSubsystem is async but listActions only needs the registry
-      // which is set synchronously during init. If not yet initialized,
-      // trigger init (fire-and-forget) and skip this render pass.
       allActions = getAgentApi().listActions(chatMode);
     } catch {
       void initAgentSubsystem().then(() => {
-        // Re-render after init completes
         renderAgentActionsInSlashMenu(query);
       }).catch(() => {});
       return;
@@ -8015,29 +9389,16 @@ export function setupHandlers(
             a.description.toLowerCase().includes(query),
         )
       : allActions;
-    const ownerDoc = body.ownerDocument;
-    const list = slashMenu?.querySelector(".llm-action-picker-list");
-    if (!ownerDoc || !list) return;
-    // Anchor: first static base item (marked in buildUI.ts)
     const baseAnchor = list.querySelector("[data-slash-base-item]") || null;
-    const mkAgentEl = (tag: string, cls: string): HTMLElement => {
-      const el = ownerDoc.createElement(tag);
-      el.className = cls;
-      el.setAttribute("data-slash-agent-item", "true");
-      return el;
-    };
-    // "Base actions" section label (always shown above static base items)
     const baseLabel = mkAgentEl("div", "llm-slash-menu-section");
     baseLabel.setAttribute("aria-hidden", "true");
     baseLabel.setAttribute("data-slash-section", "base");
     baseLabel.textContent = t("Base actions");
     list.insertBefore(baseLabel, baseAnchor);
-    // "Agent actions" section label (at the very top)
     const agentLabel = mkAgentEl("div", "llm-slash-menu-section");
     agentLabel.setAttribute("aria-hidden", "true");
     agentLabel.textContent = t("Agent actions");
     list.insertBefore(agentLabel, baseLabel);
-    // Agent action items (between agent label and base label)
     filtered.forEach((action) => {
       const btn = mkAgentEl("button", "llm-action-picker-item") as HTMLButtonElement;
       btn.type = "button";
@@ -9216,6 +10577,126 @@ export function setupHandlers(
     });
   }
 
+  let queuedClaudeDrainTimer: number | null = null;
+
+  const getQueuedClaudeInputs = (): QueuedClaudeInput[] => {
+    const threadKey = getClaudeQueuedInputThreadKey(item);
+    if (!threadKey) return [];
+    return queuedClaudeInputsByClaudeThread.get(threadKey) || [];
+  };
+
+  const setQueuedClaudeInputs = (entries: QueuedClaudeInput[]): void => {
+    const threadKey = getClaudeQueuedInputThreadKey(item);
+    if (!threadKey) return;
+    if (!entries.length) {
+      queuedClaudeInputsByClaudeThread.delete(threadKey);
+      syncClaudeQueuedInputThreadBodies(threadKey);
+      return;
+    }
+    queuedClaudeInputsByClaudeThread.set(threadKey, entries);
+    syncClaudeQueuedInputThreadBodies(threadKey);
+  };
+
+  renderQueuedClaudeInputs = () => {
+    if (!queueBar) return;
+    const queuedClaudeInputs = getQueuedClaudeInputs();
+    if (!queuedClaudeInputs.length) {
+      queueBar.textContent = "";
+      queueBar.style.display = "none";
+      return;
+    }
+
+    const ownerDoc = body.ownerDocument!;
+    queueBar.textContent = "";
+    queueBar.style.display = "flex";
+
+    const rail = ownerDoc.createElement("div") as HTMLDivElement;
+    rail.className = "llm-queued-input-rail";
+
+    const list = ownerDoc.createElement("div") as HTMLDivElement;
+    list.className = "llm-queued-input-list";
+    for (const entry of queuedClaudeInputs) {
+      const row = ownerDoc.createElement("div") as HTMLDivElement;
+      row.className = "llm-queued-input-item";
+
+      const text = ownerDoc.createElement("span") as HTMLSpanElement;
+      text.className = "llm-queued-input-chip";
+      text.textContent = entry.text;
+      text.title = entry.text;
+
+      const removeBtn = ownerDoc.createElement("button") as HTMLButtonElement;
+      removeBtn.type = "button";
+      removeBtn.className = "llm-queued-input-remove";
+      removeBtn.textContent = "×";
+      removeBtn.title = "Remove queued input";
+      removeBtn.setAttribute("aria-label", "Remove queued input");
+      removeBtn.addEventListener("click", (event: Event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setQueuedClaudeInputs(
+          getQueuedClaudeInputs().filter((item) => item.id !== entry.id),
+        );
+        renderQueuedClaudeInputs();
+      });
+
+      row.append(text, removeBtn);
+      list.appendChild(row);
+    }
+
+    rail.append(list);
+    queueBar.appendChild(rail);
+  };
+
+  scheduleClaudeQueueDrain = () => {
+    const threadKey = getClaudeQueuedInputThreadKey(item);
+    if (!threadKey) return;
+    if (queuedClaudeDrainTimer !== null) return;
+    const win = body.ownerDocument?.defaultView;
+    if (!win) return;
+    queuedClaudeDrainTimer = win.setTimeout(() => {
+      queuedClaudeDrainTimer = null;
+      void drainQueuedClaudeInput();
+    }, 220) as unknown as number;
+  };
+  (body as any).__llmScheduleClaudeQueueDrain = scheduleClaudeQueueDrain;
+  (body as any).__llmScheduleClaudeThreadQueueDrain = () => {
+    scheduleClaudeQueuedInputThreadDrain(getClaudeQueuedInputThreadKey(item));
+  };
+
+  isClaudeQueueSendAvailable = () => {
+    const activeConversationKey = item ? getConversationKey(item) : null;
+    return Boolean(
+      getClaudeQueuedInputThreadKey(item) &&
+        activeConversationKey !== null &&
+        isRequestPending(activeConversationKey),
+    );
+  };
+
+  queueClaudeInput = (text: string) => {
+    const normalized = text.trim();
+    if (!normalized) return;
+    const nextQueue = [
+      ...getQueuedClaudeInputs(),
+      {
+        id: ++queuedClaudeInputSeq,
+        text: normalized,
+      },
+    ];
+    setQueuedClaudeInputs(nextQueue);
+    inputBox.value = "";
+    persistDraftInputForCurrentConversation();
+    renderQueuedClaudeInputs();
+    if (status) {
+      setStatus(
+        status,
+        nextQueue.length === 1 ? t("Queued 1 follow-up") : t(`Queued ${nextQueue.length} follow-ups`),
+        "ready",
+      );
+    }
+  };
+
+  syncRequestUiForCurrentConversation();
+
   const { doSend } = createSendFlowController({
     body,
     inputBox,
@@ -9315,7 +10796,7 @@ export function setupHandlers(
       if (!filePath) throw new Error("Could not locate PDF file");
       return readAttachmentBytes(filePath);
     },
-    encodeBytesBase64: (bytes: Uint8Array) => {
+    encodeBytesBase64: (bytes: Uint8Array<ArrayBufferLike>) => {
       let binaryStr = "";
       const chunkSize = 0x8000;
       for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -9330,8 +10811,10 @@ export function setupHandlers(
     buildModelPromptWithFileContext,
     isAgentMode: () => getCurrentRuntimeMode() === "agent",
     isGlobalMode,
+    isClaudeConversationSystem,
     normalizeConversationTitleSeed,
     getConversationKey,
+    touchClaudeConversationTitle,
     touchGlobalConversationTitle,
     touchPaperConversationTitle,
     getSelectedProfile,
@@ -9346,6 +10829,9 @@ export function setupHandlers(
     getLatestEditablePair,
     editLatestUserMessageAndRetry,
     sendQuestion,
+    retainClaudeRuntime: async (sendBody, sendItem) => {
+      await retainClaudeRuntimeForBody(sendBody, sendItem);
+    },
     retainPinnedImageState,
     retainPaperState,
     consumePaperModeState,
@@ -9362,6 +10848,7 @@ export function setupHandlers(
     },
     persistDraftInput: persistDraftInputForCurrentConversation,
     autoLockGlobalChat: () => {
+      if (isClaudeConversationSystem()) return;
       if (!item || !isGlobalMode() || isNoteSession()) return;
       const ck = conversationKey;
       if (ck === null) return;
@@ -9373,6 +10860,7 @@ export function setupHandlers(
       syncConversationIdentity();
     },
     autoUnlockGlobalChat: () => {
+      if (isClaudeConversationSystem()) return;
       const ck = conversationKey;
       if (ck === null || !isAutoLockedGlobalConversation(ck)) return;
       removeAutoLockedGlobalConversationKey(ck);
@@ -9400,6 +10888,11 @@ export function setupHandlers(
     getConversationKey: () => (item ? getConversationKey(item) : null),
     getCurrentItemID: () =>
       item && Number.isFinite(item.id) && item.id > 0 ? item.id : null,
+    getPendingRequestId,
+    getAbortController,
+    setCancelledRequestId,
+    setPendingRequestId,
+    setAbortController,
     clearPendingTurnDeletion: (conversationKey) => {
       if (pendingTurnDeletion?.conversationKey === conversationKey) {
         clearPendingTurnDeletion();
@@ -9413,8 +10906,44 @@ export function setupHandlers(
     markConversationLoaded: (conversationKey) => {
       loadedConversationKeys.add(conversationKey);
     },
-    clearStoredConversation,
-    resetConversationTitle: clearConversationTitle,
+    invalidateConversationSession: async (conversationKey) => {
+      if (!isClaudeConversationSystem() || !item) return;
+      const libraryID = Number(item.libraryID || 0);
+      const currentKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      if (!Number.isFinite(libraryID) || libraryID <= 0 || !currentKind) return;
+      const scope = buildClaudeScope({
+        libraryID: Math.floor(libraryID),
+        kind: currentKind,
+        paperItemID:
+          currentKind === "paper" ? Number(baseItem?.id || 0) || undefined : undefined,
+        paperTitle:
+          currentKind === "paper"
+            ? String(baseItem?.getField?.("title") || "").trim() || undefined
+            : undefined,
+      });
+      await invalidateClaudeConversationSession(getCoreAgentRuntime(), {
+        conversationKey,
+        scope,
+      });
+      void touchClaudeConversation(conversationKey, {
+        providerSessionId: undefined,
+        scopedConversationKey: undefined,
+        scopeType: undefined,
+        scopeId: undefined,
+        scopeLabel: undefined,
+        cwd: undefined,
+        updatedAt: Date.now(),
+      });
+    },
+    clearStoredConversation: (conversationKey) =>
+      isClaudeConversationSystem()
+        ? clearClaudeConversation(conversationKey)
+        : clearStoredConversation(conversationKey),
+    resetConversationTitle: (conversationKey) =>
+      isClaudeConversationSystem()
+        ? setClaudeConversationTitle(conversationKey, "")
+        : clearConversationTitle(conversationKey),
     clearOwnerAttachmentRefs,
     removeConversationAttachmentFiles,
     refreshChatPreservingScroll,
@@ -9442,7 +10971,10 @@ export function setupHandlers(
     },
     markNextWebChatSendAsNewChat,
   });
-  const executeSend = async () => {
+  const executeSend = async (options?: {
+    fromQueue?: boolean;
+    queuedText?: string;
+  }) => {
     // If the inline edit widget is active, route through editUserTurnAndRetry
     // instead of the normal send flow.
     if (inlineEditTarget && item) {
@@ -9708,6 +11240,13 @@ export function setupHandlers(
       }
       return;
     }
+    if (!options?.fromQueue && isClaudeQueueSendAvailable()) {
+      const queuedText = inputBox?.value?.trim() ?? "";
+      if (queuedText) {
+        queueClaudeInput(queuedText);
+        return;
+      }
+    }
     closeActionPicker();
     // Intercept command chip: if a command chip is active, route to action execution
     const chipAction = getActiveCommandAction();
@@ -9721,9 +11260,38 @@ export function setupHandlers(
       void handleInlineCommand(chipAction.name, params);
       return;
     }
-    await doSend();
+    await doSend(
+      options?.fromQueue && options.queuedText
+        ? {
+            overrideText: options.queuedText,
+            preserveInputDraft: true,
+          }
+        : undefined,
+    );
     persistDraftInputForCurrentConversation();
+    scheduleClaudeQueuedInputThreadDrain(getClaudeQueuedInputThreadKey(item));
   };
+
+  async function drainQueuedClaudeInput(): Promise<void> {
+    const queuedClaudeInputs = getQueuedClaudeInputs();
+    if (!queuedClaudeInputs.length) {
+      renderQueuedClaudeInputs();
+      return;
+    }
+    const activeConversationKey = item ? getConversationKey(item) : null;
+    if (!getClaudeQueuedInputThreadKey(item) || activeConversationKey === null) {
+      return;
+    }
+    if (isRequestPending(activeConversationKey)) {
+      scheduleClaudeQueueDrain();
+      return;
+    }
+    const [next, ...rest] = queuedClaudeInputs;
+    setQueuedClaudeInputs(rest);
+    renderQueuedClaudeInputs();
+    if (!next) return;
+    await executeSend({ fromQueue: true, queuedText: next.text });
+  }
 
   // Send button - use addEventListener
   sendBtn.addEventListener("click", (e: Event) => {
@@ -10744,7 +12312,48 @@ export function setupHandlers(
         }
       }
 
-      const retryTarget = (e.target as Element | null)?.closest(
+      const target = e.target as Element | null;
+      const copyBtn = target?.closest(
+        ".llm-render-copy-btn",
+      ) as HTMLButtonElement | null;
+      if (copyBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const copyable = copyBtn.closest(".llm-copyable") as HTMLElement | null;
+        const source = copyable?.dataset.llmCopySource || "";
+        if (source) {
+          copyable?.setAttribute("data-copy-feedback", "copied");
+          void copyTextToClipboard(body, source);
+        }
+        return;
+      }
+
+      const linkTarget = target?.closest("a[href]") as HTMLAnchorElement | null;
+      if (linkTarget) {
+        e.preventDefault();
+        e.stopPropagation();
+        const href = linkTarget.href?.trim();
+        if (href) {
+          try {
+            const launch = (Zotero as unknown as { launchURL?: (url: string) => void })
+              .launchURL;
+            if (typeof launch === "function") {
+              launch(href);
+              return;
+            }
+          } catch {
+            /* ignore */
+          }
+          try {
+            body.ownerDocument?.defaultView?.open?.(href, "_blank");
+          } catch {
+            /* ignore */
+          }
+        }
+        return;
+      }
+
+      const retryTarget = target?.closest(
         ".llm-retry-latest",
       ) as HTMLButtonElement | null;
       if (!retryTarget) return;
@@ -11950,5 +13559,24 @@ export function setupHandlers(
 
       void clearCurrentConversation();
     });
+  }
+
+  const cleanupBody = body as Element & { __llmQueuedThreadCleanupRegistered?: boolean };
+  if (!cleanupBody.__llmQueuedThreadCleanupRegistered) {
+    cleanupBody.__llmQueuedThreadCleanupRegistered = true;
+    const observer = new MutationObserver(() => {
+      if (body.isConnected) return;
+      cleanupPrefObservers?.();
+      unregisterClaudeQueuedInputThreadBody(registeredClaudeQueueThreadKey, body);
+      activeContextPanelStateSync.delete(body);
+      delete (body as any).__llmApplyResolvedClaudeEffort;
+      void releaseClaudeRuntimeForBody(body);
+      observer.disconnect();
+      cleanupBody.__llmQueuedThreadCleanupRegistered = false;
+    });
+    const observeRoot = body.ownerDocument;
+    if (observeRoot) {
+      observer.observe(observeRoot, { childList: true, subtree: true });
+    }
   }
 }

@@ -44,6 +44,11 @@ import {
   resolveNoteTitle,
   resolvePaperPortalBaseItem,
 } from "./portalScope";
+import {
+  isClaudeGlobalPortalItem,
+  isClaudePaperPortalItem,
+  resolveClaudePaperPortalBaseItem,
+} from "../../claudeCode/portal";
 
 export type NoteSnapshot = {
   noteId: number;
@@ -185,11 +190,14 @@ export function readNoteSnapshot(
 }
 
 function resolveParentItemForNote(item: Zotero.Item): Zotero.Item | null {
-  if (isGlobalPortalItem(item)) {
+  if (isGlobalPortalItem(item) || isClaudeGlobalPortalItem(item)) {
     return null;
   }
   if (isPaperPortalItem(item)) {
     return resolvePaperPortalBaseItem(item);
+  }
+  if (isClaudePaperPortalItem(item)) {
+    return resolveClaudePaperPortalBaseItem(item);
   }
   const noteParentItem = resolveNoteParentItem(item);
   if (noteParentItem) {

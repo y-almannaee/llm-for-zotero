@@ -1,9 +1,13 @@
+/// <reference types="zotero-types" />
+
 import { assert } from "chai";
+import { after, before, beforeEach, describe, it } from "mocha";
 import {
   isPaperPortalItem,
   resolveActiveNoteSession,
   resolveInitialPanelItemState,
 } from "../src/modules/contextPanel/portalScope";
+import { createClaudePaperPortalItem } from "../src/claudeCode/portal";
 import {
   activeConversationModeByLibrary,
   activeGlobalConversationByLibrary,
@@ -34,7 +38,7 @@ describe("portalScope resolveInitialPanelItemState", function () {
     itemsById.clear();
   });
 
-  it("keeps paper chat as the default when opening a paper", function () {
+  it("restores the remembered global chat when library mode is global", function () {
     const paperItem = {
       id: 42,
       libraryID: 7,
@@ -49,7 +53,7 @@ describe("portalScope resolveInitialPanelItemState", function () {
     const resolved = resolveInitialPanelItemState(paperItem);
 
     assert.equal(resolved.basePaperItem, paperItem);
-    assert.equal(resolved.item, paperItem);
+    assert.equal(resolved.item?.id, 9001);
     assert.equal(resolved.item?.libraryID, 7);
   });
 
@@ -141,5 +145,42 @@ describe("portalScope resolveInitialPanelItemState", function () {
         showOpenLock: false,
       },
     });
+  });
+
+  it("falls back to upstream paper state when Claude mode is disabled", function () {
+    let claudeEnabled = false;
+    const originalPrefs = globalThis.Zotero?.Prefs;
+    const paperItem = {
+      id: 42,
+      libraryID: 7,
+      parentID: undefined,
+      isAttachment: () => false,
+      isRegularItem: () => true,
+    } as unknown as Zotero.Item;
+    itemsById.set(42, paperItem);
+    activePaperConversationByPaper.set("7:42", 4207);
+    globalThis.Zotero = {
+      ...globalThis.Zotero,
+      Items: {
+        get: (itemId: number) => itemsById.get(itemId) || null,
+      },
+      Prefs: {
+        get: (key: string) => {
+          if (String(key).endsWith("enableClaudeCodeMode")) return claudeEnabled;
+          if (String(key).endsWith("conversationSystem")) return "claude_code";
+          return originalPrefs?.get?.(key, true) ?? "";
+        },
+      },
+    } as typeof Zotero;
+
+    const claudePortal = createClaudePaperPortalItem(paperItem, 3500005254) as Zotero.Item;
+    const resolved = resolveInitialPanelItemState(claudePortal, {
+      conversationSystem: "claude_code",
+    });
+
+    assert.equal(resolved.basePaperItem, paperItem);
+    assert.isTrue(isPaperPortalItem(resolved.item));
+    assert.equal(resolved.item?.id, 4207);
+    assert.equal(resolved.item?.libraryID, 7);
   });
 });

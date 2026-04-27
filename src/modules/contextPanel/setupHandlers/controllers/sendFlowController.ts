@@ -4,7 +4,6 @@ import type {
   AdvancedModelParams,
   ChatAttachment,
   ChatRuntimeMode,
-  NoteContextRef,
   PaperContextRef,
   SelectedTextContext,
 } from "../../types";
@@ -68,11 +67,11 @@ type SendFlowControllerDeps = {
   uploadPdfForProvider: (params: {
     apiBase: string;
     apiKey: string;
-    pdfBytes: Uint8Array;
+    pdfBytes: Uint8Array<ArrayBufferLike>;
     fileName: string;
   }) => Promise<{ systemMessageContent: string; label: string } | null>;
-  resolvePdfBytes: (paperContext: PaperContextRef) => Promise<Uint8Array>;
-  encodeBytesBase64: (bytes: Uint8Array) => string;
+  resolvePdfBytes: (paperContext: PaperContextRef) => Promise<Uint8Array<ArrayBufferLike>>;
+  encodeBytesBase64: (bytes: Uint8Array<ArrayBufferLike>) => string;
   getSelectedFiles: (itemId: number) => ChatAttachment[];
   getSelectedImages: (itemId: number) => string[];
   resolvePromptText: (
@@ -95,8 +94,13 @@ type SendFlowControllerDeps = {
   ) => string;
   isAgentMode: () => boolean;
   isGlobalMode: () => boolean;
+  isClaudeConversationSystem: () => boolean;
   normalizeConversationTitleSeed: (raw: unknown) => string;
   getConversationKey: (item: Zotero.Item) => number;
+  touchClaudeConversationTitle: (
+    conversationKey: number,
+    title: string,
+  ) => Promise<void>;
   touchGlobalConversationTitle: (
     conversationKey: number,
     title: string,
@@ -121,6 +125,7 @@ type SendFlowControllerDeps = {
   sendQuestion: (
     opts: import("../../types").SendQuestionOptions,
   ) => Promise<void>;
+  retainClaudeRuntime?: (body: Element, item: Zotero.Item) => Promise<void>;
   retainPinnedImageState: (itemId: number) => void;
   retainPaperState: (itemId: number) => void;
   consumePaperModeState: (itemId: number) => void;
@@ -147,9 +152,12 @@ type SendFlowControllerDeps = {
 };
 
 export function createSendFlowController(deps: SendFlowControllerDeps): {
-  doSend: () => Promise<void>;
+  doSend: (options?: { overrideText?: string; preserveInputDraft?: boolean }) => Promise<void>;
 } {
-  const doSend = async () => {
+  const doSend = async (options?: {
+    overrideText?: string;
+    preserveInputDraft?: boolean;
+  }) => {
     const item = deps.getItem();
     if (!item) return;
 
@@ -159,7 +167,8 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
 
     try {
     const textContextConversationKey = deps.getConversationKey(item);
-    const text = deps.inputBox.value.trim();
+    const draftText = deps.inputBox.value.trim();
+    const text = (options?.overrideText ?? draftText).trim();
     const selectedContexts = deps.getSelectedTextContextEntries(
       textContextConversationKey,
     );
@@ -345,6 +354,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           composedQuestionBase,
           selectedFiles,
         );
+
     // Check for command action metadata (set by handleInlineCommand for /command display)
     const dataset = deps.inputBox.dataset;
     const commandAction = dataset?.commandAction;
@@ -361,25 +371,20 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.normalizeConversationTitleSeed(text) ||
       deps.normalizeConversationTitleSeed(resolvedPromptText);
     if (titleSeed) {
-      if (deps.isGlobalMode()) {
-        void deps
-          .touchGlobalConversationTitle(
-            deps.getConversationKey(item),
-            titleSeed,
-          )
-          .catch((err) => {
-            ztoolkit.log("LLM: Failed to touch global conversation title", err);
-          });
-      } else {
-        void deps
-          .touchPaperConversationTitle(deps.getConversationKey(item), titleSeed)
-          .catch((err) => {
-            ztoolkit.log("LLM: Failed to touch paper conversation title", err);
-          });
-      }
+      const touchTitle = deps.isClaudeConversationSystem()
+        ? deps.touchClaudeConversationTitle
+        : deps.isGlobalMode()
+          ? deps.touchGlobalConversationTitle
+          : deps.touchPaperConversationTitle;
+      void touchTitle(deps.getConversationKey(item), titleSeed).catch((err) => {
+        ztoolkit.log("LLM: Failed to touch conversation title", err);
+      });
     }
 
     const selectedProfile = deps.getSelectedProfile();
+    const shouldRetainClaudeRuntime =
+      deps.isClaudeConversationSystem() ||
+      selectedProfile?.providerLabel === "Claude Code";
     const activeModelName = (
       selectedProfile?.model ||
       deps.getCurrentModelName() ||
@@ -435,6 +440,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
         model: selectedProfile?.model,
         apiBase: selectedProfile?.apiBase,
         apiKey: selectedProfile?.apiKey,
+        authMode: selectedProfile?.authMode,
+        providerProtocol: selectedProfile?.providerProtocol,
+        modelEntryId: selectedProfile?.entryId,
+        modelProviderLabel: selectedProfile?.providerLabel,
         reasoning: selectedReasoning,
         advanced: advancedParams,
       });
@@ -453,8 +462,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
         return;
       }
 
-      deps.inputBox.value = "";
-      deps.persistDraftInput();
+      if (!options?.preserveInputDraft) {
+        deps.inputBox.value = "";
+        deps.persistDraftInput();
+      }
       deps.retainPinnedImageState(item.id);
       if (hasPaperComposeState) {
         deps.consumePaperModeState(item.id);
@@ -476,8 +487,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       return;
     }
 
-    deps.inputBox.value = "";
-    deps.persistDraftInput();
+    if (!options?.preserveInputDraft) {
+      deps.inputBox.value = "";
+      deps.persistDraftInput();
+    }
     deps.retainPinnedImageState(item.id);
     if (selectedFiles.length) {
       deps.retainPinnedFileState(item.id);
@@ -502,6 +515,9 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       : false;
 
     const forcedSkillIds = deps.consumeForcedSkillIds?.();
+    if (shouldRetainClaudeRuntime) {
+      await deps.retainClaudeRuntime?.(deps.body, item);
+    }
     const sendTask = deps.sendQuestion({
       body: deps.body,
       item,
@@ -510,6 +526,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       model: selectedProfile?.model,
       apiBase: selectedProfile?.apiBase,
       apiKey: selectedProfile?.apiKey,
+      authMode: selectedProfile?.authMode,
+      providerProtocol: selectedProfile?.providerProtocol,
+      modelEntryId: selectedProfile?.entryId,
+      modelProviderLabel: selectedProfile?.providerLabel,
       reasoning: selectedReasoning,
       advanced: advancedParams,
       displayQuestion,

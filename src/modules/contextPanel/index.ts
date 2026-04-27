@@ -64,9 +64,23 @@ import {
   getSelectionFromDocument,
 } from "./readerSelection";
 import { resolveReaderPopupPaperContext } from "./readerPopup";
-import { resolveInitialPanelItemState, resolveActiveLibraryID, resolveDisplayConversationKind } from "./portalScope";
+import {
+  resolveInitialPanelItemState,
+  resolveActiveLibraryID,
+  resolveConversationSystemForItem,
+  resolveDisplayConversationKind,
+} from "./portalScope";
 import { getLockedGlobalConversationKey } from "./prefHelpers";
 import { getEditableSelectionFromDocument } from "./noteSelection";
+import {
+  activeClaudeConversationModeByLibrary,
+  activeClaudeGlobalConversationByLibrary,
+  buildClaudeLibraryStateKey,
+} from "../../claudeCode/state";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
 
 export { openStandaloneChat } from "./standaloneWindow";
 import {
@@ -135,6 +149,7 @@ export function registerReaderContextPanel() {
     onRender: ({ body, item }) => {
       // When standalone window is open, show placeholder instead of full UI
       if (isStandaloneWindowActive()) {
+        void releaseClaudeRuntimeForBody(body);
         renderStandalonePlaceholder(body);
         const resolvedState = resolveInitialPanelItemState(item);
         activeContextPanels.set(body, () => resolvedState.item);
@@ -149,12 +164,23 @@ export function registerReaderContextPanel() {
         // belong to a tab that onAsyncRender never fired for.
         const needsFullRender = !activeContextPanels.has(body) || !panelRoot;
 
+        const resolvedState = resolveInitialPanelItemState(item);
+        const expectedSystem =
+          resolveConversationSystemForItem(resolvedState.item) || "upstream";
+
         // Also check if a global lock requires switching to open chat
         const libraryID = resolveActiveLibraryID() ||
+          (resolvedState.item ? Number(resolvedState.item.libraryID || 0) : 0) ||
           (item ? Number(item.libraryID || 0) : 0);
-        const lockedKey = libraryID > 0 ? getLockedGlobalConversationKey(libraryID) : null;
+        const lockedKey =
+          expectedSystem === "claude_code"
+            ? null
+            : libraryID > 0
+              ? getLockedGlobalConversationKey(libraryID)
+              : null;
         const currentKind = panelRoot?.dataset?.conversationKind;
         const currentItemKey = panelRoot?.dataset?.itemId;
+        const currentSystem = panelRoot?.dataset?.conversationSystem || "";
         // Lock is stale if:
         // - lock active + panel in paper mode (need to switch to global)
         // - lock active + panel shows different global conversation
@@ -168,7 +194,6 @@ export function registerReaderContextPanel() {
 
         // Detect if the active item has changed (e.g. user switched reader tabs).
         // If so, the panel must fully re-render to switch conversations.
-        const resolvedState = resolveInitialPanelItemState(item);
         const storedItemKey = panelRoot?.dataset?.itemId;
         const newItemKey = resolvedState.item
           ? String(getConversationKey(resolvedState.item))
@@ -177,8 +202,11 @@ export function registerReaderContextPanel() {
           !needsFullRender &&
           storedItemKey !== undefined &&
           storedItemKey !== newItemKey;
+        const systemChanged =
+          !needsFullRender &&
+          currentSystem !== expectedSystem;
 
-        if (needsFullRender || lockStale || itemChanged) {
+        if (needsFullRender || lockStale || itemChanged || systemChanged) {
           // Build UI synchronously so panel data attributes (basePaperItemId,
           // conversationKind, etc.) are immediately correct.  The reader popup
           // "Add Text" path reads these attributes to decide paper-mismatch —
@@ -186,6 +214,7 @@ export function registerReaderContextPanel() {
           buildUI(body, resolvedState.item);
           activeContextPanels.set(body, () => resolvedState.item);
           activeContextPanelRawItems.set(body, item || null);
+          void retainClaudeRuntimeForBody(body, resolvedState.item);
           // Attach handlers synchronously so buttons (lock, send, etc.) are
           // immediately interactive — don't gate on ensureConversationLoaded.
           setupHandlers(body, item);
@@ -206,6 +235,7 @@ export function registerReaderContextPanel() {
           // (e.g. Add Text) always resolve the active item.
           activeContextPanels.set(body, () => resolvedState.item);
           activeContextPanelRawItems.set(body, item || null);
+          void retainClaudeRuntimeForBody(body, resolvedState.item);
         }
       } catch { /* ignore */ }
     },
@@ -220,7 +250,6 @@ export function registerReaderContextPanel() {
 
       const resolvedInitialState = resolveInitialPanelItemState(item);
       const resolvedItem = resolvedInitialState.item;
-      const basePaperItem = resolvedInitialState.basePaperItem;
 
       // If onRender already did the synchronous buildUI + setupHandlers for
       // this render cycle, skip the duplicate work.  We still run the
@@ -355,7 +384,9 @@ export function registerReaderSelectionTracking() {
           };
           for (const [panelBody] of activeContextPanels.entries()) {
             if (!(panelBody as Element).isConnected) {
+              void releaseClaudeRuntimeForBody(panelBody as Element);
               activeContextPanels.delete(panelBody);
+              activeContextPanelRawItems.delete(panelBody);
               activeContextPanelStateSync.delete(panelBody);
               continue;
             }
@@ -402,20 +433,6 @@ export function registerReaderSelectionTracking() {
             Number.isFinite(readerLibraryID) && readerLibraryID > 0
               ? Math.floor(readerLibraryID)
               : 0;
-          const readerModeLock =
-            normalizedReaderLibraryID > 0
-              ? activeConversationModeByLibrary.get(normalizedReaderLibraryID)
-              : null;
-          const readerGlobalConversationKey =
-            readerModeLock === "global" && normalizedReaderLibraryID > 0
-              ? Math.floor(
-                  Number(
-                    activeGlobalConversationByLibrary.get(
-                      normalizedReaderLibraryID,
-                    ) || 0,
-                  ),
-                )
-              : 0;
           const readerPaperContext = resolveReaderPopupPaperContext(
             item,
             getActiveContextAttachmentFromTabs(),
@@ -452,6 +469,16 @@ export function registerReaderSelectionTracking() {
               ? Math.floor(parsed)
               : null;
           };
+          const getPanelConversationSystem = (
+            root: HTMLDivElement,
+          ): "upstream" | "claude_code" | null => {
+            const raw = `${root.dataset.conversationSystem || ""}`
+              .trim()
+              .toLowerCase();
+            if (raw === "upstream") return "upstream";
+            if (raw === "claude_code") return "claude_code";
+            return null;
+          };
           const isVisible = (root: HTMLElement) =>
             root.getClientRects().length > 0;
           const popupTopDoc = event.doc.defaultView?.top?.document || null;
@@ -461,12 +488,33 @@ export function registerReaderSelectionTracking() {
               const panelItemId = getPanelItemId(root);
               const panelLibraryId = getPanelLibraryId(root);
               const conversationKind = getPanelConversationKind(root);
+              const conversationSystem = getPanelConversationSystem(root);
               const conversationKey = panelItemId;
               const basePaperItemID = getPanelBasePaperItemID(root);
+              const panelModeLock =
+                panelLibraryId && conversationSystem === "claude_code"
+                  ? activeClaudeConversationModeByLibrary.get(
+                      buildClaudeLibraryStateKey(panelLibraryId),
+                    )
+                  : panelLibraryId && conversationSystem === "upstream"
+                    ? activeConversationModeByLibrary.get(panelLibraryId)
+                    : null;
+              const panelGlobalConversationKey =
+                panelModeLock === "global" && panelLibraryId
+                  ? Math.floor(
+                      Number(
+                        (conversationSystem === "claude_code"
+                          ? activeClaudeGlobalConversationByLibrary.get(
+                              buildClaudeLibraryStateKey(panelLibraryId),
+                            )
+                          : activeGlobalConversationByLibrary.get(panelLibraryId)) || 0,
+                      ),
+                    )
+                  : 0;
               const sameConversationMode =
-                readerModeLock === "global"
+                panelModeLock === "global"
                   ? conversationKind === "global"
-                  : readerModeLock === "paper"
+                  : panelModeLock === "paper"
                     ? conversationKind === "paper"
                     : false;
               return {
@@ -475,6 +523,7 @@ export function registerReaderSelectionTracking() {
                 panelItemId,
                 panelLibraryId,
                 conversationKind,
+                conversationSystem,
                 basePaperItemID,
                 conversationKey,
                 visible: isVisible(root),
@@ -487,8 +536,8 @@ export function registerReaderSelectionTracking() {
                   basePaperItemID !== null &&
                   basePaperItemID === readerPaperItemID,
                 matchesLockedGlobal:
-                  readerGlobalConversationKey > 0 &&
-                  conversationKey === readerGlobalConversationKey,
+                  panelGlobalConversationKey > 0 &&
+                  conversationKey === panelGlobalConversationKey,
                 sameConversationMode,
                 hasActiveFocus: Boolean(
                   ownerDoc?.activeElement &&
@@ -500,7 +549,8 @@ export function registerReaderSelectionTracking() {
               (state) =>
                 state.panelItemId !== null &&
                 state.conversationKey !== null &&
-                state.conversationKind !== null,
+                state.conversationKind !== null &&
+                state.conversationSystem !== null,
             );
           if (!rootStates.length) return;
           const sameLibraryStates =
@@ -570,7 +620,9 @@ export function registerReaderSelectionTracking() {
               ? Zotero.Items.get(readerPaperItemID) || null
               : null;
             if (readerItem) {
-              const resolved = resolveInitialPanelItemState(readerItem);
+              const resolved = resolveInitialPanelItemState(readerItem, {
+                conversationSystem: bestState.conversationSystem,
+              });
               conversationKey = resolved.item
                 ? getConversationKey(resolved.item)
                 : readerPaperItemID;
@@ -768,12 +820,13 @@ export function registerReaderSelectionTracking() {
           }
 
           // Clean up cache when the selection popup is dismissed.
-          // MutationObserver is unreliable in Gecko cross-compartment
-          // contexts, so use a simple delayed check instead.
-          const win = sentinel.ownerDocument?.defaultView;
-          if (win) {
+          // MutationObserver proved unreliable in this Gecko context, so use a
+          // delayed connectivity check instead.
+          const sentinelEl: HTMLSpanElement | null = sentinel;
+          const win = sentinelEl?.ownerDocument?.defaultView;
+          if (win && sentinelEl) {
             win.setTimeout(() => {
-              if (!sentinel.isConnected) {
+              if (!sentinelEl.isConnected) {
                 for (const key of keys) {
                   if (recentReaderSelectionCache.get(key) === selectedText) {
                     recentReaderSelectionCache.delete(key);

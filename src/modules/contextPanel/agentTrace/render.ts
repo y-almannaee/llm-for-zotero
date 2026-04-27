@@ -1,5 +1,4 @@
 import { getAgentRuntime } from "../../../agent";
-import { renderMarkdown } from "../../../utils/markdown";
 import type {
   AgentPendingAction,
   AgentPendingField,
@@ -11,6 +10,7 @@ import type {
 } from "../../../agent/types";
 import type { Message, PaperContextRef } from "../types";
 import { sanitizeText, getSelectedTextSourceIcon } from "../textUtils";
+import { renderMarkdown } from "../../../utils/markdown";
 import { toFileUrl } from "../../../utils/pathFileUrl";
 import {
   normalizePaperContextRefs,
@@ -111,16 +111,16 @@ function isAgentTraceRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function readAgentTraceText(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+  if (typeof value !== "string") return null;
+  return value.trim() ? value : null;
 }
 
 function appendAgentTraceText(
   base: string | undefined,
   next: unknown,
 ): string | undefined {
-  const chunk =
-    typeof next === "string" && next.trim() ? sanitizeText(next) : null;
-  if (!chunk) return base;
+  const chunk = typeof next === "string" ? sanitizeText(next) : null;
+  if (!chunk || !chunk.trim()) return base;
   return `${base || ""}${chunk}`;
 }
 
@@ -1448,6 +1448,7 @@ export function renderPendingActionCard(
 ): HTMLDivElement {
   const card = doc.createElement("div");
   card.className = "llm-agent-hitl-card";
+  card.dataset.requestId = pending.requestId;
 
   const header = doc.createElement("div");
   header.className = "llm-agent-hitl-header";
@@ -2077,13 +2078,15 @@ function buildAgentTraceRequestSummary(
         (entry) => entry.title,
       )
     : [];
-  const fileNames = Array.isArray(userMessage?.attachments)
-    ? userMessage.attachments
+  const attachments = userMessage?.attachments;
+  const screenshotImages = userMessage?.screenshotImages;
+  const fileNames = Array.isArray(attachments)
+    ? attachments
         .filter((entry) => entry && entry.category !== "image")
         .map((entry) => entry.name)
     : [];
-  const screenshotCount = Array.isArray(userMessage?.screenshotImages)
-    ? userMessage.screenshotImages.filter(Boolean).length
+  const screenshotCount = Array.isArray(screenshotImages)
+    ? screenshotImages.filter(Boolean).length
     : 0;
   return {
     selectedTexts,
@@ -2212,16 +2215,21 @@ function summarizeAgentTraceToolCall(
   request?: AgentTraceRequestSummary,
 ): AgentTraceSummaryRow {
   const label = toolLabelFromName(name);
+  const a =
+    args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+  const skillName =
+    name === "Skill" && typeof a.skill === "string" && a.skill.trim()
+      ? a.skill.trim()
+      : null;
   const text =
     resolveToolPresentationSummary(
       getToolDefinition(name)?.presentation?.summaries?.onCall,
       { label, args, request },
-    ) || `Using ${label}`;
+    ) ||
+    (skillName ? `Using Skill: ${skillName}` : `Using ${label}`);
 
   // Show code block for shell commands and file I/O
   let codeBlock: string | undefined;
-  const a =
-    args && typeof args === "object" ? (args as Record<string, unknown>) : {};
   if (name === "run_command" && typeof a.command === "string") {
     codeBlock = a.command;
   } else if (name === "file_io" && typeof a.filePath === "string") {
@@ -2304,8 +2312,9 @@ function toolContentLooksEmpty(content: unknown): boolean {
     "pages",
     "collections",
   ]) {
-    if (Array.isArray(record[key])) {
-      return record[key].length === 0;
+    const value = record[key];
+    if (Array.isArray(value)) {
+      return value.length === 0;
     }
   }
   return false;
@@ -2348,7 +2357,10 @@ function summarizeAgentTraceToolResult(
       getToolDefinition(name)?.presentation?.summaries?.onSuccess,
       { label, content, request },
     ) ||
-    `${isEmpty ? "No results from" : "Completed"} ${label}`;
+    (isEmpty ? `No results from ${label}` : "");
+  if (!text) {
+    return null;
+  }
   return {
     kind: isEmpty ? "skip" : "ok",
     icon: isEmpty ? "-" : "✓",
@@ -2361,6 +2373,21 @@ function isGenericAgentStatusText(text: string): boolean {
   return (
     normalized === "running agent" ||
     /^continuing agent \(\d+\/\d+\)$/.test(normalized)
+  );
+}
+
+function isHiddenClaudeStartupStatus(text: string): boolean {
+  return (
+    text === "Checking the request against the attached context." ||
+    text === "Request and attached context received" ||
+    text === "Reused previous context" ||
+    text === "Detected updated context" ||
+    text === "Initializing Claude session" ||
+    text === "Rebuilding Claude session after runtime change" ||
+    text === "Session signature mismatch detected. Retrying with a fresh Claude session." ||
+    text === "Claude runtime changed. Rebuilding this conversation on the new runtime while keeping local context." ||
+    /^Claude bridge URL:/i.test(text) ||
+    text === "Claude bridge URL is empty. Falling back to local runtime."
   );
 }
 
@@ -2455,6 +2482,7 @@ export function buildAgentTraceDisplayItems(
   let lastMeaningfulStatus: string | null = null;
   const reasoningLabels = new Map<string, string>();
   let reasoningStepCounter = 0;
+  let fallbackReasoningStep = 1;
 
   items.push({
     type: "message",
@@ -2485,6 +2513,20 @@ export function buildAgentTraceDisplayItems(
         ) {
           break;
         }
+        const isSessionStartStatus =
+          statusText === "Running SessionStart:resume" ||
+          statusText === "Finished SessionStart:resume" ||
+          statusText === "Running SessionStart:startup" ||
+          statusText === "Finished SessionStart:startup";
+        if (isSessionStartStatus) {
+          break;
+        }
+        if (statusText === "Compacting context…") {
+          break;
+        }
+        if (isHiddenClaudeStartupStatus(statusText)) {
+          break;
+        }
         lastMeaningfulStatus = statusText;
         items.push({
           type: "action",
@@ -2510,23 +2552,32 @@ export function buildAgentTraceDisplayItems(
             userMessage,
           ),
         });
+        fallbackReasoningStep += 1;
         break;
       case "reasoning": {
-        // Prefer details (full reasoning body) over summary (short title)
         const text =
           readAgentTraceText(entry.payload.details) ||
           readAgentTraceText(entry.payload.summary) ||
           undefined;
         if (!text) break;
-        const reasoningKey = getReasoningTraceKey(entry.payload);
-        const existing = items.findLast(
-          (item) => item.type === "reasoning" && item.key === reasoningKey,
+        const hasExplicitStepId = Boolean(
+          typeof entry.payload.stepId === "string" && entry.payload.stepId.trim(),
         );
+        const reasoningKey = hasExplicitStepId
+          ? getReasoningTraceKey(entry.payload)
+          : `step:${fallbackReasoningStep}`;
+        let existing: Extract<AgentTraceDisplayItem, { type: "reasoning" }> | null = null;
+        for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+          const candidate = items[itemIndex];
+          if (candidate.type === "reasoning" && candidate.key === reasoningKey) {
+            existing = candidate;
+            break;
+          }
+        }
         if (existing && existing.type === "reasoning") {
-          // Accumulate delta chunks; skip if already contained (dedup)
           const prev = existing.summary || "";
           if (!prev.includes(text)) {
-            existing.summary = prev + text;
+            existing.summary = appendAgentTraceText(existing.summary, text);
           }
         } else {
           let label = readAgentTraceText(entry.payload.stepLabel) || "";
@@ -2534,11 +2585,11 @@ export function buildAgentTraceDisplayItems(
             label = reasoningLabels.get(reasoningKey) || "";
           }
           if (!label) {
-            if (entry.payload.stepId) {
+            if (hasExplicitStepId) {
               reasoningStepCounter += 1;
               label = `Thinking for step ${reasoningStepCounter}`;
             } else {
-              label = `Thinking for step ${entry.payload.round}`;
+              label = "Thinking";
             }
             reasoningLabels.set(reasoningKey, label);
           }
@@ -2644,16 +2695,22 @@ export function buildAgentTraceDisplayItems(
         }
         break;
       }
-      case "final":
-        items.push({
-          type: "action",
-          row: {
-            kind: "done",
-            icon: "✓",
-            text: "Response ready",
-          },
-        });
+      case "final": {
+        const alreadyCompleted = items.some(
+          (item) => item.type === "action" && item.row.kind === "done",
+        );
+        if (!alreadyCompleted) {
+          items.push({
+            type: "action",
+            row: {
+              kind: "done",
+              icon: "✓",
+              text: "Response ready",
+            },
+          });
+        }
         break;
+      }
       case "fallback":
         items.push({
           type: "message",
@@ -2675,8 +2732,14 @@ export function renderAgentTrace({
   onTraceMissing,
   onInterleavedText,
 }: RenderAgentTraceParams): HTMLElement | null {
-  const runId = message.agentRunId?.trim();
-  if (!runId) return null;
+  const runId = message.agentRunId?.trim() || "pending";
+  if (
+    !events.length &&
+    !message.pendingAgentTraceEvents?.length &&
+    !onTraceMissing
+  ) {
+    return null;
+  }
   const wrap = doc.createElement("div");
   wrap.className = "llm-agent-activity";
   const list = doc.createElement("div");
@@ -2743,13 +2806,20 @@ export function renderAgentTrace({
       const summary = doc.createElement("summary") as HTMLElement;
       summary.className = "llm-agent-reasoning-summary";
       summary.textContent = itemEntry.label;
+      let reasoningToggleHandled = false;
       const toggleReasoning = (event: Event) => {
+        if (reasoningToggleHandled) return;
+        reasoningToggleHandled = true;
         event.preventDefault();
         event.stopPropagation();
         const next = !details.open;
         details.open = next;
         agentReasoningExpandedCache.set(expansionKey, next);
+        doc.defaultView?.setTimeout(() => {
+          reasoningToggleHandled = false;
+        }, 0);
       };
+      summary.addEventListener("pointerdown", toggleReasoning);
       summary.addEventListener("mousedown", toggleReasoning);
       summary.addEventListener("click", (event: Event) => {
         event.preventDefault();
@@ -2772,12 +2842,7 @@ export function renderAgentTrace({
         summaryBlock.className = "llm-agent-reasoning-block";
         const text = doc.createElement("div") as HTMLDivElement;
         text.className = "llm-agent-reasoning-text";
-        try {
-          text.innerHTML = renderMarkdown(reasoningText);
-        } catch (error) {
-          ztoolkit.log("Agent reasoning render error:", error);
-          text.textContent = reasoningText;
-        }
+        text.textContent = reasoningText;
         summaryBlock.appendChild(text);
         bodyWrap.appendChild(summaryBlock);
       }

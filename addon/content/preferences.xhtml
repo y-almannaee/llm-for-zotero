@@ -241,6 +241,346 @@
           </html:span>
         </html:div>
 
+        <html:div style="border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; overflow: hidden; margin-top: 6px;">
+          <html:div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: Field; color: FieldText; border-bottom: 1px solid var(--stroke-secondary, #c8c8c8);">
+            <html:span style="font-weight: 700; font-size: 13px;">Claude Code Integration</html:span>
+          </html:div>
+          <html:div style="display: flex; flex-direction: column; gap: 14px; padding: 14px;">
+            <html:span style="font-size: 11.5px; color: var(--fill-secondary, #888); line-height: 1.5;">
+              This panel configures the embedded Claude runtime. You enter Claude Code mode from the chat header, not from settings.
+            </html:span>
+
+            <html:div style="display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; background: color-mix(in srgb, Field 92%, var(--color-accent, #2563eb) 8%);">
+              <html:label
+                for="__addonRef__-agent-backend-mode"
+                style="display: block; font-weight: 700; font-size: 12px; color: var(--fill-primary, inherit);"
+              >
+                Enable Claude Code integration
+              </html:label>
+              <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.5;">
+                When enabled, Zotero shows the Claude button in the chat header so you can switch between upstream chat and Claude Code.
+              </html:span>
+              <html:select
+                id="__addonRef__-agent-backend-mode"
+                style="
+                  width: 100%;
+                  padding: 5px 8px;
+                  font-size: 12px;
+                  border: 1px solid var(--stroke-secondary, #c8c8c8);
+                  border-radius: 6px;
+                  background: Field;
+                  color: FieldText;
+                "
+              >
+                <html:option value="disabled">Off</html:option>
+                <html:option value="claude_bridge">On</html:option>
+              </html:select>
+            </html:div>
+
+            <html:div
+              id="__addonRef__-agent-bridge-settings"
+              style="display: none; flex-direction: column; gap: 14px;"
+            >
+              <html:div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; background: color-mix(in srgb, var(--color-accent, #2563eb) 6%, Field);">
+                <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                  <html:span style="font-weight: 700; font-size: 12px; color: var(--fill-primary, inherit);">Connection</html:span>
+                  <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.5;">
+                    Zotero sends Claude requests to this local bridge service.
+                  </html:span>
+                </html:div>
+                <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                  <html:label
+                    for="__addonRef__-agent-bridge-url"
+                    style="display: block; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);"
+                  >
+                    Bridge URL
+                  </html:label>
+                  <html:input
+                    id="__addonRef__-agent-bridge-url"
+                    type="text"
+                    placeholder="http://127.0.0.1:19787"
+                    style="
+                      width: 100%;
+                      max-width: none;
+                      padding: 5px 8px;
+                      font-size: 12px;
+                      border: 1px solid var(--stroke-secondary, #c8c8c8);
+                      border-radius: 6px;
+                      background: Field;
+                      color: FieldText;
+                      box-sizing: border-box;
+                    "
+                  />
+                </html:div>
+              </html:div>
+
+              <html:div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; background: Field;">
+                <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                  <html:span style="font-weight: 700; font-size: 12px; color: var(--fill-primary, inherit);">Config source</html:span>
+                  <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.5;">
+                    Choose where Claude should load its settings from. Most users should keep <html:code>default</html:code>.
+                  </html:span>
+                </html:div>
+                <html:div style="display: flex; flex-direction: column; gap: 6px; max-width: none;">
+                  <html:label
+                    for="__addonRef__-agent-claude-config-source"
+                    style="display: block; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);"
+                  >
+                    Claude Config Source
+                  </html:label>
+                  <html:select
+                    id="__addonRef__-agent-claude-config-source"
+                    style="
+                      width: 100%;
+                      padding: 4px 8px;
+                      font-size: 12px;
+                      border: 1px solid var(--stroke-secondary, #c8c8c8);
+                      border-radius: 6px;
+                      background: Field;
+                      color: FieldText;
+                    "
+                  >
+                    <html:option value="default">default — user + project + local</html:option>
+                    <html:option value="user-only">user-only — only your global Claude config</html:option>
+                    <html:option value="zotero-only">zotero-only — only Zotero-managed configs</html:option>
+                  </html:select>
+                </html:div>
+                <html:details style="margin-top: 4px;">
+                  <html:summary style="font-size: 11px; color: var(--fill-secondary, #666); cursor: pointer; user-select: none;">
+                    Show config locations and advanced details
+                  </html:summary>
+                  <html:div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+                    <html:div style="font-size: 11px; color: var(--fill-secondary, #666); line-height: 1.55; display: flex; flex-direction: column; gap: 3px;">
+                      <html:span><html:code>default</html:code> loads user + project + local. Priority: local &gt; project &gt; user.</html:span>
+                      <html:span><html:code>user-only</html:code> loads only your machine-wide Claude settings.</html:span>
+                      <html:span><html:code>zotero-only</html:code> loads only Zotero-managed shared and per-conversation settings.</html:span>
+                    </html:div>
+                    <html:div id="__addonRef__-claude-config-paths" style="display: flex; flex-direction: column; gap: 8px; width: 100%;"></html:div>
+                    <html:div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border:1px solid var(--stroke-secondary, #c8c8c8); border-radius:8px; background: rgba(255,255,255,0.02);">
+                      <html:div style="display:flex; flex-direction:column; gap:2px; min-width:0;">
+                        <html:div style="font-size:11px; font-weight:600; color: var(--fill-secondary, #666);">Trace logs</html:div>
+                        <html:div style="font-size:10.5px; color: var(--fill-secondary, #666); line-height:1.45;">Save Claude runtime traces for debugging and copy the log directory path.</html:div>
+                        <html:div id="__addonRef__-claude-trace-path" style="font-size:11px; color: var(--fill-secondary, #666); word-break: break-all;"></html:div>
+                      </html:div>
+                      <html:div style="display:flex; align-items:center; gap:8px; flex:0 0 auto;">
+                        <html:label style="display:flex; align-items:center; gap:6px; font-size:11px; color: var(--fill-secondary, #666);">
+                          <html:input id="__addonRef__-claude-trace-enabled" type="checkbox" />
+                          Enabled
+                        </html:label>
+                        <html:button id="__addonRef__-claude-trace-copy-path" type="button" style="padding:4px 10px; font-size:11px; border:1px solid var(--stroke-secondary, #c8c8c8); border-radius:6px; background: Field; color: FieldText; cursor:pointer;">Copy path</html:button>
+                      </html:div>
+                    </html:div>
+                    <html:a
+                      id="__addonRef__-claude-config-doc-link"
+                      href="https://code.claude.com/docs/en/settings"
+                      style="font-size: 11px; color: var(--fill-secondary, #666); text-decoration: underline;"
+                    >
+                      Claude Code settings guide
+                    </html:a>
+                  </html:div>
+                </html:details>
+              </html:div>
+
+              <html:div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; background: Field;">
+                <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                  <html:span style="font-weight: 700; font-size: 12px; color: var(--fill-primary, inherit);">Runtime defaults</html:span>
+                  <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.5;">
+                    These values control how Claude runs inside Zotero by default.
+                  </html:span>
+                </html:div>
+                <html:div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px 16px; align-items: start;">
+                  <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                    <html:label
+                      for="__addonRef__-agent-permission-mode"
+                      style="display: block; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);"
+                    >
+                      Permission Mode
+                    </html:label>
+                    <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.45;">
+                      <html:code>safe</html:code> is recommended. <html:code>yolo</html:code> removes confirmation prompts.
+                    </html:span>
+                    <html:select
+                      id="__addonRef__-agent-permission-mode"
+                      style="
+                        width: 100%;
+                        max-width: none;
+                        padding: 4px 8px;
+                        font-size: 12px;
+                        border: 1px solid var(--stroke-secondary, #c8c8c8);
+                        border-radius: 6px;
+                        background: Field;
+                        color: FieldText;
+                      "
+                    >
+                      <html:option value="safe">safe</html:option>
+                      <html:option value="yolo">yolo</html:option>
+                    </html:select>
+                  </html:div>
+
+                  <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                    <html:label
+                      for="__addonRef__-claude-code-model"
+                      style="display: block; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);"
+                    >
+                      Default Model
+                    </html:label>
+                    <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.45;">
+                      This sets the default capability tier for new Claude conversations. <html:code>haiku</html:code>, <html:code>sonnet</html:code>, and <html:code>opus</html:code> are strength tiers, so the runtime may map them to different underlying models.
+                    </html:span>
+                    <html:select
+                      id="__addonRef__-claude-code-model"
+                      style="
+                        width: 100%;
+                        max-width: none;
+                        padding: 4px 8px;
+                        font-size: 12px;
+                        border: 1px solid var(--stroke-secondary, #c8c8c8);
+                        border-radius: 6px;
+                        background: Field;
+                        color: FieldText;
+                      "
+                    >
+                      <html:option value="sonnet">sonnet</html:option>
+                      <html:option value="opus">opus</html:option>
+                      <html:option value="haiku">haiku</html:option>
+                    </html:select>
+                  </html:div>
+
+                  <html:div style="display: flex; flex-direction: column; gap: 4px;">
+                    <html:label
+                      for="__addonRef__-claude-code-reasoning"
+                      style="display: block; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);"
+                    >
+                      Default Reasoning
+                    </html:label>
+                    <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.45;">
+                      The reasoning effort Claude uses by default for new runs.
+                    </html:span>
+                    <html:select
+                      id="__addonRef__-claude-code-reasoning"
+                      style="
+                        width: 100%;
+                        max-width: none;
+                        padding: 4px 8px;
+                        font-size: 12px;
+                        border: 1px solid var(--stroke-secondary, #c8c8c8);
+                        border-radius: 6px;
+                        background: Field;
+                        color: FieldText;
+                      "
+                    >
+                      <html:option value="auto">auto</html:option>
+                      <html:option value="low">low</html:option>
+                      <html:option value="medium">medium</html:option>
+                      <html:option value="high">high</html:option>
+                      <html:option value="xhigh">xhigh</html:option>
+                      <html:option value="max">max</html:option>
+                    </html:select>
+                  </html:div>
+
+                  <html:div style="display: flex; flex-direction: column; gap: 6px;">
+                    <html:label style="display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);">
+                      <html:input id="__addonRef__-claude-code-block-streaming" type="checkbox"></html:input>
+                      Enable block streaming
+                    </html:label>
+                    <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.45;">
+                      Show Claude answers chunk by chunk while they stream, instead of waiting until the final answer is assembled.
+                    </html:span>
+                  </html:div>
+
+                  <html:div style="display: flex; flex-direction: column; gap: 6px;">
+                    <html:label style="display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 12px; color: var(--fill-primary, inherit);">
+                      <html:input id="__addonRef__-claude-code-auto-compact" type="checkbox"></html:input>
+                      Enable auto-compact
+                    </html:label>
+                    <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.45;">
+                      Automatically send <html:code>/compact</html:code> before a new Claude turn when context usage crosses the threshold below.
+                    </html:span>
+                    <html:div style="display:flex; align-items:center; gap:10px;">
+                      <html:input id="__addonRef__-claude-code-auto-compact-threshold" type="range" min="30" max="80" step="1" style="flex:1 1 auto;" />
+                      <html:span id="__addonRef__-claude-code-auto-compact-threshold-value" style="min-width:48px; text-align:right; font-size:11px; color: var(--fill-secondary, #777);"></html:span>
+                    </html:div>
+                  </html:div>
+                </html:div>
+              </html:div>
+
+              <html:details style="padding: 12px; border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; background: Field;">
+                <html:summary style="font-weight: 700; font-size: 12px; color: var(--fill-primary, inherit); cursor: pointer; user-select: none;">
+                  Advanced: Runtime CLAUDE.md instructions
+                </html:summary>
+                <html:div style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;">
+                  <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.5;">
+                    This controls the text injected between <html:code>&lt;!-- LLM-FOR-ZOTERO:CLAUDE-MANAGED-BEGIN --&gt;</html:code> and <html:code>&lt;!-- LLM-FOR-ZOTERO:CLAUDE-MANAGED-END --&gt;</html:code> inside the runtime <html:code>CLAUDE.md</html:code>. Existing files are preserved. Clicking Update only refreshes that managed block.
+                  </html:span>
+                  <html:span style="font-size: 11px; color: var(--fill-secondary, #777); line-height: 1.5;">
+                    If you are not already comfortable editing Claude Code project instructions, leave this unchanged.
+                  </html:span>
+                  <html:textarea
+                    id="__addonRef__-claude-managed-instruction-template"
+                    rows="12"
+                    spellcheck="false"
+                    style="
+                      width: 100%;
+                      padding: 8px 10px;
+                      font-size: 12px;
+                      line-height: 1.5;
+                      border: 1px solid var(--stroke-secondary, #c8c8c8);
+                      border-radius: 6px;
+                      box-sizing: border-box;
+                      resize: vertical;
+                      background: Field;
+                      color: FieldText;
+                      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                      white-space: pre;
+                      min-height: 220px;
+                    "
+                  ></html:textarea>
+                  <html:div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <html:button
+                      id="__addonRef__-claude-managed-instruction-update"
+                      type="button"
+                      style="
+                        padding: 4px 10px;
+                        font-size: 12px;
+                        font-weight: 500;
+                        white-space: nowrap;
+                        background: transparent;
+                        color: var(--color-accent, #2563eb);
+                        border: 1px solid var(--color-accent, #2563eb);
+                        border-radius: 5px;
+                        cursor: pointer;
+                      "
+                    >
+                      Update runtime CLAUDE.md
+                    </html:button>
+                    <html:button
+                      id="__addonRef__-claude-managed-instruction-reset"
+                      type="button"
+                      style="
+                        padding: 4px 10px;
+                        font-size: 12px;
+                        font-weight: 500;
+                        white-space: nowrap;
+                        background: Field;
+                        color: FieldText;
+                        border: 1px solid var(--stroke-secondary, #c8c8c8);
+                        border-radius: 5px;
+                        cursor: pointer;
+                      "
+                    >
+                      Reset to default
+                    </html:button>
+                    <html:span
+                      id="__addonRef__-claude-managed-instruction-status"
+                      style="font-size: 11.5px; display: none;"
+                    ></html:span>
+                  </html:div>
+                </html:div>
+              </html:details>
+            </html:div>
+          </html:div>
+        </html:div>
+
         <!-- ── Notes Directory ── -->
         <html:div style="border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 8px; overflow: hidden; margin-top: 6px;">
           <html:div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: Field; color: FieldText; border-bottom: 1px solid var(--stroke-secondary, #c8c8c8);">

@@ -9,9 +9,62 @@
 import type { AgentRuntime } from "../../../agent/runtime";
 import type {
   AgentEvent,
+  AgentPendingAction,
   AgentRunEventRecord,
   AgentRuntimeRequest,
 } from "../../../agent/types";
+import { consumePendingRetentionEvents } from "../../../claudeCode/runtimeRetention";
+import { captureClaudeSessionInfo, buildClaudeScope } from "../../../claudeCode/runtime";
+import {
+  resolveConversationBaseItem,
+  resolveDisplayConversationKind,
+} from "../portalScope";
+import { renderPendingActionCard } from "../agentTrace/render";
+
+function buildPendingAgentTraceEvents(body?: Element): AgentRunEventRecord[] {
+  const now = Date.now();
+  const events: AgentRunEventRecord[] = [
+    {
+      runId: "pending",
+      seq: 1,
+      eventType: "status",
+      payload: { type: "status", text: "Checking the request against the attached context." },
+      createdAt: now,
+    },
+    {
+      runId: "pending",
+      seq: 2,
+      eventType: "status",
+      payload: { type: "status", text: "Request and attached context received" },
+      createdAt: now + 1,
+    },
+  ];
+  if (!body) return events;
+  const retentionEvents = consumePendingRetentionEvents(body);
+  for (const event of retentionEvents) {
+    events.push({
+      runId: "pending",
+      seq: events.length + 1,
+      eventType: event.type,
+      payload: event,
+      createdAt: Date.now(),
+    });
+  }
+  return events;
+}
+
+function applyResolvedClaudeEffortDisplay(
+  body: Element,
+  event: AgentEvent,
+): void {
+  if (event.type !== "provider_event") return;
+  if (event.providerType !== "runtime_config") return;
+  const applyResolvedEffort = (body as any).__llmApplyResolvedClaudeEffort as
+    | ((effort: unknown) => void)
+    | undefined;
+  if (typeof applyResolvedEffort !== "function") return;
+  applyResolvedEffort(event.payload?.resolvedEffort);
+}
 import type {
   AdvancedModelParams,
   ChatAttachment,
@@ -23,6 +76,7 @@ import type { ReasoningConfig as LLMReasoningConfig } from "../../../utils/llmCl
 import type { ChatMessage } from "../../../utils/llmClient";
 import type { StoredChatMessage } from "../../../utils/chatStore";
 import type { Message } from "../types";
+import { isClaudeBlockStreamingEnabled } from "../../../claudeCode/prefs";
 
 // ---------------------------------------------------------------------------
 // Types for panel helpers (defined inline to avoid importing from chat.ts)
@@ -44,18 +98,103 @@ type PanelUpdateHelpers = {
   setStatusSafely: (text: string, kind: StatusKind) => void;
 };
 
+function syncInlineActionCardState(body: Element, ui: PanelRequestUIShape): void {
+  const hasCard = Boolean(ui.chatBox?.querySelector(".llm-action-inline-card"));
+  const panelRoot = body as HTMLElement;
+  if (hasCard) {
+    panelRoot.dataset.hasActionCard = "true";
+  } else {
+    delete panelRoot.dataset.hasActionCard;
+  }
+}
+
+function scrollActionCardIntoView(chatBox: HTMLElement, card: HTMLElement): void {
+  const scroll = () => {
+    try {
+      card.scrollIntoView({ block: "end" });
+    } catch {
+      // Older Zotero runtimes can be picky about scrollIntoView options.
+    }
+    chatBox.scrollTop = chatBox.scrollHeight;
+  };
+  scroll();
+  const view = chatBox.ownerDocument?.defaultView;
+  view?.requestAnimationFrame?.(scroll);
+  view?.setTimeout(scroll, 80);
+}
+
+function findRenderedPendingActionCard(
+  chatBox: HTMLElement,
+  requestId: string,
+): HTMLElement | null {
+  const cards = Array.from(
+    chatBox.querySelectorAll(".llm-agent-hitl-card[data-request-id]"),
+  ) as HTMLElement[];
+  return cards.find((card) => card.dataset.requestId === requestId) || null;
+}
+
+function showInlineConfirmationCard(
+  body: Element,
+  ui: PanelRequestUIShape,
+  requestId: string,
+  action: AgentPendingAction,
+): void {
+  const chatBox = ui.chatBox;
+  const ownerDoc = body.ownerDocument;
+  if (!chatBox || !ownerDoc) return;
+  chatBox.querySelector(".llm-action-inline-card")?.remove();
+  const renderedCard = findRenderedPendingActionCard(chatBox, requestId);
+  if (renderedCard) {
+    scrollActionCardIntoView(chatBox, renderedCard);
+    syncInlineActionCardState(body, ui);
+    return;
+  }
+  const wrapper = ownerDoc.createElement("div");
+  wrapper.className = "llm-action-inline-card";
+  wrapper.dataset.requestId = requestId;
+  wrapper.appendChild(renderPendingActionCard(ownerDoc, { requestId, action }));
+  chatBox.appendChild(wrapper);
+  scrollActionCardIntoView(chatBox, wrapper);
+  syncInlineActionCardState(body, ui);
+}
+
+function closeInlineConfirmationCard(
+  body: Element,
+  ui: PanelRequestUIShape,
+  requestId?: string,
+): void {
+  const chatBox = ui.chatBox;
+  if (!chatBox) return;
+  let card: Element | null = null;
+  if (requestId) {
+    card =
+      (Array.from(chatBox.querySelectorAll(".llm-action-inline-card")) as HTMLElement[])
+        .find((entry) => entry.dataset.requestId === requestId) ||
+      chatBox.querySelector(".llm-action-inline-card");
+  } else {
+    card = chatBox.querySelector(".llm-action-inline-card");
+  }
+  card?.remove();
+  syncInlineActionCardState(body, ui);
+}
+
 type EffectiveRequestConfigShape = {
   model: string;
   apiBase: string;
   apiKey: string;
-  authMode: "api_key" | "codex_auth" | "codex_app_server" | "webchat"; // [webchat]
+  authMode:
+    | "api_key"
+    | "codex_auth"
+    | "codex_app_server"
+    | "copilot_auth"
+    | "webchat";
   providerProtocol?:
     | "codex_responses"
     | "responses_api"
     | "openai_chat_compat"
     | "anthropic_messages"
     | "gemini_native"
-    | "web_sync"; // [webchat]
+    | "web_sync";
   modelEntryId?: string;
   modelProviderLabel?: string;
   reasoning: LLMReasoningConfig | undefined;
@@ -131,6 +270,16 @@ export type AgentEngineDeps = {
 
   // Data helpers
   ensureConversationLoaded: (item: Zotero.Item) => Promise<void>;
+  getConversationSystem: () => string;
+  accumulateSessionTokens: (conversationKey: number, delta: number) => number;
+  getContextUsageSnapshot: (conversationKey: number) => { contextTokens: number; contextWindow?: number } | undefined;
+  setContextUsageSnapshot: (conversationKey: number, snapshot: { contextTokens: number; contextWindow?: number }) => void;
+  setTokenUsage: (
+    el: HTMLElement,
+    sessionTokens: number,
+    contextWindow?: number,
+    gaugeEl?: HTMLElement | null,
+  ) => void;
   getConversationKey: (item: Zotero.Item) => number;
   buildLLMHistoryMessages: (history: Message[]) => ChatMessage[];
   buildAgentRuntimeRequest: (
@@ -141,6 +290,16 @@ export type AgentEngineDeps = {
     model?: string;
     apiBase?: string;
     apiKey?: string;
+    authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
+    providerProtocol?:
+      | "codex_responses"
+      | "responses_api"
+      | "openai_chat_compat"
+      | "anthropic_messages"
+      | "gemini_native"
+      | "web_sync";
+    modelEntryId?: string;
+    modelProviderLabel?: string;
     reasoning?: LLMReasoningConfig;
     advanced?: AdvancedModelParams;
   }) => EffectiveRequestConfigShape;
@@ -176,8 +335,7 @@ export type AgentEngineDeps = {
     fallbackText?: string,
   ) => void;
   sanitizeText: (text: string) => string;
-  accumulateSessionTokens: (conversationKey: number, delta: number) => number;
-  setTokenUsage: (el: HTMLElement, total: number) => void;
+  appendReasoningPart: (base: string | undefined, next?: string) => string;
 
   // Persistence
   persistConversationMessage: (
@@ -216,6 +374,16 @@ export async function sendAgentTurn(
     model?: string;
     apiBase?: string;
     apiKey?: string;
+    authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
+    providerProtocol?:
+      | "codex_responses"
+      | "responses_api"
+      | "openai_chat_compat"
+      | "anthropic_messages"
+      | "gemini_native"
+      | "web_sync";
+    modelEntryId?: string;
+    modelProviderLabel?: string;
     reasoning?: LLMReasoningConfig;
     advanced?: AdvancedModelParams;
     displayQuestion?: string;
@@ -231,80 +399,40 @@ export async function sendAgentTurn(
   deps: AgentEngineDeps,
 ): Promise<void> {
   const {
-    body, item, question, images, model, apiBase, apiKey, reasoning, advanced,
-    displayQuestion, selectedTexts, selectedTextSources, selectedTextPaperContexts,
-    selectedTextNoteContexts, paperContexts, fullTextPaperContexts, attachments,
-    forcedSkillIds,
-  } = opts;
-  await deps.ensureConversationLoaded(item);
-  const conversationKey = deps.getConversationKey(item);
-  const history = deps.chatHistory.get(conversationKey) || [];
-  const llmHistory = deps.buildLLMHistoryMessages(history.slice());
-  const effectiveRequestConfig = deps.resolveEffectiveRequestConfig({
+    body,
     item,
+    question,
+    images,
     model,
     apiBase,
     apiKey,
+    authMode,
+    providerProtocol,
+    modelEntryId,
+    modelProviderLabel,
     reasoning,
     advanced,
-  });
+    displayQuestion,
+    selectedTexts,
+    selectedTextSources,
+    selectedTextPaperContexts,
+    selectedTextNoteContexts,
+    paperContexts,
+    fullTextPaperContexts,
+    attachments,
+    forcedSkillIds,
+  } = opts;
+  const conversationKey = deps.getConversationKey(item);
+  const ui = deps.getPanelRequestUI(body);
+  const thisRequestId = deps.nextRequestId();
+  deps.setPendingRequestId(conversationKey, thisRequestId);
+  deps.setRequestUIBusy(body, ui, conversationKey, "Preparing agent...");
+
   const selectedTextsForMessage = deps.normalizeSelectedTexts(selectedTexts);
   const selectedTextSourcesForMessage = deps.normalizeSelectedTextSources(
     selectedTextSources,
     selectedTextsForMessage.length,
   );
-  const normalizedPaperContexts = deps.normalizePaperContexts(paperContexts);
-  const normalizedFullTextPaperContexts =
-    deps.normalizePaperContexts(fullTextPaperContexts);
-  const {
-    paperContexts: paperContextsForMessage,
-    fullTextPaperContexts: fullTextPaperContextsForMessage,
-  } = deps.includeAutoLoadedPaperContext(
-    item,
-    normalizedPaperContexts,
-    normalizedFullTextPaperContexts,
-  );
-  const runtimeRequest = await deps.buildAgentRuntimeRequest({
-    conversationKey,
-    item,
-    userText: question,
-    selectedTexts: selectedTextsForMessage,
-    selectedTextSources: selectedTextSourcesForMessage,
-    paperContexts: paperContextsForMessage,
-    fullTextPaperContexts: fullTextPaperContextsForMessage,
-    attachments,
-    screenshots: images,
-    forcedSkillIds,
-    effectiveRequestConfig,
-    history: llmHistory,
-  });
-  const agentRuntime = deps.getAgentRuntime();
-  const capabilities = agentRuntime.getCapabilities(runtimeRequest);
-  if (!capabilities.toolCalls) {
-    const fallback = await agentRuntime.runTurn({
-      request: runtimeRequest,
-    });
-    if (fallback.kind === "fallback") {
-      await deps.sendChatFallback({
-        body, item, question, images, model, apiBase, apiKey, reasoning, advanced,
-        displayQuestion, selectedTexts, selectedTextSources, selectedTextPaperContexts,
-        selectedTextNoteContexts, paperContexts, fullTextPaperContexts, attachments,
-        runtimeMode: "agent",
-        agentRunId: fallback.runId,
-        skipAgentDispatch: true,
-      });
-      return;
-    }
-  }
-
-  const ui = deps.getPanelRequestUI(body);
-  const thisRequestId = deps.nextRequestId();
-  deps.setPendingRequestId(conversationKey, thisRequestId);
-  const initialConversationKey = deps.getConversationKey(item);
-  deps.setRequestUIBusy(body, ui, initialConversationKey, "Preparing agent...");
-
-  const historyForRun = deps.chatHistory.get(conversationKey) || [];
-  const shownQuestion = displayQuestion || question;
   const selectedTextPaperContextsForMessage =
     deps.normalizeSelectedTextPaperContextsByIndex(
       selectedTextPaperContexts,
@@ -315,6 +443,7 @@ export async function sendAgentTurn(
       selectedTextNoteContexts,
       selectedTextsForMessage.length,
     );
+  const shownQuestion = displayQuestion || question;
   const screenshotImagesForMessage = Array.isArray(images)
     ? images
         .filter((entry): entry is string => typeof entry === "string")
@@ -322,6 +451,9 @@ export async function sendAgentTurn(
         .filter(Boolean)
         .slice(0, deps.maxSelectedImages)
     : [];
+
+  const historyForRun = deps.chatHistory.get(conversationKey) || [];
+  const isCompactCommand = /^\/compact(?:\s|$)/i.test(question.trim());
   const userMessage: Message = {
     role: "user",
     text: shownQuestion,
@@ -346,12 +478,6 @@ export async function sendAgentTurn(
       ? selectedTextNoteContextsForMessage
       : undefined,
     selectedTextExpandedIndex: -1,
-    paperContexts: paperContextsForMessage.length
-      ? paperContextsForMessage
-      : undefined,
-    fullTextPaperContexts: fullTextPaperContextsForMessage.length
-      ? fullTextPaperContextsForMessage
-      : undefined,
     paperContextsExpanded: false,
     screenshotImages: screenshotImagesForMessage.length
       ? screenshotImagesForMessage
@@ -360,22 +486,34 @@ export async function sendAgentTurn(
     screenshotActiveIndex: 0,
     attachments: attachments?.length ? attachments : undefined,
   };
-  historyForRun.push(userMessage);
-  await deps.persistConversationMessage(conversationKey, {
-    role: "user",
-    text: userMessage.text,
-    timestamp: userMessage.timestamp,
-    runMode: "agent",
-    selectedText: userMessage.selectedText,
-    selectedTexts: userMessage.selectedTexts,
-    selectedTextSources: userMessage.selectedTextSources,
-    selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
-    paperContexts: userMessage.paperContexts,
-    fullTextPaperContexts: userMessage.fullTextPaperContexts,
-    screenshotImages: userMessage.screenshotImages,
-    attachments: userMessage.attachments,
-  });
+  if (!isCompactCommand) {
+    historyForRun.push(userMessage);
+    await deps.persistConversationMessage(conversationKey, {
+      role: "user",
+      text: userMessage.text,
+      timestamp: userMessage.timestamp,
+      runMode: "agent",
+      selectedText: userMessage.selectedText,
+      selectedTexts: userMessage.selectedTexts,
+      selectedTextSources: userMessage.selectedTextSources,
+      selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
+      screenshotImages: userMessage.screenshotImages,
+      attachments: userMessage.attachments,
+    });
+  }
 
+  const effectiveRequestConfig = deps.resolveEffectiveRequestConfig({
+    item,
+    model,
+    apiBase,
+    apiKey,
+    authMode,
+    providerProtocol,
+    modelEntryId,
+    modelProviderLabel,
+    reasoning,
+    advanced,
+  });
   const assistantMessage: Message = {
     role: "assistant",
     text: "",
@@ -385,17 +523,117 @@ export async function sendAgentTurn(
     modelEntryId: effectiveRequestConfig.modelEntryId,
     modelProviderLabel: effectiveRequestConfig.modelProviderLabel,
     streaming: true,
+    waitingAnimationStartedAt:
+      effectiveRequestConfig.modelProviderLabel === "Claude Code" ? Date.now() : undefined,
+    pendingAgentTraceEvents:
+      effectiveRequestConfig.modelProviderLabel === "Claude Code"
+        ? buildPendingAgentTraceEvents(body)
+        : undefined,
     reasoningOpen: false,
   };
   historyForRun.push(assistantMessage);
   const { refreshChatSafely, setStatusSafely } =
     deps.createPanelUpdateHelpers(body, item, conversationKey, ui);
+  const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
+  const scheduleQueueDrain =
+    ((body as any).__llmScheduleClaudeThreadQueueDrain as (() => void) | undefined) ||
+    ((body as any).__llmScheduleClaudeQueueDrain as (() => void) | undefined);
+  setStatusSafely("Checking the request against the attached context.", "sending");
   refreshChatSafely();
+
+  await deps.ensureConversationLoaded(item);
+  const history = deps.chatHistory.get(conversationKey) || [];
+  const llmHistory = deps.buildLLMHistoryMessages(history.slice(0, -2));
+  const normalizedPaperContexts = deps.normalizePaperContexts(paperContexts);
+  const normalizedFullTextPaperContexts =
+    deps.normalizePaperContexts(fullTextPaperContexts);
+  const {
+    paperContexts: paperContextsForMessage,
+    fullTextPaperContexts: fullTextPaperContextsForMessage,
+  } = deps.includeAutoLoadedPaperContext(
+    item,
+    normalizedPaperContexts,
+    normalizedFullTextPaperContexts,
+  );
+  userMessage.paperContexts = paperContextsForMessage.length
+    ? paperContextsForMessage
+    : undefined;
+  userMessage.fullTextPaperContexts = fullTextPaperContextsForMessage.length
+    ? fullTextPaperContextsForMessage
+    : undefined;
+  if (!isCompactCommand) {
+    await deps.updateStoredLatestUserMessage(conversationKey, {
+      text: userMessage.text,
+      timestamp: userMessage.timestamp,
+      runMode: "agent",
+      selectedText: userMessage.selectedText,
+      selectedTexts: userMessage.selectedTexts,
+      selectedTextSources: userMessage.selectedTextSources,
+      selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
+      selectedTextNoteContexts: userMessage.selectedTextNoteContexts,
+      paperContexts: userMessage.paperContexts,
+      fullTextPaperContexts: userMessage.fullTextPaperContexts,
+      screenshotImages: userMessage.screenshotImages,
+      attachments: userMessage.attachments,
+    });
+  }
+  const runtimeRequest = await deps.buildAgentRuntimeRequest({
+    conversationKey,
+    item,
+    userText: question,
+    selectedTexts: selectedTextsForMessage,
+    selectedTextSources: selectedTextSourcesForMessage,
+    paperContexts: paperContextsForMessage,
+    fullTextPaperContexts: fullTextPaperContextsForMessage,
+    attachments,
+    screenshots: images,
+    forcedSkillIds,
+    effectiveRequestConfig,
+    history: llmHistory,
+  });
+  const agentRuntime = deps.getAgentRuntime();
+  const capabilities = agentRuntime.getCapabilities(runtimeRequest);
+  if (!capabilities.toolCalls) {
+    const fallback = await agentRuntime.runTurn({
+      request: runtimeRequest,
+    });
+    if (fallback.kind === "fallback") {
+      historyForRun.pop();
+      await deps.sendChatFallback({
+        body,
+        item,
+        question,
+        images,
+        model,
+        apiBase,
+        apiKey,
+        authMode,
+        providerProtocol,
+        modelEntryId,
+        modelProviderLabel,
+        reasoning,
+        advanced,
+        displayQuestion,
+        selectedTexts,
+        selectedTextSources,
+        selectedTextPaperContexts,
+        selectedTextNoteContexts,
+        paperContexts,
+        fullTextPaperContexts,
+        attachments,
+        runtimeMode: "agent",
+        agentRunId: fallback.runId,
+        skipAgentDispatch: true,
+      });
+      return;
+    }
+  }
 
   let assistantPersisted = false;
   const persistAssistantOnce = async () => {
     if (assistantPersisted) return;
     assistantPersisted = true;
+    const snapshot = deps.getContextUsageSnapshot?.(conversationKey);
     await deps.persistConversationMessage(conversationKey, {
       role: "assistant",
       text: assistantMessage.text,
@@ -405,6 +643,8 @@ export async function sendAgentTurn(
       modelName: assistantMessage.modelName,
       modelEntryId: assistantMessage.modelEntryId,
       modelProviderLabel: assistantMessage.modelProviderLabel,
+      contextTokens: snapshot?.contextTokens,
+      contextWindow: snapshot?.contextWindow,
     });
   };
   const markCancelled = async () => {
@@ -420,7 +660,6 @@ export async function sendAgentTurn(
       conversationKey,
       AbortControllerCtor ? new AbortControllerCtor() : null,
     );
-    const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
 
     const pushTraceEvent = (runId: string, event: AgentEvent) => {
       const list = deps.agentRunTraceCache.get(runId) || [];
@@ -442,64 +681,187 @@ export async function sendAgentTurn(
         userMessage.agentRunId = runId;
         deps.agentRunTraceCache.set(runId, []);
         refreshChatSafely();
-        await deps.updateStoredLatestUserMessage(conversationKey, {
-          text: userMessage.text,
-          timestamp: userMessage.timestamp,
-          runMode: "agent",
-          agentRunId: runId,
-          selectedText: userMessage.selectedText,
-          selectedTexts: userMessage.selectedTexts,
-          selectedTextSources: userMessage.selectedTextSources,
-          selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
-          screenshotImages: userMessage.screenshotImages,
-          paperContexts: userMessage.paperContexts,
-          fullTextPaperContexts: userMessage.fullTextPaperContexts,
-          attachments: userMessage.attachments,
-        });
+        if (!isCompactCommand) {
+          await deps.updateStoredLatestUserMessage(conversationKey, {
+            text: userMessage.text,
+            timestamp: userMessage.timestamp,
+            runMode: "agent",
+            agentRunId: runId,
+            selectedText: userMessage.selectedText,
+            selectedTexts: userMessage.selectedTexts,
+            selectedTextSources: userMessage.selectedTextSources,
+            selectedTextPaperContexts: userMessage.selectedTextPaperContexts,
+            screenshotImages: userMessage.screenshotImages,
+            paperContexts: userMessage.paperContexts,
+            fullTextPaperContexts: userMessage.fullTextPaperContexts,
+            attachments: userMessage.attachments,
+          });
+        }
       },
       onEvent: async (event) => {
         if (assistantMessage.agentRunId) {
           pushTraceEvent(assistantMessage.agentRunId, event);
         }
         switch (event.type) {
-          case "status":
-            setStatusSafely(event.text, "sending");
+          case "provider_event":
+            applyResolvedClaudeEffortDisplay(body, event);
             break;
+          case "usage": {
+            if (ui.tokenUsageEl) {
+              const previous = deps.getContextUsageSnapshot?.(conversationKey);
+              const usageEvent = event as Extract<AgentEvent, { type: "usage" }>;
+              const usageRecord = usageEvent as unknown as Record<string, unknown>;
+              const hasContextPayload = "contextTokens" in usageRecord;
+              if (hasContextPayload) {
+                const nextTokens = Math.max(0, Number(usageRecord.contextTokens) || 0);
+                const rawContextWindow = usageRecord.contextWindow;
+                const nextWindow =
+                  typeof rawContextWindow === "number" && Number.isFinite(rawContextWindow)
+                    ? rawContextWindow
+                    : previous?.contextWindow;
+                const effectiveTokens =
+                  nextTokens > 0
+                    ? nextTokens
+                    : usageRecord.contextWindowIsAuthoritative === true
+                      ? (previous?.contextTokens ?? 0)
+                      : 0;
+                deps.setContextUsageSnapshot?.(conversationKey, {
+                  contextTokens: effectiveTokens,
+                  contextWindow: nextWindow,
+                });
+                deps.setTokenUsage(
+                  ui.tokenUsageEl,
+                  effectiveTokens,
+                  nextWindow,
+                  body.querySelector("#llm-claude-context-gauge") as HTMLElement | null,
+                );
+              } else if (typeof usageRecord.totalTokens === "number" && usageRecord.totalTokens > 0) {
+                const total = deps.accumulateSessionTokens(
+                  conversationKey,
+                  usageRecord.totalTokens,
+                );
+                deps.setTokenUsage(ui.tokenUsageEl, total);
+              }
+            }
+            break;
+          }
+          case "status": {
+            const isCompactingStatus = /compacting context/i.test(event.text);
+            if (
+              !isCompactingStatus &&
+              !assistantMessage.agentRunId &&
+              assistantMessage.pendingAgentTraceEvents
+            ) {
+              assistantMessage.pendingAgentTraceEvents.push({
+                runId: "pending",
+                seq: assistantMessage.pendingAgentTraceEvents.length + 1,
+                eventType: event.type,
+                payload: event,
+                createdAt: Date.now(),
+              });
+            }
+            setStatusSafely(event.text, "sending");
+            if (isCompactingStatus) {
+              assistantMessage.pendingAgentTraceEvents = undefined;
+              queueRefresh();
+            }
+            break;
+          }
+          case "reasoning": {
+            if (event.summary) {
+              assistantMessage.reasoningSummary = deps.appendReasoningPart(
+                assistantMessage.reasoningSummary,
+                event.summary,
+              );
+            }
+            if (event.details) {
+              assistantMessage.reasoningDetails = deps.appendReasoningPart(
+                assistantMessage.reasoningDetails,
+                event.details,
+              );
+            }
+            queueRefresh();
+            return;
+          }
           case "fallback":
+            if (assistantMessage.text === "Compacting context…") {
+              assistantMessage.text = "";
+            }
             setStatusSafely(event.reason, "sending");
             break;
-          case "message_delta":
-            assistantMessage.text += deps.sanitizeText(event.text);
-            break;
+          case "confirmation_required":
+            showInlineConfirmationCard(body, ui, event.requestId, event.action);
+            queueRefresh();
+            body.ownerDocument?.defaultView?.setTimeout(() => {
+              showInlineConfirmationCard(body, ui, event.requestId, event.action);
+            }, 90);
+            setStatusSafely("Approval required", "sending");
+            return;
+          case "confirmation_resolved":
+            closeInlineConfirmationCard(body, ui, event.requestId);
+            queueRefresh();
+            setStatusSafely(event.approved ? "Approval sent" : "Action denied", "sending");
+            return;
+          case "message_delta": {
+            assistantMessage.pendingFinalText =
+              `${assistantMessage.pendingFinalText || ""}${deps.sanitizeText(event.text)}`;
+            assistantMessage.text = assistantMessage.pendingFinalText || assistantMessage.text;
+            queueRefresh();
+            return;
+          }
           case "message_rollback":
             if (typeof event.length === "number" && event.length > 0) {
-              assistantMessage.text = assistantMessage.text.slice(
+              assistantMessage.pendingFinalText = (assistantMessage.pendingFinalText || "").slice(
                 0,
-                Math.max(0, assistantMessage.text.length - event.length),
+                Math.max(0, (assistantMessage.pendingFinalText || "").length - event.length),
               );
+              if (isClaudeBlockStreamingEnabled()) {
+                assistantMessage.text = assistantMessage.pendingFinalText || "";
+                queueRefresh();
+              }
             }
-            break;
-          case "usage":
-            if (ui.tokenUsageEl && event.totalTokens > 0) {
-              const total = deps.accumulateSessionTokens(
-                conversationKey,
-                event.totalTokens,
-              );
-              deps.setTokenUsage(ui.tokenUsageEl, total);
-            }
-            break;
+            return;
+          case "context_compacted": {
+            const compactMarker: Message = {
+              role: "assistant",
+              text: event.automatic ? "Context compacted automatically" : "Conversation compacted",
+              timestamp: Date.now(),
+              runMode: "agent",
+              compactMarker: true,
+              modelName: assistantMessage.modelName,
+              modelEntryId: assistantMessage.modelEntryId,
+              modelProviderLabel: assistantMessage.modelProviderLabel,
+            };
+            const insertIndex = Math.max(0, historyForRun.indexOf(assistantMessage));
+            historyForRun.splice(insertIndex, 0, compactMarker);
+            await deps.persistConversationMessage(conversationKey, {
+              role: "assistant",
+              text: compactMarker.text,
+              timestamp: compactMarker.timestamp,
+              runMode: "agent",
+              modelName: compactMarker.modelName,
+              modelEntryId: compactMarker.modelEntryId,
+              modelProviderLabel: compactMarker.modelProviderLabel,
+              compactMarker: true,
+            });
+            assistantMessage.text = "";
+            assistantMessage.pendingAgentTraceEvents = undefined;
+            refreshChatSafely();
+            scheduleQueueDrain?.();
+            await deps.waitForUiStep();
+            return;
+          }
           case "final":
-            if (!assistantMessage.text.trim()) {
-              assistantMessage.text = deps.sanitizeText(event.text);
-            }
+            assistantMessage.text =
+              deps.sanitizeText(event.text) ||
+              assistantMessage.pendingFinalText ||
+              assistantMessage.text;
+            assistantMessage.pendingFinalText = undefined;
             assistantMessage.streaming = false;
+            scheduleQueueDrain?.();
             break;
           default:
             break;
-        }
-        if (event.type === "message_delta" || event.type === "message_rollback") {
-          queueRefresh();
-          return;
         }
         refreshChatSafely();
         await deps.waitForUiStep();
@@ -517,14 +879,38 @@ export async function sendAgentTurn(
     assistantMessage.agentRunId = outcome.runId;
     assistantMessage.runMode = "agent";
     const finalOutcomeText =
-      outcome.kind === "completed" ? outcome.text : assistantMessage.text;
+      outcome.kind === "completed"
+        ? outcome.text
+        : assistantMessage.pendingFinalText || assistantMessage.text;
     assistantMessage.text =
       deps.sanitizeText(finalOutcomeText) ||
+      assistantMessage.pendingFinalText ||
       assistantMessage.text ||
       "No response.";
+    assistantMessage.pendingFinalText = undefined;
+    assistantMessage.waitingAnimationStartedAt = undefined;
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
+    if (deps.getConversationSystem?.() === "claude_code") {
+      const conversationKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      await captureClaudeSessionInfo(
+        conversationKey,
+        buildClaudeScope({
+          libraryID: Number(item.libraryID || baseItem?.libraryID || 0),
+          kind: conversationKind === "global" ? "global" : "paper",
+          paperItemID:
+            conversationKind === "paper"
+              ? Number(baseItem?.id || 0) || undefined
+              : undefined,
+          paperTitle:
+            conversationKind === "paper"
+              ? String(baseItem?.getField?.("title") || "").trim() || undefined
+              : undefined,
+        }),
+      ).catch(() => null);
+    }
     setStatusSafely("Ready", "ready");
   } catch (err) {
     const isCancelled =
@@ -536,15 +922,20 @@ export async function sendAgentTurn(
       return;
     }
     const errMsg = (err as Error).message || "Error";
-    assistantMessage.text = `Error: ${errMsg}`;
+    const userFacingError =
+      errMsg.includes("[ede_diagnostic]") && errMsg.includes("last_content_type=none")
+        ? "The model returned an empty reply. Please retry."
+        : errMsg;
+    assistantMessage.text = `Error: ${userFacingError}`;
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
-    setStatusSafely(`Error: ${errMsg.slice(0, 40)}`, "error");
+    setStatusSafely(`Error: ${userFacingError.slice(0, 40)}`, "error");
   } finally {
+    deps.setPendingRequestId(conversationKey, 0);
     deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
     deps.setCurrentAbortController(conversationKey, null);
-    deps.setPendingRequestId(conversationKey, 0);
+    scheduleQueueDrain?.();
   }
 }
 
@@ -558,6 +949,17 @@ export async function retryAgentTurn(
   model: string | undefined,
   apiBase: string | undefined,
   apiKey: string | undefined,
+  authMode: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat" | undefined,
+  providerProtocol:
+    | "codex_responses"
+    | "responses_api"
+    | "openai_chat_compat"
+    | "anthropic_messages"
+    | "gemini_native"
+    | "web_sync"
+    | undefined,
+  modelEntryId: string | undefined,
+  modelProviderLabel: string | undefined,
   reasoning: LLMReasoningConfig | undefined,
   advanced: AdvancedModelParams | undefined,
   deps: AgentEngineDeps,
@@ -581,26 +983,36 @@ export async function retryAgentTurn(
 
   const assistantMessage = retryPair.assistantMessage;
 
-  // Clear the previous agent run so the trace and text reset immediately.
-  assistantMessage.text = "";
-  assistantMessage.agentRunId = undefined;
-  assistantMessage.runMode = "agent";
-  assistantMessage.streaming = true;
-  assistantMessage.reasoningSummary = undefined;
-  assistantMessage.reasoningDetails = undefined;
-  assistantMessage.reasoningOpen = deps.isReasoningExpandedByDefault();
-
   const effectiveRequestConfig = deps.resolveEffectiveRequestConfig({
     item,
     model,
     apiBase,
     apiKey,
+    authMode,
+    providerProtocol,
+    modelEntryId,
+    modelProviderLabel,
     reasoning,
     advanced,
   });
+
+  // Clear the previous agent run so the trace and text reset immediately.
+  assistantMessage.text = "";
+  assistantMessage.agentRunId = undefined;
+  assistantMessage.runMode = "agent";
+  assistantMessage.streaming = true;
   assistantMessage.modelName = effectiveRequestConfig.model;
   assistantMessage.modelEntryId = effectiveRequestConfig.modelEntryId;
   assistantMessage.modelProviderLabel = effectiveRequestConfig.modelProviderLabel;
+  assistantMessage.waitingAnimationStartedAt =
+    assistantMessage.modelProviderLabel === "Claude Code" ? Date.now() : undefined;
+  assistantMessage.reasoningSummary = undefined;
+  assistantMessage.reasoningDetails = undefined;
+  assistantMessage.reasoningOpen = deps.isReasoningExpandedByDefault();
+  assistantMessage.pendingAgentTraceEvents =
+    assistantMessage.modelProviderLabel === "Claude Code"
+      ? buildPendingAgentTraceEvents(body)
+      : undefined;
 
   const { refreshChatSafely, setStatusSafely } = deps.createPanelUpdateHelpers(
     body,
@@ -608,6 +1020,10 @@ export async function retryAgentTurn(
     conversationKey,
     ui,
   );
+  const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
+  const scheduleQueueDrain =
+    ((body as any).__llmScheduleClaudeThreadQueueDrain as (() => void) | undefined) ||
+    ((body as any).__llmScheduleClaudeQueueDrain as (() => void) | undefined);
   refreshChatSafely(); // Immediately clear the old trace from view
 
   const { question, screenshotImages, paperContexts, fullTextPaperContexts } =
@@ -652,6 +1068,7 @@ export async function retryAgentTurn(
   const persistAssistantOnce = async () => {
     if (assistantPersisted) return;
     assistantPersisted = true;
+    const snapshot = deps.getContextUsageSnapshot?.(conversationKey);
     await deps.updateStoredLatestAssistantMessage(conversationKey, {
       text: assistantMessage.text,
       timestamp: assistantMessage.timestamp,
@@ -660,6 +1077,8 @@ export async function retryAgentTurn(
       modelName: assistantMessage.modelName,
       modelEntryId: assistantMessage.modelEntryId,
       modelProviderLabel: assistantMessage.modelProviderLabel,
+      contextTokens: snapshot?.contextTokens,
+      contextWindow: snapshot?.contextWindow,
     });
   };
   const markCancelled = async () => {
@@ -676,7 +1095,6 @@ export async function retryAgentTurn(
       conversationKey,
       AbortControllerCtor ? new AbortControllerCtor() : null,
     );
-    const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
 
     const pushTraceEvent = (runId: string, event: AgentEvent) => {
       const list = deps.agentRunTraceCache.get(runId) || [];
@@ -718,44 +1136,163 @@ export async function retryAgentTurn(
           pushTraceEvent(assistantMessage.agentRunId, event);
         }
         switch (event.type) {
-          case "status":
-            setStatusSafely(event.text, "sending");
+          case "provider_event":
+            applyResolvedClaudeEffortDisplay(body, event);
             break;
+          case "usage": {
+            if (ui.tokenUsageEl) {
+              const previous = deps.getContextUsageSnapshot?.(conversationKey);
+              const usageEvent = event as Extract<AgentEvent, { type: "usage" }>;
+              const usageRecord = usageEvent as unknown as Record<string, unknown>;
+              const hasContextPayload = "contextTokens" in usageRecord;
+              if (hasContextPayload) {
+                const nextTokens = Math.max(0, Number(usageRecord.contextTokens) || 0);
+                const rawContextWindow = usageRecord.contextWindow;
+                const nextWindow =
+                  typeof rawContextWindow === "number" && Number.isFinite(rawContextWindow)
+                    ? rawContextWindow
+                    : previous?.contextWindow;
+                const effectiveTokens =
+                  nextTokens > 0
+                    ? nextTokens
+                    : usageRecord.contextWindowIsAuthoritative === true
+                      ? (previous?.contextTokens ?? 0)
+                      : 0;
+                deps.setContextUsageSnapshot?.(conversationKey, {
+                  contextTokens: effectiveTokens,
+                  contextWindow: nextWindow,
+                });
+                deps.setTokenUsage(
+                  ui.tokenUsageEl,
+                  effectiveTokens,
+                  nextWindow,
+                  body.querySelector("#llm-claude-context-gauge") as HTMLElement | null,
+                );
+              } else if (typeof usageRecord.totalTokens === "number" && usageRecord.totalTokens > 0) {
+                const total = deps.accumulateSessionTokens(
+                  conversationKey,
+                  usageRecord.totalTokens,
+                );
+                deps.setTokenUsage(ui.tokenUsageEl, total);
+              }
+            }
+            break;
+          }
+          case "status": {
+            const isCompactingStatus = /compacting context/i.test(event.text);
+            if (
+              !isCompactingStatus &&
+              !assistantMessage.agentRunId &&
+              assistantMessage.pendingAgentTraceEvents
+            ) {
+              assistantMessage.pendingAgentTraceEvents.push({
+                runId: "pending",
+                seq: assistantMessage.pendingAgentTraceEvents.length + 1,
+                eventType: event.type,
+                payload: event,
+                createdAt: Date.now(),
+              });
+            }
+            setStatusSafely(event.text, "sending");
+            if (isCompactingStatus) {
+              assistantMessage.pendingAgentTraceEvents = undefined;
+              queueRefresh();
+            }
+            break;
+          }
+          case "reasoning": {
+            if (event.summary) {
+              assistantMessage.reasoningSummary = deps.appendReasoningPart(
+                assistantMessage.reasoningSummary,
+                event.summary,
+              );
+            }
+            if (event.details) {
+              assistantMessage.reasoningDetails = deps.appendReasoningPart(
+                assistantMessage.reasoningDetails,
+                event.details,
+              );
+            }
+            queueRefresh();
+            return;
+          }
           case "fallback":
+            if (assistantMessage.text === "Compacting context…") {
+              assistantMessage.text = "";
+            }
             setStatusSafely(event.reason, "sending");
             break;
-          case "message_delta":
-            assistantMessage.text += deps.sanitizeText(event.text);
-            break;
+          case "confirmation_required":
+            showInlineConfirmationCard(body, ui, event.requestId, event.action);
+            queueRefresh();
+            body.ownerDocument?.defaultView?.setTimeout(() => {
+              showInlineConfirmationCard(body, ui, event.requestId, event.action);
+            }, 90);
+            setStatusSafely("Approval required", "sending");
+            return;
+          case "confirmation_resolved":
+            closeInlineConfirmationCard(body, ui, event.requestId);
+            queueRefresh();
+            setStatusSafely(event.approved ? "Approval sent" : "Action denied", "sending");
+            return;
+          case "message_delta": {
+            assistantMessage.pendingFinalText =
+              `${assistantMessage.pendingFinalText || ""}${deps.sanitizeText(event.text)}`;
+            assistantMessage.text = assistantMessage.pendingFinalText || assistantMessage.text;
+            queueRefresh();
+            return;
+          }
           case "message_rollback":
             if (typeof event.length === "number" && event.length > 0) {
-              assistantMessage.text = assistantMessage.text.slice(
+              assistantMessage.pendingFinalText = (assistantMessage.pendingFinalText || "").slice(
                 0,
-                Math.max(0, assistantMessage.text.length - event.length),
+                Math.max(0, (assistantMessage.pendingFinalText || "").length - event.length),
               );
+              if (isClaudeBlockStreamingEnabled()) {
+                assistantMessage.text = assistantMessage.pendingFinalText || "";
+                queueRefresh();
+              }
             }
-            break;
-          case "usage":
-            if (ui.tokenUsageEl && event.totalTokens > 0) {
-              const total = deps.accumulateSessionTokens(
-                conversationKey,
-                event.totalTokens,
-              );
-              deps.setTokenUsage(ui.tokenUsageEl, total);
-            }
-            break;
+            return;
+          case "context_compacted": {
+            const compactMarker: Message = {
+              role: "assistant",
+              text: event.automatic ? "Context compacted automatically" : "Conversation compacted",
+              timestamp: Date.now(),
+              runMode: "agent",
+              compactMarker: true,
+              modelName: assistantMessage.modelName,
+              modelEntryId: assistantMessage.modelEntryId,
+              modelProviderLabel: assistantMessage.modelProviderLabel,
+            };
+            const insertIndex = Math.max(0, history.indexOf(assistantMessage));
+            history.splice(insertIndex, 0, compactMarker);
+            await deps.persistConversationMessage(conversationKey, {
+              role: "assistant",
+              text: compactMarker.text,
+              timestamp: compactMarker.timestamp,
+              runMode: "agent",
+              modelName: compactMarker.modelName,
+              modelEntryId: compactMarker.modelEntryId,
+              modelProviderLabel: compactMarker.modelProviderLabel,
+              compactMarker: true,
+            });
+            refreshChatSafely();
+            scheduleQueueDrain?.();
+            await deps.waitForUiStep();
+            return;
+          }
           case "final":
-            if (!assistantMessage.text.trim()) {
-              assistantMessage.text = deps.sanitizeText(event.text);
-            }
+            assistantMessage.text =
+              deps.sanitizeText(event.text) ||
+              assistantMessage.pendingFinalText ||
+              assistantMessage.text;
+            assistantMessage.pendingFinalText = undefined;
             assistantMessage.streaming = false;
+            scheduleQueueDrain?.();
             break;
           default:
             break;
-        }
-        if (event.type === "message_delta" || event.type === "message_rollback") {
-          queueRefresh();
-          return;
         }
         refreshChatSafely();
         await deps.waitForUiStep();
@@ -773,14 +1310,38 @@ export async function retryAgentTurn(
     assistantMessage.agentRunId = outcome.runId;
     assistantMessage.runMode = "agent";
     const finalOutcomeText =
-      outcome.kind === "completed" ? outcome.text : assistantMessage.text;
+      outcome.kind === "completed"
+        ? outcome.text
+        : assistantMessage.pendingFinalText || assistantMessage.text;
     assistantMessage.text =
       deps.sanitizeText(finalOutcomeText) ||
+      assistantMessage.pendingFinalText ||
       assistantMessage.text ||
       "No response.";
+    assistantMessage.pendingFinalText = undefined;
+    assistantMessage.waitingAnimationStartedAt = undefined;
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
+    if (deps.getConversationSystem?.() === "claude_code") {
+      const conversationKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      await captureClaudeSessionInfo(
+        conversationKey,
+        buildClaudeScope({
+          libraryID: Number(item.libraryID || baseItem?.libraryID || 0),
+          kind: conversationKind === "global" ? "global" : "paper",
+          paperItemID:
+            conversationKind === "paper"
+              ? Number(baseItem?.id || 0) || undefined
+              : undefined,
+          paperTitle:
+            conversationKind === "paper"
+              ? String(baseItem?.getField?.("title") || "").trim() || undefined
+              : undefined,
+        }),
+      ).catch(() => null);
+    }
     setStatusSafely("Ready", "ready");
   } catch (err) {
     const isCancelled =
@@ -792,14 +1353,19 @@ export async function retryAgentTurn(
       return;
     }
     const errMsg = (err as Error).message || "Error";
-    assistantMessage.text = `Error: ${errMsg}`;
+    const userFacingError =
+      errMsg.includes("[ede_diagnostic]") && errMsg.includes("last_content_type=none")
+        ? "The model returned an empty reply. Please retry."
+        : errMsg;
+    assistantMessage.text = `Error: ${userFacingError}`;
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
-    setStatusSafely(`Error: ${errMsg.slice(0, 40)}`, "error");
+    setStatusSafely(`Error: ${userFacingError.slice(0, 40)}`, "error");
   } finally {
+    deps.setPendingRequestId(conversationKey, 0);
     deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
     deps.setCurrentAbortController(conversationKey, null);
-    deps.setPendingRequestId(conversationKey, 0);
+    scheduleQueueDrain?.();
   }
 }

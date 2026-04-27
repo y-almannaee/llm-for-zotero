@@ -1,28 +1,45 @@
-import { config, GLOBAL_CONVERSATION_KEY_BASE } from "./constants";
+import { config, GLOBAL_CONVERSATION_KEY_BASE, isUpstreamGlobalConversationKey } from "./constants";
 import {
   activeContextPanels,
   activeContextPanelRawItems,
   activeContextPanelStateSync,
   activeGlobalConversationByLibrary,
   activePaperConversationByPaper,
+  selectedPaperContextCache,
+  selectedModelCache,
+  selectedReasoningCache,
+  getPendingRequestId,
+  setPendingRequestId,
+  setCancelledRequestId,
+  getAbortController,
+  setAbortController,
 } from "./state";
 import {
   resolveActiveLibraryID,
-  resolveActiveNoteSession,
+  resolveConversationSystemForItem,
   resolveDisplayConversationKind,
   resolveInitialPanelItemState,
   resolveConversationBaseItem,
   createGlobalPortalItem,
   createPaperPortalItem,
 } from "./portalScope";
-import { getLockedGlobalConversationKey, buildPaperStateKey } from "./prefHelpers";
-import { applyPanelFontScale } from "./prefHelpers";
+import {
+  applyPanelFontScale,
+  buildPaperStateKey,
+  getClaudeCodeModeEnabled,
+  getLastUsedPaperConversationKey,
+  getLockedGlobalConversationKey,
+  removeLastUsedPaperConversationKey,
+  setLockedGlobalConversationKey,
+} from "./prefHelpers";
 import { buildUI } from "./buildUI";
 import { setupHandlers, type SetupHandlersHooks } from "./setupHandlers";
+import { clearConversationSummary as clearConversationSummaryFromCache } from "./conversationSummaryCache";
 import {
   ensureConversationLoaded,
   getConversationKey,
   refreshChat,
+  resetSessionTokens,
 } from "./chat";
 import { renderShortcuts } from "./shortcuts";
 import { createElement, HTML_NS } from "../../utils/domHelpers";
@@ -34,17 +51,73 @@ import {
   clearConversation as clearStoredConversation,
   deleteGlobalConversation,
   deletePaperConversation,
+  getGlobalConversationUserTurnCount,
+  getLatestEmptyGlobalConversation,
+  getPaperConversation,
+  listPaperConversations,
+  loadConversation,
 } from "../../utils/chatStore";
 import { removeConversationAttachmentFiles } from "./attachmentStorage";
 import { clearOwnerAttachmentRefs } from "../../utils/attachmentRefStore";
 import { chatHistory, loadedConversationKeys } from "./state";
 import {
   loadConversationHistoryScope,
-  loadAllConversationHistory,
-  type ConversationHistoryScopeEntry,
 } from "./historyLoader";
-import { loadConversation } from "../../utils/chatStore";
 import { resolveStandalonePaperTabLabel } from "./standaloneTabLabel";
+import { resolvePaperContextRefFromItem } from "./paperAttribution";
+import {
+  buildDefaultClaudeGlobalConversationKey,
+} from "../../claudeCode/constants";
+import {
+  resolveRememberedClaudeConversationKey,
+  invalidateAllClaudeHotRuntimes,
+  refreshClaudeSlashCommands,
+} from "../../claudeCode/runtime";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
+import {
+  createClaudeProjectSkillTemplate,
+  deleteClaudeProjectSkillFile,
+  getClaudeProjectDir,
+  listClaudeProjectSkillEntries,
+} from "../../claudeCode/projectSkills";
+import { getCoreAgentRuntime } from "../../agent";
+import {
+  getConversationSystemPref,
+  getLastUsedClaudeConversationMode,
+  getLastUsedClaudeGlobalConversationKey,
+  getLastUsedClaudePaperConversationKey,
+  removeLastUsedClaudeGlobalConversationKey,
+  removeLastUsedClaudePaperConversationKey,
+  setConversationSystemPref,
+  setLastUsedClaudeConversationMode,
+} from "../../claudeCode/prefs";
+import {
+  activeClaudeGlobalConversationByLibrary,
+  activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
+  buildClaudePaperStateKey,
+} from "../../claudeCode/state";
+import {
+  createClaudeGlobalPortalItem,
+  createClaudePaperPortalItem,
+} from "../../claudeCode/portal";
+import {
+  clearClaudeConversation,
+  createClaudeGlobalConversation,
+  createClaudePaperConversation,
+  deleteClaudeConversation,
+  getClaudeConversationSummary,
+  listClaudeGlobalConversations,
+  listClaudePaperConversations,
+  loadClaudeConversation,
+  upsertClaudeConversationSummary,
+} from "../../claudeCode/store";
+import {
+  loadClaudeConversationHistoryScope,
+} from "../../claudeCode/historyLoader";
 
 type StandaloneSessionState = {
   pending: boolean;
@@ -147,16 +220,19 @@ function restoreEmbeddedPanelsAfterStandaloneClose(
   for (const [body] of activeContextPanels) {
     if (excludedBody && body === excludedBody) continue;
     if (!(body as Element).isConnected) {
+      void releaseClaudeRuntimeForBody(body as Element);
       activeContextPanels.delete(body);
       activeContextPanelRawItems.delete(body);
       activeContextPanelStateSync.delete(body);
       continue;
     }
     const rawItem = activeContextPanelRawItems.get(body as Element) || null;
-    const resolved = resolveInitialPanelItemState(rawItem);
+    const resolved = resolveInitialPanelItemState(rawItem, {
+      conversationSystem: resolveConversationSystemForItem(rawItem),
+    });
     buildUI(body as Element, resolved.item);
     activeContextPanels.set(body, () => resolved.item);
-    setupHandlers(body as Element, rawItem);
+    setupHandlers(body as Element, resolved.item || rawItem);
     void (async () => {
       try {
         if (resolved.item) await ensureConversationLoaded(resolved.item);
@@ -247,6 +323,8 @@ type SidebarConv = {
   lastActivityAt: number;
   title?: string;
   sessionVersion?: number;
+  paperItemID?: number;
+  mode?: "open" | "paper";
 };
 
 function getDayGroupLabel(ts: number): string {
@@ -304,7 +382,15 @@ export function openStandaloneChat(options?: {
   if (!mainWin) return;
 
   const sourceItem = options?.initialItem || null;
-  const resolvedSourceState = resolveInitialPanelItemState(sourceItem);
+  const sourceConversationSystem = sourceItem
+    ? resolveConversationSystemForItem(sourceItem) || "upstream"
+    : getConversationSystemPref() === "claude_code"
+      ? "claude_code"
+      : "upstream";
+  let currentConversationSystem: "upstream" | "claude_code" = sourceConversationSystem;
+  const resolvedSourceState = resolveInitialPanelItemState(sourceItem, {
+    conversationSystem: sourceConversationSystem,
+  });
   const initialBasePaperItem =
     resolvedSourceState.basePaperItem ||
     resolveConversationBaseItem(sourceItem) ||
@@ -312,14 +398,8 @@ export function openStandaloneChat(options?: {
   const initialDisplayConversationKind = resolveDisplayConversationKind(
     resolvedSourceState.item || sourceItem,
   );
-  // Determine initial mode: if a paper context is available, default to paper
-  // even when resolveDisplayConversationKind returns null (e.g. raw attachment).
-  const initialMode: "open" | "paper" =
-    initialDisplayConversationKind === "paper"
-      ? "paper"
-      : initialBasePaperItem
-        ? "paper"
-        : "open";
+  const isClaudeConversationSystem = () =>
+    currentConversationSystem === "claude_code";
   const initialLibraryID =
     Number(
       resolvedSourceState.item?.libraryID ||
@@ -328,14 +408,44 @@ export function openStandaloneChat(options?: {
         1,
     ) || 1;
 
-  // Resolve which global conversation to show
   const libraryID = initialLibraryID > 0 ? Math.floor(initialLibraryID) : 1;
-  const lockedKey = getLockedGlobalConversationKey(libraryID);
-  const conversationKey =
-    lockedKey ??
-    activeGlobalConversationByLibrary.get(libraryID) ??
-    GLOBAL_CONVERSATION_KEY_BASE;
-  const globalPortalItem = createGlobalPortalItem(libraryID, conversationKey);
+  const initialRememberedClaudeMode =
+    sourceConversationSystem === "claude_code"
+      ? getLastUsedClaudeConversationMode(libraryID)
+      : null;
+  const initialMode: "open" | "paper" =
+    initialDisplayConversationKind === "paper"
+      ? "paper"
+      : initialDisplayConversationKind === "global"
+        ? "open"
+        : initialRememberedClaudeMode === "global"
+          ? "open"
+          : initialBasePaperItem
+            ? "paper"
+            : "open";
+  const lockedKey = isClaudeConversationSystem()
+    ? null
+    : getLockedGlobalConversationKey(libraryID);
+  const sourceClaudeGlobalKey =
+    resolvedSourceState.item &&
+    (resolvedSourceState.item as any).__llmClaudeGlobalPortalItem === true
+      ? Number(resolvedSourceState.item.id || 0)
+      : sourceItem && (sourceItem as any).__llmClaudeGlobalPortalItem === true
+        ? Number(sourceItem.id || 0)
+        : 0;
+  const conversationKey = isClaudeConversationSystem()
+    ? sourceClaudeGlobalKey > 0
+      ? sourceClaudeGlobalKey
+      : resolveRememberedClaudeConversationKey({
+            libraryID,
+            kind: "global",
+          }) || buildDefaultClaudeGlobalConversationKey(libraryID)
+    : lockedKey ??
+      activeGlobalConversationByLibrary.get(libraryID) ??
+      GLOBAL_CONVERSATION_KEY_BASE;
+  const globalPortalItem = isClaudeConversationSystem()
+    ? createClaudeGlobalPortalItem(libraryID, conversationKey)
+    : createGlobalPortalItem(libraryID, conversationKey);
   const initialPaperItem =
     initialMode === "paper"
       ? resolvedSourceState.item || initialBasePaperItem
@@ -374,12 +484,14 @@ export function openStandaloneChat(options?: {
   let currentBasePaperItem: Zotero.Item | null = initialBasePaperItem;
   let isInWebChatMode = false;
   let currentChatHooks: SetupHandlersHooks | null = null;
+  let standaloneSidebarRenderQueued = false;
   let themeObserver: {
     observe(target: Node, options: MutationObserverInit): void;
     disconnect(): void;
   } | null = null;
   let darkMQ: MediaQueryList | null = null;
   let onSchemeChange: (() => void) | null = null;
+  let cleanupStandalonePrefObserver: (() => void) | null = null;
 
   const initWindow = () => {
     // Now the window is loaded — safe to clear the pending flag.
@@ -474,6 +586,21 @@ export function openStandaloneChat(options?: {
       katexCSS.href = `chrome://${config.addonRef}/content/vendor/katex/katex.min.css`;
       doc.documentElement?.appendChild(katexCSS);
 
+      const rerenderStandaloneShellAfterStylesReady = () => {
+        if (cancelled || newWin.closed) return;
+        const mountedItem = activeItem;
+        if (!mountedItem) return;
+        const llmMain = contentArea.querySelector("#llm-main") as HTMLElement | null;
+        applyPanelFontScale(llmMain);
+        applyPanelFontScale(root);
+        const shortcutMode = standaloneMode === "open" ? "library" : "paper";
+        void renderShortcuts(contentArea, mountedItem, shortcutMode);
+        refreshChat(contentArea, mountedItem);
+      };
+      mainCSS.addEventListener("load", rerenderStandaloneShellAfterStylesReady, {
+        once: true,
+      });
+
       // Mount into the root div
       const root = doc.getElementById(
         "llmforzotero-standalone-chat-root",
@@ -529,9 +656,28 @@ export function openStandaloneChat(options?: {
       tabGroup.className = "llm-standalone-tab-group";
       tabGroup.append(paperTab, openTab);
 
+      const systemToggleBtn = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      systemToggleBtn.className = "llm-standalone-claude-toggle";
+      systemToggleBtn.type = "button";
+      systemToggleBtn.setAttribute("aria-label", "Claude Code");
+
+      const updateStandaloneSystemToggle = () => {
+        const enabled = getClaudeCodeModeEnabled() && !isInWebChatMode;
+        systemToggleBtn.style.display = enabled ? "inline-flex" : "none";
+        const active = isClaudeConversationSystem();
+        systemToggleBtn.dataset.active = active ? "true" : "false";
+        systemToggleBtn.title = active ? "Switch to upstream mode" : "Switch to Claude Code mode";
+        systemToggleBtn.innerHTML = active
+          ? `<svg height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z" fill="#D97757" fill-rule="evenodd"></path></svg>`
+          : `<svg fill="currentColor" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"></path></svg>`;
+      };
+
       const tabRow = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
       tabRow.className = "llm-standalone-tab-row";
-      tabRow.append(tabGroup);
+      tabRow.append(systemToggleBtn, tabGroup);
 
       // -- Lower area: sidebar + content side by side --
       const lowerArea = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
@@ -697,6 +843,19 @@ export function openStandaloneChat(options?: {
         "div",
       ) as HTMLDivElement;
       contentTitleBar.className = "llm-standalone-content-title";
+
+      const contentTitleText = doc.createElementNS(
+        HTML_NS,
+        "span",
+      ) as HTMLSpanElement;
+      contentTitleText.className = "llm-standalone-content-title-text";
+
+      const contentTitleBarSpacer = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      contentTitleBarSpacer.className = "llm-standalone-content-title-actions";
+      contentTitleBar.append(contentTitleText, contentTitleBarSpacer);
 
       const contentArea = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
       contentArea.className = "llm-standalone-content";
@@ -878,9 +1037,18 @@ export function openStandaloneChat(options?: {
 
       const getSelectedZoteroItem = (): Zotero.Item | null => {
         try {
-          const pane = Zotero.getActiveZoteroPane?.() as any;
-          const items = pane?.getSelectedItems?.();
-          return items?.[0] || null;
+          const activePane = Zotero.getActiveZoteroPane?.() as any;
+          const activeItems = activePane?.getSelectedItems?.();
+          if (activeItems?.[0]) {
+            return activeItems[0];
+          }
+        } catch {
+          void 0;
+        }
+        try {
+          const mainPane = (mainWin as any)?.ZoteroPane;
+          const mainItems = mainPane?.getSelectedItems?.();
+          return mainItems?.[0] || null;
         } catch {
           return null;
         }
@@ -891,6 +1059,50 @@ export function openStandaloneChat(options?: {
           paperSlotItem: currentPaperItem,
           isWebChat: isInWebChatMode,
         });
+      };
+
+      const getCurrentLibraryScopeID = (): number => {
+        const activeLibraryID = Number(activeItem?.libraryID || 0);
+        if (Number.isFinite(activeLibraryID) && activeLibraryID > 0) {
+          return Math.floor(activeLibraryID);
+        }
+        const paperLibraryID = Number(
+          currentBasePaperItem?.libraryID || currentPaperItem?.libraryID || 0,
+        );
+        if (Number.isFinite(paperLibraryID) && paperLibraryID > 0) {
+          return Math.floor(paperLibraryID);
+        }
+        return libraryID;
+      };
+
+      const getCurrentPaperLibraryID = (): number => {
+        const value = Number(
+          currentBasePaperItem?.libraryID ||
+            currentPaperItem?.libraryID ||
+            getCurrentLibraryScopeID(),
+        );
+        return Number.isFinite(value) && value > 0
+          ? Math.floor(value)
+          : getCurrentLibraryScopeID();
+      };
+
+      const ensureClaudeConversationCatalogEntry = async (params: {
+        conversationKey: number;
+        libraryID: number;
+        kind: "global" | "paper";
+        paperItemID?: number;
+      }) => {
+        const existing = await getClaudeConversationSummary(params.conversationKey);
+        if (existing) return existing;
+        await upsertClaudeConversationSummary({
+          conversationKey: params.conversationKey,
+          libraryID: params.libraryID,
+          kind: params.kind,
+          paperItemID: params.paperItemID,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        return getClaudeConversationSummary(params.conversationKey);
       };
 
       // -----------------------------------------------------------------------
@@ -933,7 +1145,7 @@ export function openStandaloneChat(options?: {
           void renderWebChatSidebar();
         } else {
           sidebarTitle.textContent = t("History");
-          void renderSidebar();
+          scheduleStandaloneSidebarRender();
         }
       };
 
@@ -1172,23 +1384,56 @@ export function openStandaloneChat(options?: {
           try {
             const title =
               (currentBasePaperItem as any).getField?.("title") || "";
-            contentTitleBar.textContent = title || "Paper chat";
+            contentTitleText.textContent = title || "Paper chat";
           } catch {
-            contentTitleBar.textContent = "Paper chat";
+            contentTitleText.textContent = "Paper chat";
           }
         } else {
-          contentTitleBar.textContent = "Library chat";
+          contentTitleText.textContent = "Library chat";
         }
       };
 
-      const mountChatPanel = (item: Zotero.Item) => {
-        try {
-          activeItem = item;
-          activeConversationKey = getConversationKey(item);
+      const buildStandalonePortalItem = (params: {
+        mode: "open" | "paper";
+        conversationKey: number;
+        paperItem?: Zotero.Item | null;
+        sessionVersion?: number;
+      }): Zotero.Item | null => {
+        if (params.mode === "open") {
+          return isClaudeConversationSystem()
+            ? (createClaudeGlobalPortalItem(getCurrentLibraryScopeID(), params.conversationKey) as Zotero.Item)
+            : createGlobalPortalItem(getCurrentLibraryScopeID(), params.conversationKey);
+        }
+        if (!params.paperItem) return null;
+        return isClaudeConversationSystem()
+          ? (createClaudePaperPortalItem(params.paperItem, params.conversationKey) as Zotero.Item)
+          : createPaperPortalItem(
+              params.paperItem,
+              params.conversationKey,
+              params.sessionVersion || 1,
+            );
+      };
 
-          // Pre-seed the shared paper conversation state so that
-          // resolveInitialPanelItemState inside setupHandlers resolves to the
-          // same conversation the caller explicitly targeted.
+      const scheduleStandaloneSidebarRender = () => {
+        if (cancelled || standaloneSidebarRenderQueued) return;
+        standaloneSidebarRenderQueued = true;
+        newWin.setTimeout(() => {
+          standaloneSidebarRenderQueued = false;
+          void renderSidebar();
+        }, 0);
+      };
+
+      const mountChatPanel = (nextItem: Zotero.Item) => {
+        const resolvedState = resolveInitialPanelItemState(nextItem, {
+          conversationSystem: currentConversationSystem,
+        });
+        const mountedItem = resolvedState.item || nextItem;
+        try {
+          activeItem = mountedItem;
+          currentConversationSystem =
+            resolveConversationSystemForItem(mountedItem) || currentConversationSystem;
+          activeConversationKey = getConversationKey(mountedItem);
+
           if (standaloneMode === "paper" && currentBasePaperItem) {
             const paperItemID = Number(currentBasePaperItem.id || 0);
             if (paperItemID > 0) {
@@ -1202,7 +1447,7 @@ export function openStandaloneChat(options?: {
           clearContent();
           updateContentTitle();
 
-          buildUI(contentArea, item);
+          buildUI(contentArea, mountedItem);
 
           // The left tab represents the preserved paper-side slot, so do not
           // derive its label from a mounted global portal item.
@@ -1214,29 +1459,27 @@ export function openStandaloneChat(options?: {
           if (llmMain) llmMain.dataset.standalone = "true";
 
           activeContextPanels.set(contentArea, () => activeItem);
-          activeContextPanelRawItems.set(contentArea, null);
+          activeContextPanelRawItems.set(contentArea, mountedItem);
+          void retainClaudeRuntimeForBody(contentArea, mountedItem);
           const chatHooks: SetupHandlersHooks = {
             onConversationHistoryChanged: () => {
               if (cancelled) return;
-              void renderSidebar();
+              scheduleStandaloneSidebarRender();
             },
             onWebChatModeChanged: (isWebChat) => {
               if (cancelled) return;
               updateStandaloneWebChatUI(isWebChat);
             },
           };
-          setupHandlers(contentArea, item as any, chatHooks);
+          setupHandlers(contentArea, mountedItem as any, chatHooks);
           // Store hooks reference so webchat load handlers can call clearWebChatNewChatIntent
           currentChatHooks = chatHooks;
 
-          refreshChat(contentArea, item);
+          refreshChat(contentArea, mountedItem);
           applyPanelFontScale(llmMain);
           applyPanelFontScale(root);
-          const shortcutMode =
-            resolveDisplayConversationKind(item) === "global"
-              ? "library"
-              : "paper";
-          void renderShortcuts(contentArea, item, shortcutMode);
+          const shortcutMode = standaloneMode === "open" ? "library" : "paper";
+          void renderShortcuts(contentArea, mountedItem, shortcutMode);
         } catch (err) {
           ztoolkit.log("LLM: standalone mountChatPanel sync failed", err);
         }
@@ -1244,11 +1487,11 @@ export function openStandaloneChat(options?: {
         void (async () => {
           try {
             if (cancelled) return;
-            await ensureConversationLoaded(item);
+            await ensureConversationLoaded(mountedItem);
             if (cancelled) return;
-            refreshChat(contentArea, item);
+            refreshChat(contentArea, mountedItem);
             // Refresh sidebar after conversation is confirmed loaded
-            void renderSidebar();
+            scheduleStandaloneSidebarRender();
           } catch (err) {
             ztoolkit.log("LLM: standalone mount async failed", err);
           }
@@ -1331,21 +1574,44 @@ export function openStandaloneChat(options?: {
         );
         try {
           if (standaloneMode === "open") {
-            // Ensure the active conversation has a DB row so it appears in listings
-            await ensureGlobalConversationExists(
-              libraryID,
-              activeConversationKey,
-            );
-            const conversations = await loadConversationHistoryScope({
-              mode: "open",
-              libraryID,
-              limit: 50,
-            });
+            let conversations: SidebarConv[];
+            if (isClaudeConversationSystem()) {
+              if (activeConversationKey > 0) {
+                await ensureClaudeConversationCatalogEntry({
+                  conversationKey: activeConversationKey,
+                  libraryID: getCurrentLibraryScopeID(),
+                  kind: "global",
+                });
+              }
+              conversations = (await loadClaudeConversationHistoryScope({
+                libraryID: getCurrentLibraryScopeID(),
+                kind: "global",
+                limit: 50,
+              })).map((entry) => ({
+                conversationKey: entry.conversationKey,
+                lastActivityAt: entry.lastActivityAt,
+                title: entry.title,
+                mode: "open" as const,
+              }));
+            } else {
+              await ensureGlobalConversationExists(getCurrentLibraryScopeID(), activeConversationKey);
+              conversations = (await loadConversationHistoryScope({
+                mode: "open",
+                libraryID: getCurrentLibraryScopeID(),
+                limit: 50,
+              })).map((entry) => ({
+                conversationKey: entry.conversationKey,
+                lastActivityAt: entry.lastActivityAt,
+                title: entry.title,
+                sessionVersion: entry.sessionVersion,
+                paperItemID: entry.paperItemID,
+                mode: entry.mode,
+              }));
+            }
             if (cancelled) return;
             sidebarTitle.textContent = t("History");
             renderSidebarItems(conversations);
           } else {
-            // Paper chat — list conversations for the current paper
             if (!currentBasePaperItem) {
               ztoolkit.log(
                 "LLM: standalone renderSidebar paper mode — currentBasePaperItem is null",
@@ -1363,16 +1629,43 @@ export function openStandaloneChat(options?: {
               "paperID=" + paperID,
               "libraryID=" + paperLibID,
             );
-            const conversations = await loadConversationHistoryScope({
-              mode: "paper",
-              libraryID: paperLibID,
-              paperItemID: paperID,
-              limit: 50,
-            });
-            ztoolkit.log(
-              "LLM: standalone renderSidebar paper results",
-              "count=" + conversations.length,
-            );
+            let conversations: SidebarConv[];
+            if (isClaudeConversationSystem()) {
+              if (activeConversationKey > 0) {
+                await ensureClaudeConversationCatalogEntry({
+                  conversationKey: activeConversationKey,
+                  libraryID: paperLibID,
+                  kind: "paper",
+                  paperItemID: paperID,
+                });
+              }
+              conversations = (await loadClaudeConversationHistoryScope({
+                libraryID: paperLibID,
+                kind: "paper",
+                paperItemID: paperID,
+                limit: 50,
+              })).map((entry) => ({
+                conversationKey: entry.conversationKey,
+                lastActivityAt: entry.lastActivityAt,
+                title: entry.title,
+                paperItemID: entry.paperItemID,
+                mode: "paper" as const,
+              }));
+            } else {
+              conversations = (await loadConversationHistoryScope({
+                mode: "paper",
+                libraryID: paperLibID,
+                paperItemID: paperID,
+                limit: 50,
+              })).map((entry) => ({
+                conversationKey: entry.conversationKey,
+                lastActivityAt: entry.lastActivityAt,
+                title: entry.title,
+                sessionVersion: entry.sessionVersion,
+                paperItemID: entry.paperItemID,
+                mode: entry.mode,
+              }));
+            }
             if (cancelled) return;
             sidebarTitle.textContent = t("History");
             renderSidebarItems(conversations);
@@ -1437,7 +1730,7 @@ export function openStandaloneChat(options?: {
       };
 
       const renderSearchResults = (
-        entries: ConversationHistoryScopeEntry[],
+        entries: SidebarConv[],
         query: string,
       ) => {
         searchResults.textContent = "";
@@ -1452,17 +1745,9 @@ export function openStandaloneChat(options?: {
           return;
         }
 
-        const groups = groupByDay(
-          entries.map((e) => ({
-            conversationKey: e.conversationKey,
-            lastActivityAt: e.lastActivityAt,
-            title: e.title,
-            sessionVersion: e.sessionVersion,
-          })),
-        );
+        const groups = groupByDay(entries);
 
-        // Build a map for quick lookup by conversationKey
-        const entryMap = new Map<number, ConversationHistoryScopeEntry>();
+        const entryMap = new Map<number, SidebarConv>();
         for (const e of entries) entryMap.set(e.conversationKey, e);
 
         for (const group of groups) {
@@ -1493,19 +1778,23 @@ export function openStandaloneChat(options?: {
               btn.dataset.sessionVersion = String(entry.sessionVersion);
             }
 
+            const textWrap = doc.createElementNS(
+              HTML_NS,
+              "div",
+            ) as HTMLDivElement;
+            textWrap.className = "llm-standalone-search-text";
+
             const label = doc.createElementNS(
               HTML_NS,
               "span",
             ) as HTMLSpanElement;
             label.className = "llm-standalone-search-label";
-            label.dataset.labelType =
-              entry.mode === "paper" ? "paper" : "library";
-            const labelText =
-              entry.mode === "paper"
-                ? resolvePaperLabel(entry.paperItemID)
-                : t("Library chat");
-            label.textContent =
-              entry.mode === "paper" ? labelText : t("Library chat");
+            const isPaperEntry = entry.mode === "paper";
+            label.dataset.labelType = isPaperEntry ? "paper" : "library";
+            const labelText = isPaperEntry
+              ? resolvePaperLabel(entry.paperItemID)
+              : t("Library chat");
+            label.textContent = labelText;
 
             const title = doc.createElementNS(
               HTML_NS,
@@ -1514,7 +1803,8 @@ export function openStandaloneChat(options?: {
             title.className = "llm-standalone-search-title";
             title.textContent = entry.title || t("Untitled chat");
 
-            btn.append(label, title);
+            textWrap.append(label, title);
+            btn.append(textWrap);
             btn.title = `${labelText}: ${entry.title || t("Untitled chat")}`;
             searchResults.appendChild(btn);
           }
@@ -1524,10 +1814,72 @@ export function openStandaloneChat(options?: {
       const runSearch = async (query: string) => {
         const thisSeq = ++searchSeq;
         try {
-          const allEntries = await loadAllConversationHistory({
-            libraryID,
-            limit: 100,
-          });
+          const allEntries: SidebarConv[] = await (async () => {
+            if (isClaudeConversationSystem()) {
+              if (standaloneMode === "open") {
+                return (await loadClaudeConversationHistoryScope({
+                  libraryID: getCurrentLibraryScopeID(),
+                  kind: "global",
+                  limit: 100,
+                })).map((entry) => ({
+                  conversationKey: entry.conversationKey,
+                  lastActivityAt: entry.lastActivityAt,
+                  title: entry.title,
+                  paperItemID: entry.paperItemID,
+                  mode: entry.kind === "paper" ? "paper" : "open",
+                }));
+              }
+              const paperID = Number(currentBasePaperItem?.id || 0);
+              const paperLibID = Number(currentBasePaperItem?.libraryID || getCurrentLibraryScopeID());
+              if (!Number.isFinite(paperID) || paperID <= 0 || !Number.isFinite(paperLibID) || paperLibID <= 0) {
+                return [];
+              }
+              return (await loadClaudeConversationHistoryScope({
+                libraryID: paperLibID,
+                kind: "paper",
+                paperItemID: paperID,
+                limit: 100,
+              })).map((entry) => ({
+                conversationKey: entry.conversationKey,
+                lastActivityAt: entry.lastActivityAt,
+                title: entry.title,
+                paperItemID: entry.paperItemID,
+                mode: entry.kind === "paper" ? "paper" : "open",
+              }));
+            }
+            if (standaloneMode === "open") {
+              return (await loadConversationHistoryScope({
+                mode: "open",
+                libraryID: getCurrentLibraryScopeID(),
+                limit: 100,
+              })).map((entry) => ({
+                conversationKey: entry.conversationKey,
+                lastActivityAt: entry.lastActivityAt,
+                title: entry.title,
+                sessionVersion: entry.sessionVersion,
+                paperItemID: entry.paperItemID,
+                mode: entry.mode,
+              }));
+            }
+            const paperID = Number(currentBasePaperItem?.id || 0);
+            const paperLibID = Number(currentBasePaperItem?.libraryID || getCurrentLibraryScopeID());
+            if (!Number.isFinite(paperID) || paperID <= 0 || !Number.isFinite(paperLibID) || paperLibID <= 0) {
+              return [];
+            }
+            return (await loadConversationHistoryScope({
+              mode: "paper",
+              libraryID: paperLibID,
+              paperItemID: paperID,
+              limit: 100,
+            })).map((entry) => ({
+              conversationKey: entry.conversationKey,
+              lastActivityAt: entry.lastActivityAt,
+              title: entry.title,
+              sessionVersion: entry.sessionVersion,
+              paperItemID: entry.paperItemID,
+              mode: entry.mode,
+            }));
+          })();
           if (thisSeq !== searchSeq || cancelled) return;
 
           if (!query.trim()) {
@@ -1556,7 +1908,7 @@ export function openStandaloneChat(options?: {
             (e) => !titleMatchKeys.has(e.conversationKey),
           );
 
-          const contentMatches: ConversationHistoryScopeEntry[] = [];
+          const contentMatches: SidebarConv[] = [];
           for (const entry of entriesToSearch) {
             if (thisSeq !== searchSeq || cancelled) return;
 
@@ -1564,11 +1916,16 @@ export function openStandaloneChat(options?: {
               searchDocCache.get(entry.conversationKey);
             if (!doc_) {
               try {
-                const messages = await loadConversation(
-                  entry.conversationKey,
-                  200,
-                );
-                const messageText = messages.map((m) => m.text || "").join(" ");
+                const messages = isClaudeConversationSystem()
+                  ? await loadClaudeConversation(
+                      entry.conversationKey,
+                      200,
+                    )
+                  : await loadConversation(
+                      entry.conversationKey,
+                      200,
+                    );
+                const messageText = messages.map((m: any) => m.text || "").join(" ");
                 doc_ = { title: entry.title || "", messages: messageText };
                 searchDocCache.set(entry.conversationKey, doc_);
               } catch {
@@ -1585,8 +1942,15 @@ export function openStandaloneChat(options?: {
 
           if (thisSeq !== searchSeq || cancelled) return;
 
-          // Merge title matches + content matches
-          const allMatches = [...titleMatches, ...contentMatches];
+          // Merge title matches + content matches, dedup by conversationKey
+          const dedupedMatches = new Map<number, SidebarConv>();
+          for (const entry of [...titleMatches, ...contentMatches]) {
+            const existing = dedupedMatches.get(entry.conversationKey);
+            if (!existing || entry.lastActivityAt > existing.lastActivityAt) {
+              dedupedMatches.set(entry.conversationKey, entry);
+            }
+          }
+          const allMatches: SidebarConv[] = Array.from(dedupedMatches.values());
           allMatches.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
           renderSearchResults(allMatches, query);
         } catch (err) {
@@ -1653,7 +2017,13 @@ export function openStandaloneChat(options?: {
             ) as Zotero.Item | null;
             if (paperItem) {
               const sv = sessionVersion > 0 ? sessionVersion : 1;
-              const portalItem = createPaperPortalItem(paperItem, convKey, sv);
+              const portalItem = buildStandalonePortalItem({
+                mode: "paper",
+                conversationKey: convKey,
+                paperItem,
+                sessionVersion: sv,
+              });
+              if (!portalItem) return;
               standaloneMode = "paper";
               currentPaperItem = paperItem;
               currentBasePaperItem = paperItem;
@@ -1666,7 +2036,11 @@ export function openStandaloneChat(options?: {
             standaloneMode = "open";
             paperTab.classList.remove("active");
             openTab.classList.add("active");
-            const portalItem = createGlobalPortalItem(libraryID, convKey);
+            const portalItem = buildStandalonePortalItem({
+              mode: "open",
+              conversationKey: convKey,
+            });
+            if (!portalItem) return;
             mountChatPanel(portalItem);
           }
         } catch (err) {
@@ -1690,11 +2064,48 @@ export function openStandaloneChat(options?: {
         setUserSkills(skills);
       };
 
+      const reloadClaudeProjectCommands = async () => {
+        try {
+          await refreshClaudeSlashCommands(getCoreAgentRuntime(), true);
+        } catch (err) {
+          ztoolkit.log("LLM: Claude project command refresh failed", err);
+        }
+      };
+
+      const resolveSkillPopupSystem = (): "upstream" | "claude_code" =>
+        resolveConversationSystemForItem(activeItem) === "claude_code"
+          ? "claude_code"
+          : "upstream";
+
+      let skillRenderSeq = 0;
       const renderSkillGrid = async () => {
-        const { getSkillListing } =
-          await import("../../agent/skills/userSkills");
-        const entries = await getSkillListing();
-        skillGrid.textContent = "";
+        const renderSeq = ++skillRenderSeq;
+        const skillSystem = resolveSkillPopupSystem();
+        const isClaudeMode = skillSystem === "claude_code";
+        try {
+          const entries: Array<{
+            filePath: string;
+            openPath?: string;
+            filename: string;
+            description: string;
+            source: "system" | "customized" | "personal";
+            managedBlockOutdated?: boolean;
+            shippedVersion?: number | null;
+            version?: number;
+            id?: string;
+          }> = isClaudeMode
+            ? (await listClaudeProjectSkillEntries()).map((entry) => ({
+                filePath: entry.filePath,
+                openPath: entry.openPath,
+                filename: `/${entry.name}`,
+                description: entry.description,
+                source: "personal" as const,
+              }))
+            : await (await import("../../agent/skills/userSkills")).getSkillListing();
+          if (renderSeq !== skillRenderSeq || skillSystem !== resolveSkillPopupSystem()) {
+            return;
+          }
+          skillGrid.textContent = "";
 
         // "+" add button — first grid item
         const addBtn = doc.createElementNS(
@@ -1714,9 +2125,9 @@ export function openStandaloneChat(options?: {
         addLabel.textContent = t("New skill");
         addBtn.append(addIcon, addLabel);
         addBtn.addEventListener("click", async () => {
-          const { createSkillTemplate } =
-            await import("../../agent/skills/userSkills");
-          const filePath = await createSkillTemplate();
+          const filePath = isClaudeMode
+            ? await createClaudeProjectSkillTemplate()
+            : await (await import("../../agent/skills/userSkills")).createSkillTemplate();
           if (filePath) {
             try {
               (
@@ -1725,7 +2136,11 @@ export function openStandaloneChat(options?: {
             } catch {
               /* */
             }
-            await reloadRuntimeSkills();
+            if (isClaudeMode) {
+              await reloadClaudeProjectCommands();
+            } else {
+              await reloadRuntimeSkills();
+            }
             void renderSkillGrid();
           }
         });
@@ -1760,16 +2175,17 @@ export function openStandaloneChat(options?: {
           item.append(icon, label);
 
           // Tooltip summarizes source + available actions
-          const tooltipLines = [entry.description || entry.id, ""];
+          const tooltipLines = [entry.description || entry.filename, ""];
           if (entry.source === "system") {
-            tooltipLines.push(`Shipped built-in (v${entry.version})`);
+            tooltipLines.push(`Shipped built-in (v${entry.version ?? 0})`);
           } else if (entry.source === "customized") {
+            const shippedVersion = entry.shippedVersion ?? null;
+            const version = entry.version ?? 0;
             tooltipLines.push(
               entry.managedBlockOutdated
-                ? `Customized — shipped v${entry.shippedVersion} uses a new format. Right-click → Restore to default to adopt it (overwrites your edits).`
-                : entry.shippedVersion !== null &&
-                    entry.version < entry.shippedVersion
-                  ? `Customized — shipped v${entry.shippedVersion} available. Right-click → Restore to default to adopt it.`
+                ? `Customized — shipped v${shippedVersion ?? "unknown"} uses a new format. Right-click → Restore to default to adopt it (overwrites your edits).`
+                : typeof shippedVersion === "number" && version < shippedVersion
+                  ? `Customized — shipped v${shippedVersion} available. Right-click → Restore to default to adopt it.`
                   : `Customized built-in.`,
             );
           } else {
@@ -1782,7 +2198,7 @@ export function openStandaloneChat(options?: {
             try {
               (
                 Zotero as unknown as { launchFile?: (p: string) => void }
-              ).launchFile?.(entry.filePath);
+              ).launchFile?.(entry.openPath || entry.filePath);
             } catch {
               /* */
             }
@@ -1820,11 +2236,33 @@ export function openStandaloneChat(options?: {
 
           skillGrid.appendChild(item);
         }
+        } catch (err) {
+          if (renderSeq !== skillRenderSeq) return;
+          skillGrid.textContent = "";
+          const errorEl = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+          errorEl.className = "llm-standalone-sidebar-empty";
+          errorEl.textContent = t("Failed to load skills");
+          skillGrid.appendChild(errorEl);
+          Zotero.debug?.(
+            `[llm-for-zotero] Standalone skill grid render failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
       };
 
       const openSkillPopup = () => {
         skillOverlay.style.display = "flex";
-        void reloadRuntimeSkills();
+        skillGrid.textContent = "";
+        const loading = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+        loading.className = "llm-standalone-sidebar-empty";
+        loading.textContent = t("Loading…");
+        skillGrid.appendChild(loading);
+        if (resolveSkillPopupSystem() === "claude_code") {
+          void reloadClaudeProjectCommands();
+        } else {
+          void reloadRuntimeSkills();
+        }
         void renderSkillGrid();
       };
 
@@ -1860,9 +2298,9 @@ export function openStandaloneChat(options?: {
       // Context menu: Show in file system
       skillCtxShowInFs.addEventListener("click", async () => {
         skillCtxMenu.style.display = "none";
-        const { getUserSkillsDir } =
-          await import("../../agent/skills/userSkills");
-        const dir = getUserSkillsDir();
+        const dir = resolveSkillPopupSystem() === "claude_code"
+          ? getClaudeProjectDir()
+          : (await import("../../agent/skills/userSkills")).getUserSkillsDir();
         try {
           (
             Zotero as unknown as { launchFile?: (p: string) => void }
@@ -1871,6 +2309,15 @@ export function openStandaloneChat(options?: {
           /* */
         }
       });
+
+      const refreshSkillPopupForCurrentSystem = async () => {
+        if (resolveSkillPopupSystem() === "claude_code") {
+          await reloadClaudeProjectCommands();
+        } else {
+          await reloadRuntimeSkills();
+        }
+        await renderSkillGrid();
+      };
 
       // Context menu: Restore to default (customized built-ins only)
       skillCtxRestore.addEventListener("click", async () => {
@@ -1894,8 +2341,7 @@ export function openStandaloneChat(options?: {
         skillCtxFilePath = "";
         skillCtxFilename = "";
         if (ok) {
-          await reloadRuntimeSkills();
-          void renderSkillGrid();
+          await refreshSkillPopupForCurrentSystem();
         }
       });
 
@@ -1903,13 +2349,18 @@ export function openStandaloneChat(options?: {
       skillCtxDelete.addEventListener("click", async () => {
         skillCtxMenu.style.display = "none";
         if (!skillCtxFilePath) return;
-        const { deleteSkillFile } =
-          await import("../../agent/skills/userSkills");
-        await deleteSkillFile(skillCtxFilePath);
+        if (resolveSkillPopupSystem() === "claude_code") {
+          await deleteClaudeProjectSkillFile(skillCtxFilePath);
+          await reloadClaudeProjectCommands();
+        } else {
+          const { deleteSkillFile } =
+            await import("../../agent/skills/userSkills");
+          await deleteSkillFile(skillCtxFilePath);
+          await reloadRuntimeSkills();
+        }
         skillCtxFilePath = "";
         skillCtxFilename = "";
-        await reloadRuntimeSkills();
-        void renderSkillGrid();
+        await refreshSkillPopupForCurrentSystem();
       });
 
       // Header: Check for updates — re-seed built-ins and refresh the grid
@@ -1918,11 +2369,15 @@ export function openStandaloneChat(options?: {
         const originalText = skillRefreshBtn.textContent;
         skillRefreshBtn.textContent = t("Checking…");
         try {
-          const { initUserSkills } = await import(
-            "../../agent/skills/userSkills"
-          );
-          await initUserSkills();
-          await reloadRuntimeSkills();
+          if (resolveSkillPopupSystem() === "claude_code") {
+            await reloadClaudeProjectCommands();
+          } else {
+            const { initUserSkills } = await import(
+              "../../agent/skills/userSkills"
+            );
+            await initUserSkills();
+            await reloadRuntimeSkills();
+          }
           await renderSkillGrid();
           skillRefreshBtn.textContent = t("Up to date");
           doc.defaultView?.setTimeout(() => {
@@ -2012,25 +2467,126 @@ export function openStandaloneChat(options?: {
           }
 
           try {
-            // Clean up in-memory state
+            const pendingRequestId = getPendingRequestId(key);
+            if (pendingRequestId > 0) {
+              const ctrl = getAbortController(key);
+              if (ctrl) ctrl.abort();
+              setCancelledRequestId(key, pendingRequestId);
+              setPendingRequestId(key, 0);
+              setAbortController(key, null);
+            }
             chatHistory.delete(key);
             loadedConversationKeys.delete(key);
-            // Clean up DB: messages, attachment refs, attachment files, conversation row
-            await clearStoredConversation(key);
+            selectedModelCache.delete(key);
+            selectedReasoningCache.delete(key);
+            resetSessionTokens(key);
+            clearConversationSummaryFromCache(key);
+            if (isClaudeConversationSystem()) {
+              await clearClaudeConversation(key);
+            } else {
+              await clearStoredConversation(key);
+            }
             await clearOwnerAttachmentRefs("conversation", key).catch(() => {});
             await removeConversationAttachmentFiles(key).catch(() => {});
             if (standaloneMode === "open") {
-              await deleteGlobalConversation(key);
-              const rememberedKey =
-                activeGlobalConversationByLibrary.get(libraryID);
-              if (
-                rememberedKey !== undefined &&
-                Number(rememberedKey) === key
-              ) {
-                activeGlobalConversationByLibrary.delete(libraryID);
+              const currentLibraryID = getCurrentLibraryScopeID();
+              if (isClaudeConversationSystem()) {
+                await deleteClaudeConversation(key);
+                const rememberedKey =
+                  activeClaudeGlobalConversationByLibrary.get(
+                    buildClaudeLibraryStateKey(currentLibraryID),
+                  );
+                if (
+                  rememberedKey !== undefined &&
+                  Number(rememberedKey) === key
+                ) {
+                  activeClaudeGlobalConversationByLibrary.delete(
+                    buildClaudeLibraryStateKey(currentLibraryID),
+                  );
+                }
+                const persistedKey = getLastUsedClaudeGlobalConversationKey(
+                  currentLibraryID,
+                );
+                if (persistedKey !== null && Number(persistedKey) === key) {
+                  removeLastUsedClaudeGlobalConversationKey(currentLibraryID);
+                }
+              } else {
+                await deleteGlobalConversation(key);
+                const rememberedKey =
+                  activeGlobalConversationByLibrary.get(currentLibraryID);
+                if (
+                  rememberedKey !== undefined &&
+                  Number(rememberedKey) === key
+                ) {
+                  activeGlobalConversationByLibrary.delete(currentLibraryID);
+                }
+                const lockedKey = getLockedGlobalConversationKey(currentLibraryID);
+                if (
+                  lockedKey !== null &&
+                  Number.isFinite(lockedKey) &&
+                  Number(lockedKey) === key
+                ) {
+                  setLockedGlobalConversationKey(currentLibraryID, null);
+                }
               }
             } else {
-              await deletePaperConversation(key);
+              if (isClaudeConversationSystem()) {
+                await deleteClaudeConversation(key);
+                if (currentBasePaperItem?.id) {
+                  const paperLibraryID = getCurrentPaperLibraryID();
+                  const paperStateKey = buildClaudePaperStateKey(
+                    paperLibraryID,
+                    Number(currentBasePaperItem.id),
+                  );
+                  const rememberedKey = activeClaudePaperConversationByPaper.get(
+                    paperStateKey,
+                  );
+                  if (
+                    rememberedKey !== undefined &&
+                    Number(rememberedKey) === key
+                  ) {
+                    activeClaudePaperConversationByPaper.delete(paperStateKey);
+                  }
+                  const persistedKey = getLastUsedClaudePaperConversationKey(
+                    paperLibraryID,
+                    Number(currentBasePaperItem.id),
+                  );
+                  if (persistedKey !== null && Number(persistedKey) === key) {
+                    removeLastUsedClaudePaperConversationKey(
+                      paperLibraryID,
+                      Number(currentBasePaperItem.id),
+                    );
+                  }
+                }
+              } else {
+                await deletePaperConversation(key);
+                if (currentBasePaperItem?.id) {
+                  const paperLibraryID = getCurrentPaperLibraryID();
+                  const paperStateKey = `${paperLibraryID}:${Math.floor(Number(currentBasePaperItem.id))}`;
+                  const rememberedKey = activePaperConversationByPaper.get(
+                    paperStateKey,
+                  );
+                  if (
+                    rememberedKey !== undefined &&
+                    Number(rememberedKey) === key
+                  ) {
+                    activePaperConversationByPaper.delete(paperStateKey);
+                  }
+                  const persistedKey = getLastUsedPaperConversationKey(
+                    paperLibraryID,
+                    Number(currentBasePaperItem.id),
+                  );
+                  if (
+                    persistedKey !== null &&
+                    Number(persistedKey) === key
+                  ) {
+                    removeLastUsedPaperConversationKey(
+                      paperLibraryID,
+                      Number(currentBasePaperItem.id),
+                    );
+                  }
+                }
+              }
             }
 
             // Switch to fallback or create new conversation
@@ -2038,36 +2594,84 @@ export function openStandaloneChat(options?: {
               if (fallbackKey) {
                 activeConversationKey = fallbackKey;
                 if (standaloneMode === "open") {
-                  activeGlobalConversationByLibrary.set(libraryID, fallbackKey);
-                  const newItem = createGlobalPortalItem(
-                    libraryID,
-                    fallbackKey,
-                  );
-                  mountChatPanel(newItem);
+                  const currentLibraryID = getCurrentLibraryScopeID();
+                  if (isClaudeConversationSystem()) {
+                    activeClaudeGlobalConversationByLibrary.set(
+                      buildClaudeLibraryStateKey(currentLibraryID),
+                      fallbackKey,
+                    );
+                  } else {
+                    activeGlobalConversationByLibrary.set(currentLibraryID, fallbackKey);
+                  }
+                  const newItem = buildStandalonePortalItem({
+                    mode: "open",
+                    conversationKey: fallbackKey,
+                  });
+                  if (newItem) mountChatPanel(newItem);
                 } else if (currentBasePaperItem) {
                   const sv = fallbackSessionVersion || 0;
-                  const newItem = createPaperPortalItem(
-                    currentBasePaperItem,
-                    fallbackKey,
-                    sv,
-                  );
+                  const newItem = buildStandalonePortalItem({
+                    mode: "paper",
+                    conversationKey: fallbackKey,
+                    paperItem: currentBasePaperItem,
+                    sessionVersion: sv,
+                  });
                   currentPaperItem = currentBasePaperItem;
-                  mountChatPanel(newItem);
+                  if (newItem) mountChatPanel(newItem);
                 }
               } else {
-                // No siblings left — create a fresh conversation
                 if (standaloneMode === "open") {
-                  const newKey = await createGlobalConversation(libraryID);
+                  const currentLibraryID = getCurrentLibraryScopeID();
+                  const newKey = isClaudeConversationSystem()
+                    ? Number((await createClaudeGlobalConversation(currentLibraryID))?.conversationKey || 0)
+                    : await createGlobalConversation(currentLibraryID);
                   if (newKey && !cancelled) {
                     activeConversationKey = newKey;
-                    activeGlobalConversationByLibrary.set(libraryID, newKey);
-                    const newItem = createGlobalPortalItem(libraryID, newKey);
-                    mountChatPanel(newItem);
+                    if (isClaudeConversationSystem()) {
+                      activeClaudeGlobalConversationByLibrary.set(
+                        buildClaudeLibraryStateKey(currentLibraryID),
+                        newKey,
+                      );
+                    } else {
+                      activeGlobalConversationByLibrary.set(currentLibraryID, newKey);
+                    }
+                    const newItem = buildStandalonePortalItem({
+                      mode: "open",
+                      conversationKey: newKey,
+                    });
+                    if (newItem) mountChatPanel(newItem);
                   }
                 } else if (currentBasePaperItem) {
-                  activeConversationKey = 0;
-                  currentPaperItem = currentBasePaperItem;
-                  mountChatPanel(currentBasePaperItem);
+                  if (isClaudeConversationSystem()) {
+                    const paperId = Number(currentBasePaperItem.id || 0);
+                    const summary = await createClaudePaperConversation(getCurrentPaperLibraryID(), paperId);
+                    if (summary?.conversationKey && !cancelled) {
+                      activeConversationKey = summary.conversationKey;
+                      const newItem = buildStandalonePortalItem({
+                        mode: "paper",
+                        conversationKey: summary.conversationKey,
+                        paperItem: currentBasePaperItem,
+                      });
+                      currentPaperItem = currentBasePaperItem;
+                      if (newItem) mountChatPanel(newItem);
+                    }
+                  } else {
+                    const paperId = Number(currentBasePaperItem.id || 0);
+                    const summary = await createPaperConversation(getCurrentPaperLibraryID(), paperId);
+                    const newKey = Number(summary?.conversationKey || 0);
+                    if (!newKey || cancelled) return;
+                    activeConversationKey = newKey;
+                    currentPaperItem = currentBasePaperItem;
+                    const newItem = buildStandalonePortalItem({
+                      mode: "paper",
+                      conversationKey: newKey,
+                      paperItem: currentBasePaperItem,
+                      sessionVersion: summary?.sessionVersion,
+                    });
+                    if (newItem) mountChatPanel(newItem);
+                  }
+                } else {
+                  await restoreStandaloneOpenConversation(false);
                 }
               }
             }
@@ -2106,23 +2710,215 @@ export function openStandaloneChat(options?: {
         target.classList.add("active");
 
         if (standaloneMode === "open") {
-          const newItem = createGlobalPortalItem(libraryID, key);
-          activeGlobalConversationByLibrary.set(libraryID, key);
-          mountChatPanel(newItem);
-        } else {
-          // Paper chat — create paper portal item
-          if (currentBasePaperItem) {
-            const sessionVersion = Number(target.dataset.sessionVersion || 0);
-            const newItem = createPaperPortalItem(
-              currentBasePaperItem,
+          const currentLibraryID = getCurrentLibraryScopeID();
+          if (isClaudeConversationSystem()) {
+            activeClaudeGlobalConversationByLibrary.set(
+              buildClaudeLibraryStateKey(currentLibraryID),
               key,
-              sessionVersion,
             );
+          } else {
+            activeGlobalConversationByLibrary.set(currentLibraryID, key);
+          }
+          const newItem = buildStandalonePortalItem({
+            mode: "open",
+            conversationKey: key,
+          });
+          if (newItem) mountChatPanel(newItem);
+        } else {
+          if (currentBasePaperItem) {
+            const sessionVersion = Number(target.dataset.sessionVersion || "0");
+            const newItem = buildStandalonePortalItem({
+              mode: "paper",
+              conversationKey: key,
+              paperItem: currentBasePaperItem,
+              sessionVersion,
+            });
             currentPaperItem = currentBasePaperItem;
-            mountChatPanel(newItem);
+            if (newItem) mountChatPanel(newItem);
           }
         }
       });
+
+      const resolveStandaloneGlobalConversation = async (
+        forceFresh = false,
+      ): Promise<number> => {
+        const currentLibraryID = getCurrentLibraryScopeID();
+        if (!currentLibraryID) return 0;
+        if (isClaudeConversationSystem()) {
+          if (!forceFresh) {
+            const currentKey = Number(activeConversationKey || 0);
+            if (Number.isFinite(currentKey) && currentKey > 0) {
+              try {
+                const currentSummary = await getClaudeConversationSummary(currentKey);
+                if (
+                  currentSummary &&
+                  currentSummary.kind === "global" &&
+                  Number(currentSummary.libraryID) === currentLibraryID &&
+                  (currentSummary.userTurnCount || 0) === 0
+                ) {
+                  return Math.floor(currentKey);
+                }
+              } catch (err) {
+                ztoolkit.log("LLM: standalone failed to inspect active Claude global draft", err);
+              }
+            }
+            try {
+              const summaries = await listClaudeGlobalConversations(
+                currentLibraryID,
+                50,
+              );
+              const latestEmpty = summaries.find(
+                (summary) => (summary.userTurnCount || 0) === 0,
+              );
+              if (latestEmpty?.conversationKey) {
+                return Math.floor(latestEmpty.conversationKey);
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to list Claude global drafts", err);
+            }
+          }
+          return Number(
+            (await createClaudeGlobalConversation(currentLibraryID))?.conversationKey || 0,
+          );
+        }
+        if (!forceFresh) {
+          const currentKey = Number(activeConversationKey || 0);
+          if (isUpstreamGlobalConversationKey(currentKey)) {
+            try {
+              const turnCount = await getGlobalConversationUserTurnCount(currentKey);
+              if (turnCount === 0) {
+                return Math.floor(currentKey);
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to inspect active global draft", err);
+            }
+          }
+          try {
+            const latestEmpty = await getLatestEmptyGlobalConversation(currentLibraryID);
+            if (latestEmpty?.conversationKey) {
+              return Math.floor(latestEmpty.conversationKey);
+            }
+          } catch (err) {
+            ztoolkit.log("LLM: standalone failed to load latest global draft", err);
+          }
+        }
+        return await createGlobalConversation(currentLibraryID);
+      };
+
+      const resolveStandalonePaperConversation = async (
+        forceFresh = false,
+      ): Promise<{ conversationKey: number; sessionVersion?: number }> => {
+        if (!currentBasePaperItem) {
+          return { conversationKey: 0 };
+        }
+        const paperLibraryID = getCurrentPaperLibraryID();
+        const paperId = Number(currentBasePaperItem.id || 0);
+        if (!paperLibraryID || !paperId) {
+          return { conversationKey: 0 };
+        }
+        if (isClaudeConversationSystem()) {
+          if (!forceFresh) {
+            const currentKey = Number(activeConversationKey || 0);
+            if (Number.isFinite(currentKey) && currentKey > 0) {
+              try {
+                const currentSummary = await getClaudeConversationSummary(currentKey);
+                if (
+                  currentSummary &&
+                  currentSummary.kind === "paper" &&
+                  (currentSummary.userTurnCount || 0) === 0
+                ) {
+                  return { conversationKey: Math.floor(currentKey) };
+                }
+              } catch (err) {
+                ztoolkit.log("LLM: standalone failed to inspect active Claude paper draft", err);
+              }
+            }
+            try {
+              const summaries = await listClaudePaperConversations(
+                paperLibraryID,
+                paperId,
+                50,
+              );
+              const emptyEntry = summaries.find(
+                (summary) => (summary.userTurnCount || 0) === 0,
+              );
+              if (emptyEntry?.conversationKey) {
+                return { conversationKey: Math.floor(emptyEntry.conversationKey) };
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to list Claude paper drafts", err);
+            }
+          }
+          return {
+            conversationKey: Number(
+              (await createClaudePaperConversation(paperLibraryID, paperId))
+                ?.conversationKey || 0,
+            ),
+          };
+        }
+        if (!forceFresh) {
+          const currentKey = Number(activeConversationKey || 0);
+          if (Number.isFinite(currentKey) && currentKey > 0) {
+            try {
+              const currentSummary = await getPaperConversation(currentKey);
+              if (currentSummary && currentSummary.userTurnCount === 0) {
+                return { conversationKey: Math.floor(currentKey) };
+              }
+            } catch (err) {
+              ztoolkit.log("LLM: standalone failed to inspect active paper draft", err);
+            }
+          }
+          try {
+            const summaries = await listPaperConversations(paperLibraryID, paperId, 50);
+            const emptyEntry = summaries.find((summary) => summary.userTurnCount === 0);
+            if (emptyEntry?.conversationKey) {
+              return {
+                conversationKey: Math.floor(emptyEntry.conversationKey),
+                sessionVersion: emptyEntry.sessionVersion,
+              };
+            }
+          } catch (err) {
+            ztoolkit.log("LLM: standalone failed to list paper drafts", err);
+          }
+        }
+        const summary = await createPaperConversation(paperLibraryID, paperId);
+        return {
+          conversationKey: Number(summary?.conversationKey || 0),
+          sessionVersion: summary?.sessionVersion,
+        };
+      };
+
+      const restoreStandaloneOpenConversation = async (
+        forceFresh = false,
+      ): Promise<boolean> => {
+        standaloneMode = "open";
+        paperTab.classList.remove("active");
+        openTab.classList.add("active");
+        const conversationKey = await resolveStandaloneGlobalConversation(forceFresh);
+        if (!conversationKey || cancelled) {
+          return false;
+        }
+        activeConversationKey = conversationKey;
+        const currentLibraryID = getCurrentLibraryScopeID();
+        if (isClaudeConversationSystem()) {
+          activeClaudeGlobalConversationByLibrary.set(
+            buildClaudeLibraryStateKey(currentLibraryID),
+            conversationKey,
+          );
+        } else {
+          activeGlobalConversationByLibrary.set(currentLibraryID, conversationKey);
+        }
+        const nextItem = buildStandalonePortalItem({
+          mode: "open",
+          conversationKey,
+        });
+        if (!nextItem) {
+          return false;
+        }
+        mountChatPanel(nextItem);
+        scheduleStandaloneSidebarRender();
+        return true;
+      };
 
       // Icon strip handlers — new chat
       iconNewChat.addEventListener("click", async () => {
@@ -2137,30 +2933,38 @@ export function openStandaloneChat(options?: {
             return;
           }
 
-          // Skip if the current conversation is already empty (no user messages)
-          const currentHistory = chatHistory.get(activeConversationKey) || [];
-          if (!currentHistory.some((m) => m.role === "user")) return;
-
           if (standaloneMode === "open") {
-            const newKey = await createGlobalConversation(libraryID);
+            const currentLibraryID = getCurrentLibraryScopeID();
+            const newKey = await resolveStandaloneGlobalConversation(false);
             if (!newKey || cancelled) return;
             activeConversationKey = newKey;
-            activeGlobalConversationByLibrary.set(libraryID, newKey);
-            const newItem = createGlobalPortalItem(libraryID, newKey);
+            if (isClaudeConversationSystem()) {
+              activeClaudeGlobalConversationByLibrary.set(
+                buildClaudeLibraryStateKey(currentLibraryID),
+                newKey,
+              );
+            } else {
+              activeGlobalConversationByLibrary.set(currentLibraryID, newKey);
+            }
+            const newItem = buildStandalonePortalItem({
+              mode: "open",
+              conversationKey: newKey,
+            });
+            if (!newItem) return;
             mountChatPanel(newItem);
             await renderSidebar();
           } else {
-            // Paper chat — create a new conversation, then mount
             if (currentBasePaperItem) {
-              const paperId = Number(currentBasePaperItem.id || 0);
-              const summary = await createPaperConversation(libraryID, paperId);
-              if (!summary?.conversationKey || cancelled) return;
-              const newKey = summary.conversationKey;
-              const newItem = createPaperPortalItem(
-                currentBasePaperItem,
-                newKey,
-                summary.sessionVersion,
-              );
+              const { conversationKey: newKey, sessionVersion } =
+                await resolveStandalonePaperConversation(false);
+              if (!newKey || cancelled) return;
+              const newItem = buildStandalonePortalItem({
+                mode: "paper",
+                conversationKey: newKey,
+                paperItem: currentBasePaperItem,
+                sessionVersion,
+              });
+              if (!newItem) return;
               activeConversationKey = newKey;
               currentPaperItem = currentBasePaperItem;
               mountChatPanel(newItem);
@@ -2219,68 +3023,259 @@ export function openStandaloneChat(options?: {
       // -----------------------------------------------------------------------
       // Top bar tab switching
       // -----------------------------------------------------------------------
-      const switchToMode = (mode: "open" | "paper") => {
+      let systemSwitchSeq = 0;
+      const switchConversationSystem = async (
+        nextSystem: "upstream" | "claude_code",
+        options?: { forceFresh?: boolean },
+      ) => {
+        const switchSeq = ++systemSwitchSeq;
+        const currentSystem = isClaudeConversationSystem() ? "claude_code" : "upstream";
+        if (nextSystem === currentSystem) return;
+        const forceFresh = options?.forceFresh === true;
+        setConversationSystemPref(nextSystem);
+        currentConversationSystem = nextSystem;
+        updateStandaloneSystemToggle();
+        if (standaloneMode === "open") {
+          const libraryID = getCurrentLibraryScopeID();
+          const mountOpenConversation = (conversationKey: number) => {
+            if (switchSeq !== systemSwitchSeq) return;
+            const nextItem =
+              nextSystem === "claude_code"
+                ? createClaudeGlobalPortalItem(libraryID, conversationKey)
+                : createGlobalPortalItem(libraryID, conversationKey);
+            activeConversationKey = conversationKey;
+            if (nextSystem === "claude_code") {
+              activeClaudeGlobalConversationByLibrary.set(
+                buildClaudeLibraryStateKey(libraryID),
+                conversationKey,
+              );
+            } else {
+              activeGlobalConversationByLibrary.set(libraryID, conversationKey);
+            }
+            mountChatPanel(nextItem as Zotero.Item);
+            scheduleStandaloneSidebarRender();
+            updateStandaloneSystemToggle();
+          };
+
+          if (forceFresh) {
+            const newKey = await resolveStandaloneGlobalConversation(true);
+            if (switchSeq !== systemSwitchSeq) return;
+            if (newKey > 0) {
+              mountOpenConversation(newKey);
+            }
+            return;
+          }
+
+          if (nextSystem === "claude_code") {
+            const rememberedKey = Number(
+              resolveRememberedClaudeConversationKey({
+                libraryID,
+                kind: "global",
+              }) || 0,
+            );
+            const targetKey = Number.isFinite(rememberedKey) && rememberedKey > 0
+              ? Math.floor(rememberedKey)
+              : buildDefaultClaudeGlobalConversationKey(libraryID);
+            if (switchSeq !== systemSwitchSeq) return;
+            if (targetKey > 0) {
+              mountOpenConversation(targetKey);
+            }
+            return;
+          }
+
+          const rememberedUpstreamKey = (() => {
+            const lockedKey = getLockedGlobalConversationKey(libraryID);
+            if (lockedKey !== null) return lockedKey;
+            const activeKey = Number(activeGlobalConversationByLibrary.get(libraryID) || 0);
+            return isUpstreamGlobalConversationKey(activeKey) ? Math.floor(activeKey) : 0;
+          })();
+          const targetKey = Number.isFinite(rememberedUpstreamKey) && rememberedUpstreamKey > 0
+            ? Math.floor(rememberedUpstreamKey)
+            : GLOBAL_CONVERSATION_KEY_BASE;
+          if (switchSeq !== systemSwitchSeq) return;
+          if (targetKey > 0) {
+            mountOpenConversation(targetKey);
+          }
+          return;
+        }
+        const nextRawItem = getSelectedZoteroItem() || currentBasePaperItem || currentPaperItem;
+        const resolved = resolveInitialPanelItemState(nextRawItem, {
+          conversationSystem: nextSystem,
+        });
+        currentBasePaperItem = resolved.basePaperItem || currentBasePaperItem;
+        currentPaperItem = resolved.item || currentPaperItem;
+        if (forceFresh) {
+          const paperItem = currentBasePaperItem;
+          if (!paperItem) return;
+          const { conversationKey: newKey, sessionVersion } =
+            await resolveStandalonePaperConversation(true);
+          if (switchSeq !== systemSwitchSeq) return;
+          if (!newKey) return;
+          const freshItem = nextSystem === "claude_code"
+            ? createClaudePaperPortalItem(paperItem, newKey)
+            : createPaperPortalItem(paperItem, newKey, sessionVersion || 1);
+          activeConversationKey = newKey;
+          currentPaperItem = paperItem;
+          mountChatPanel(freshItem as Zotero.Item);
+          scheduleStandaloneSidebarRender();
+          void renderShortcuts(contentArea, freshItem as Zotero.Item, "paper");
+          updateStandaloneSystemToggle();
+          return;
+        }
+        if (switchSeq !== systemSwitchSeq) return;
+        const nextItem = resolved.item || nextRawItem;
+        if (nextItem) {
+          mountChatPanel(nextItem);
+          scheduleStandaloneSidebarRender();
+          const shortcutMode =
+            resolveDisplayConversationKind(nextItem) === "global" ? "library" : "paper";
+          void renderShortcuts(contentArea, nextItem, shortcutMode);
+        }
+        updateStandaloneSystemToggle();
+      };
+
+      systemToggleBtn.addEventListener("click", () => {
+        void switchConversationSystem(
+          isClaudeConversationSystem() ? "upstream" : "claude_code",
+          { forceFresh: true },
+        );
+      });
+      updateStandaloneSystemToggle();
+      {
+        const claudeModePrefKey = `${config.prefsPrefix}.enableClaudeCodeMode`;
+        let claudeObserverId: symbol | undefined;
+        const unregister = () => {
+          if (claudeObserverId === undefined) return;
+          try {
+            (Zotero as any).Prefs.unregisterObserver(claudeObserverId);
+          } catch {
+            void 0;
+          }
+          claudeObserverId = undefined;
+        };
+        cleanupStandalonePrefObserver = unregister;
+        const onClaudeModePrefChange = () => {
+          if (cancelled) {
+            unregister();
+            return;
+          }
+          if (!getClaudeCodeModeEnabled()) {
+            void releaseClaudeRuntimeForBody(contentArea as Element);
+            void invalidateAllClaudeHotRuntimes(getCoreAgentRuntime()).catch((err) => {
+              ztoolkit.log("LLM: Failed to invalidate all Claude hot runtimes", err);
+            });
+            setConversationSystemPref("upstream");
+            if (isClaudeConversationSystem()) {
+              void switchConversationSystem("upstream");
+              return;
+            }
+          }
+          updateStandaloneSystemToggle();
+        };
+        try {
+          claudeObserverId = (Zotero as any).Prefs.registerObserver(
+            claudeModePrefKey,
+            onClaudeModePrefChange,
+            true,
+          );
+        } catch {
+          void 0;
+        }
+      }
+
+      const switchToMode = async (mode: "open" | "paper") => {
         // [webchat] If in webchat mode and user clicks "Library chat", exit webchat first
         if (isInWebChatMode && mode === "open") {
           const clearBtnEl = contentArea.querySelector(
             "#llm-clear",
           ) as HTMLElement | null;
-          if (clearBtnEl) clearBtnEl.click(); // triggers webchat exit in setupHandlers
-          // After exit, the hook will reset isInWebChatMode and restore UI
+          if (clearBtnEl) clearBtnEl.click();
         }
-        // [webchat] If in webchat mode and user clicks "Web chat", no-op
         if (isInWebChatMode && mode === "paper") return;
-
         if (mode === standaloneMode) return;
-        standaloneMode = mode;
 
-        // Update tab active states
+        standaloneMode = mode;
+        if (isClaudeConversationSystem()) {
+          setLastUsedClaudeConversationMode(
+            getCurrentLibraryScopeID(),
+            mode === "open" ? "global" : "paper",
+          );
+        }
         paperTab.classList.toggle("active", mode === "paper");
         openTab.classList.toggle("active", mode === "open");
 
         if (mode === "open") {
-          // Restore open chat — use global conversation key, not the paper one
-          const key =
-            activeGlobalConversationByLibrary.get(libraryID) ||
-            GLOBAL_CONVERSATION_KEY_BASE;
+          const currentLibraryID = getCurrentLibraryScopeID();
+          const key = await resolveStandaloneGlobalConversation(false);
+          if (!key) return;
           activeConversationKey = key;
-          const item = createGlobalPortalItem(libraryID, key);
-          mountChatPanel(item);
-          void renderSidebar();
-        } else {
-          // Paper chat — resolve currently selected paper in Zotero
-          const rawItem =
-            currentPaperItem || currentBasePaperItem || getSelectedZoteroItem();
-          const resolved = resolveInitialPanelItemState(rawItem);
-          currentBasePaperItem =
-            resolved.basePaperItem ||
-            (rawItem ? resolveConversationBaseItem(rawItem) : null);
-          currentPaperItem = resolved.item || currentBasePaperItem;
-
-          if (currentPaperItem) {
-            activeConversationKey = 0; // Will be set by mountChatPanel
-            mountChatPanel(currentPaperItem);
-            void renderSidebar();
+          if (isClaudeConversationSystem()) {
+            activeClaudeGlobalConversationByLibrary.set(
+              buildClaudeLibraryStateKey(currentLibraryID),
+              key,
+            );
           } else {
-            // No paper open — show message
-            clearContent();
-            const noPaper = doc.createElementNS(
-              HTML_NS,
-              "div",
-            ) as HTMLDivElement;
-            noPaper.style.cssText =
-              "display:flex;align-items:center;justify-content:center;" +
-              "height:100%;color:var(--fill-tertiary);font-size:14px;";
-            noPaper.textContent = t("Open a paper to start a paper chat");
-            contentArea.appendChild(noPaper);
-            clearSidebarList();
-            sidebarTitle.textContent = t("History");
+            activeGlobalConversationByLibrary.set(currentLibraryID, key);
+          }
+          const item = buildStandalonePortalItem({
+            mode: "open",
+            conversationKey: key,
+          });
+          if (!item) return;
+          mountChatPanel(item);
+          scheduleStandaloneSidebarRender();
+          return;
+        }
+
+        const rawItem =
+          getSelectedZoteroItem() || currentBasePaperItem || currentPaperItem;
+        const resolved = resolveInitialPanelItemState(rawItem, {
+          conversationSystem: currentConversationSystem,
+        });
+        currentBasePaperItem =
+          resolved.basePaperItem ||
+          (rawItem ? resolveConversationBaseItem(rawItem) : null) ||
+          currentBasePaperItem;
+        const paperItem = currentBasePaperItem;
+        currentPaperItem = paperItem;
+
+        if (paperItem) {
+          const paperRef = resolvePaperContextRefFromItem(paperItem);
+          if (paperRef) {
+            selectedPaperContextCache.set(paperItem.id, [paperRef]);
+          }
+          const paperLibraryID = getCurrentPaperLibraryID();
+          const paperId = Number(paperItem.id || 0);
+          if (paperLibraryID > 0 && paperId > 0) {
+            const { conversationKey: newKey, sessionVersion } =
+              await resolveStandalonePaperConversation(false);
+            if (newKey > 0) {
+              activeConversationKey = newKey;
+              const item = buildStandalonePortalItem({
+                mode: "paper",
+                conversationKey: newKey,
+                paperItem,
+                sessionVersion,
+              });
+              if (item) {
+                mountChatPanel(item);
+                scheduleStandaloneSidebarRender();
+                return;
+              }
+            }
           }
         }
+
+        await restoreStandaloneOpenConversation(false);
+        return;
       };
 
-      paperTab.addEventListener("click", () => switchToMode("paper"));
-      openTab.addEventListener("click", () => switchToMode("open"));
+      paperTab.addEventListener("click", () => {
+        void switchToMode("paper");
+      });
+      openTab.addEventListener("click", () => {
+        void switchToMode("open");
+      });
 
       // Auto-collapse sidebar when window is narrow, respecting manual override.
       // ResizeObserver is unavailable in some Gecko/XUL window contexts —
@@ -2337,7 +3332,9 @@ export function openStandaloneChat(options?: {
       // When the user switches to a different paper, update the standalone chat.
       standaloneItemChangeHandler = (rawItem: Zotero.Item | null) => {
         if (cancelled || standaloneMode !== "paper") return;
-        const resolved = resolveInitialPanelItemState(rawItem);
+        const resolved = resolveInitialPanelItemState(rawItem, {
+          conversationSystem: resolveConversationSystemForItem(rawItem),
+        });
         const newBasePaper =
           resolved.basePaperItem ||
           (rawItem ? resolveConversationBaseItem(rawItem) : null);
@@ -2350,7 +3347,7 @@ export function openStandaloneChat(options?: {
         currentBasePaperItem = newBasePaper;
         currentPaperItem = resolved.item || newBasePaper;
         mountChatPanel(currentPaperItem);
-        void renderSidebar();
+        scheduleStandaloneSidebarRender();
       };
 
       // Initial mount — preserve the source panel mode/item when available
@@ -2367,7 +3364,7 @@ export function openStandaloneChat(options?: {
         "LLM: standalone renderSidebar start",
         "mode=" + standaloneMode,
       );
-      void renderSidebar();
+      scheduleStandaloneSidebarRender();
       renderStandalonePlaceholdersInEmbeddedPanels(contentArea);
     } catch (err) {
       ztoolkit.log("LLM: standalone initWindow failed", err);
@@ -2397,6 +3394,7 @@ export function openStandaloneChat(options?: {
 
   const cleanupWindow = () => {
     cancelled = true;
+    cleanupStandalonePrefObserver?.();
     standaloneItemChangeHandler = null;
     themeObserver?.disconnect();
     themeObserver = null;
@@ -2412,6 +3410,7 @@ export function openStandaloneChat(options?: {
     );
     const contentArea = root?.querySelector(".llm-standalone-content");
     if (contentArea) {
+      void releaseClaudeRuntimeForBody(contentArea as Element);
       activeContextPanels.delete(contentArea);
       activeContextPanelRawItems.delete(contentArea);
       activeContextPanelStateSync.delete(contentArea);

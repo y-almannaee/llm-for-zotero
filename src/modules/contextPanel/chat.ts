@@ -10,6 +10,22 @@ import {
   deleteTurnMessages as deleteStoredTurnMessages,
   StoredChatMessage,
 } from "../../utils/chatStore";
+import { loadClaudeConversation } from "../../claudeCode/store";
+import {
+  getClaudeAutoCompactThresholdPercent,
+  isClaudeAutoCompactEnabled,
+} from "../../claudeCode/prefs";
+import {
+  appendClaudeConversationMessage,
+  buildClaudeScope,
+  captureClaudeSessionInfo,
+  deleteClaudeConversationTurnMessages,
+  getClaudeBridgeRuntime,
+  isClaudeConversationSystemActive,
+  updateLatestClaudeConversationAssistantMessage,
+  updateLatestClaudeConversationUserMessage,
+} from "../../claudeCode/runtime";
+import { isClaudeConversationKey } from "../../claudeCode/constants";
 import {
   callLLMStream,
   ChatFileAttachment,
@@ -22,7 +38,10 @@ import {
   UsageStats,
   checkEmbeddingAvailability,
 } from "../../utils/llmClient";
-import { estimateConversationTokens } from "../../utils/modelInputCap";
+import {
+  estimateConversationTokens,
+  getModelInputTokenLimit,
+} from "../../utils/modelInputCap";
 import { formatDisplayModelName } from "../../utils/modelDisplayLabel";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
 import {
@@ -138,6 +157,8 @@ import {
 import {
   isGlobalPortalItem,
   resolveActiveNoteSession,
+  resolveConversationBaseItem,
+  resolveConversationSystemForItem,
   resolveDisplayConversationKind,
 } from "./portalScope";
 import { buildChatHistoryNotePayload, readNoteSnapshot } from "./notes";
@@ -148,7 +169,8 @@ import { renderAgentTrace } from "./agentTrace/render";
 import { toFileUrl } from "../../utils/pathFileUrl";
 import { replaceOwnerAttachmentRefs } from "../../utils/attachmentRefStore";
 import { decorateAssistantCitationLinks } from "./assistantCitationLinks";
-import { getAgentRuntime } from "../../agent";
+import { getCoreAgentRuntime } from "../../agent/index";
+import { getClaudeReasoningModePref } from "../../claudeCode/prefs";
 import { getAgentRunTrace } from "../../agent/store/traceStore";
 import {
   applyHistoryCompression,
@@ -180,7 +202,12 @@ function getAbortControllerCtor(): new () => AbortController {
 function appendReasoningPart(base: string | undefined, next?: string): string {
   const chunk = sanitizeText(next || "");
   if (!chunk) return base || "";
-  return `${base || ""}${chunk}`;
+  if (!base) return chunk;
+  const startsWithTightPunctuation = /^[,.;:!?%)}\]"'’”]/.test(chunk);
+  const needsSpacer =
+    !startsWithTightPunctuation &&
+    !(/[\s\n]$/.test(base) || /^[\s\n]/.test(chunk));
+  return needsSpacer ? `${base} ${chunk}` : `${base}${chunk}`;
 }
 
 function isReasoningExpandedByDefault(): boolean {
@@ -450,6 +477,56 @@ function renderUserBubbleContent(
   }
 }
 
+function looksLikeStreamingMarkdownTable(text: string): boolean {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const line = lines[index];
+    const next = lines[index + 1];
+    if (!line.startsWith("|")) continue;
+    if (!next?.startsWith("|")) continue;
+    if (next === "|" || /^\|?[\s:-]+(?:\|[\s:-]+)*\|?$/.test(next)) {
+      return true;
+    }
+    if (line.includes("|") && next.includes("|")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function attachRenderedCopyButtons(root: ParentNode, doc: Document): void {
+  const copyables = Array.from(
+    root.querySelectorAll(".llm-copyable[data-llm-copy-source]"),
+  ) as HTMLElement[];
+  for (const copyable of copyables) {
+    if (copyable.classList.contains("llm-copyable-inline")) continue;
+    if (!copyable.dataset.copyFeedbackBound) {
+      copyable.dataset.copyFeedbackBound = "true";
+      const clearCopyFeedback = () => {
+        delete copyable.dataset.copyFeedback;
+      };
+      copyable.addEventListener("mouseleave", clearCopyFeedback);
+      copyable.addEventListener("focusout", (event: FocusEvent) => {
+        const next = event.relatedTarget as Node | null;
+        if (!next || !copyable.contains(next)) {
+          clearCopyFeedback();
+        }
+      });
+    }
+    const existing = copyable.querySelector(
+      ":scope > .llm-render-copy-btn",
+    ) as HTMLButtonElement | null;
+    if (existing) continue;
+    const button = doc.createElement("button") as HTMLButtonElement;
+    button.type = "button";
+    button.className = "llm-render-copy-btn";
+    button.textContent = "⧉";
+    button.title = "Copy original markdown";
+    button.setAttribute("aria-label", "Copy original markdown");
+    copyable.insertBefore(button, copyable.firstChild);
+  }
+}
+
 function getMessageSelectedTextExpandedIndex(
   message: Message,
   count: number,
@@ -523,6 +600,14 @@ const followBottomStabilizers = new Map<
 
 /** Cumulative API token usage per conversation key for the current session. */
 const sessionTokenTotals = new Map<number, number>();
+const contextUsageSnapshots = new Map<number, { contextTokens: number; contextWindow?: number }>();
+function getContextInputWindow(effectiveRequestConfig: EffectiveRequestConfig): number | undefined {
+  const advancedCap = effectiveRequestConfig.advanced?.inputTokenCap;
+  if (typeof advancedCap === "number" && Number.isFinite(advancedCap) && advancedCap > 0) {
+    return advancedCap;
+  }
+  return getModelInputTokenLimit(effectiveRequestConfig.model || "");
+}
 
 function accumulateSessionTokens(
   conversationKey: number,
@@ -554,6 +639,10 @@ function getOrSeedSessionTokens(
   );
   sessionTokenTotals.set(conversationKey, estimated);
   return estimated;
+}
+
+export function getSessionTokenTotal(conversationKey: number): number {
+  return sessionTokenTotals.get(conversationKey) ?? 0;
 }
 
 export function resetSessionTokens(conversationKey: number): void {
@@ -752,14 +841,60 @@ function applyChatScrollPolicy(
   persistChatScrollSnapshotByKey(conversationKey, chatBox);
 }
 
+async function loadStoredConversationByKey(
+  conversationKey: number,
+  limit: number,
+): Promise<StoredChatMessage[]> {
+  return isClaudeConversationKey(conversationKey)
+    ? loadClaudeConversation(conversationKey, limit)
+    : loadConversation(conversationKey, limit);
+}
+
+async function updateStoredLatestUserMessageByConversation(
+  conversationKey: number,
+  message: Parameters<typeof updateStoredLatestUserMessage>[1],
+): Promise<void> {
+  if (isClaudeConversationKey(conversationKey)) {
+    await updateLatestClaudeConversationUserMessage(conversationKey, message);
+    return;
+  }
+  await updateStoredLatestUserMessage(conversationKey, message);
+}
+
+async function updateStoredLatestAssistantMessageByConversation(
+  conversationKey: number,
+  message: Parameters<typeof updateStoredLatestAssistantMessage>[1],
+): Promise<void> {
+  if (isClaudeConversationKey(conversationKey)) {
+    const latestContextSnapshot = contextUsageSnapshots.get(conversationKey);
+    await updateLatestClaudeConversationAssistantMessage(conversationKey, {
+      ...message,
+      contextTokens:
+        Number.isFinite(Number(message.contextTokens)) && Number(message.contextTokens) > 0
+          ? Math.floor(Number(message.contextTokens))
+          : latestContextSnapshot?.contextTokens,
+      contextWindow:
+        Number.isFinite(Number(message.contextWindow)) && Number(message.contextWindow) > 0
+          ? Math.floor(Number(message.contextWindow))
+          : latestContextSnapshot?.contextWindow,
+    });
+    return;
+  }
+  await updateStoredLatestAssistantMessage(conversationKey, message);
+}
+
 async function persistConversationMessage(
   conversationKey: number,
   message: StoredChatMessage,
 ): Promise<void> {
   try {
-    await appendStoredMessage(conversationKey, message);
-    await pruneConversation(conversationKey, PERSISTED_HISTORY_LIMIT);
-    const storedMessages = await loadConversation(
+    if (isClaudeConversationKey(conversationKey)) {
+      await appendClaudeConversationMessage(conversationKey, message);
+    } else {
+      await appendStoredMessage(conversationKey, message);
+      await pruneConversation(conversationKey, PERSISTED_HISTORY_LIMIT);
+    }
+    const storedMessages = await loadStoredConversationByKey(
       conversationKey,
       PERSISTED_HISTORY_LIMIT,
     );
@@ -849,6 +984,7 @@ function toPanelMessage(message: StoredChatMessage): Message {
     reasoningSummary: message.reasoningSummary,
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: isReasoningExpandedByDefault(),
+    compactMarker: Boolean((message as StoredChatMessage).compactMarker),
     webchatRunState: message.webchatRunState,
     webchatCompletionReason: message.webchatCompletionReason,
   };
@@ -873,14 +1009,21 @@ export async function ensureConversationLoaded(
 
   const task = (async () => {
     try {
-      const storedMessages = await loadConversation(
+      const storedMessages = await loadStoredConversationByKey(
         conversationKey,
         PERSISTED_HISTORY_LIMIT,
       );
-      chatHistory.set(
-        conversationKey,
-        storedMessages.map((message) => toPanelMessage(message)),
-      );
+      const panelMessages = storedMessages.map((message) => toPanelMessage(message));
+      const latestAssistantWithContext = [...storedMessages]
+        .reverse()
+        .find((message) => message.role === "assistant" && typeof message.contextTokens === "number");
+      if (latestAssistantWithContext?.contextTokens) {
+        contextUsageSnapshots.set(conversationKey, {
+          contextTokens: latestAssistantWithContext.contextTokens,
+          contextWindow: latestAssistantWithContext.contextWindow,
+        });
+      }
+      chatHistory.set(conversationKey, panelMessages);
     } catch (err) {
       ztoolkit.log("LLM: Failed to load chat history", err);
       if (!chatHistory.has(conversationKey)) {
@@ -1108,9 +1251,17 @@ function setRequestUIBusy(
   statusText: string,
 ): void {
   withScrollGuard(ui.chatBox, conversationKey, () => {
-    if (ui.sendBtn) ui.sendBtn.style.display = "none";
+    if (ui.sendBtn) {
+      ui.sendBtn.style.display = "none";
+      ui.sendBtn.disabled = false;
+    }
     if (ui.cancelBtn) ui.cancelBtn.style.display = "";
-    if (ui.inputBox) ui.inputBox.disabled = true;
+    if (ui.inputBox) {
+      const keepInputLive =
+        (body.querySelector("#llm-main") as HTMLElement | null)?.dataset
+          ?.conversationSystem === "claude_code";
+      ui.inputBox.disabled = keepInputLive ? false : true;
+    }
     if (ui.status) setStatus(ui.status, statusText, "sending");
   });
   // History controls are intentionally left enabled so the user can
@@ -1199,7 +1350,12 @@ export type EffectiveRequestConfig = {
   model: string;
   apiBase: string;
   apiKey: string;
-  authMode: "api_key" | "codex_auth" | "codex_app_server" | "webchat"; // [webchat]
+  authMode:
+    | "api_key"
+    | "codex_auth"
+    | "codex_app_server"
+    | "copilot_auth"
+    | "webchat";
   providerProtocol?: ProviderProtocol;
   modelEntryId?: string;
   modelProviderLabel?: string;
@@ -1212,44 +1368,80 @@ function resolveEffectiveRequestConfig(params: {
   model?: string;
   apiBase?: string;
   apiKey?: string;
-  authMode?: "api_key" | "codex_auth" | "webchat"; // [webchat]
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
   providerProtocol?: ProviderProtocol;
   modelEntryId?: string;
   modelProviderLabel?: string;
   reasoning?: LLMReasoningConfig;
   advanced?: AdvancedModelParams;
 }): EffectiveRequestConfig {
-  const fallbackEntry = getSelectedModelEntryForItem(params.item.id);
+  const hasExplicitProviderMetadata = Boolean(
+    params.modelProviderLabel ||
+      params.providerProtocol ||
+      params.authMode ||
+      params.modelEntryId,
+  );
+  const fallbackEntry = hasExplicitProviderMetadata
+    ? null
+    : getSelectedModelEntryForItem(params.item.id);
   const explicitEntry =
-    params.model || params.apiBase || params.apiKey
-      ? getAvailableModelEntries().find(
-          (entry) =>
-            entry.model === (params.model || "").trim() &&
-            entry.apiBase === (params.apiBase || "").trim() &&
-            entry.apiKey === (params.apiKey || "").trim(),
-        ) || null
-      : null;
+    hasExplicitProviderMetadata && params.modelProviderLabel === "Claude Code"
+      ? {
+          entryId:
+            params.modelEntryId ||
+            `claude_runtime::${(params.model || "sonnet").trim() || "sonnet"}`,
+          model: (params.model || "sonnet").trim() || "sonnet",
+          apiBase: params.apiBase ?? "",
+          apiKey: params.apiKey ?? "",
+          authMode: params.authMode || "api_key",
+          providerProtocol:
+            params.providerProtocol || "anthropic_messages",
+          providerLabel: params.modelProviderLabel,
+          advanced: params.advanced,
+        }
+      : params.model || params.apiBase || params.apiKey
+        ? getAvailableModelEntries().find(
+            (entry) =>
+              entry.model === (params.model || "").trim() &&
+              entry.apiBase === (params.apiBase || "").trim() &&
+              entry.apiKey === (params.apiKey || "").trim(),
+          ) || null
+        : null;
   const model = (
     params.model ||
+    explicitEntry?.model ||
     fallbackEntry?.model ||
     getStringPref("modelPrimary") ||
     getStringPref("model") ||
     "gpt-4o-mini"
   ).trim();
-  const apiBase = (params.apiBase || fallbackEntry?.apiBase || "").trim();
-  const apiKey = (params.apiKey || fallbackEntry?.apiKey || "").trim();
+  const apiBase = (
+    params.apiBase !== undefined
+      ? params.apiBase
+      : explicitEntry?.apiBase || fallbackEntry?.apiBase || ""
+  ).trim();
+  const apiKey = (
+    params.apiKey !== undefined
+      ? params.apiKey
+      : explicitEntry?.apiKey || fallbackEntry?.apiKey || ""
+  ).trim();
   const authMode =
     params.authMode ||
-    (fallbackEntry?.authMode === "webchat" ? "webchat" :
-     fallbackEntry?.authMode === "codex_auth" ? "codex_auth" :
-     fallbackEntry?.authMode === "codex_app_server" ? "codex_app_server" : "api_key");
+    explicitEntry?.authMode ||
+    (fallbackEntry?.authMode === "webchat"
+      ? "webchat"
+      : fallbackEntry?.authMode === "codex_auth"
+        ? "codex_auth"
+        : fallbackEntry?.authMode === "codex_app_server"
+          ? "codex_app_server"
+          : fallbackEntry?.authMode === "copilot_auth"
+            ? "copilot_auth"
+            : "api_key");
   const reasoning =
     params.reasoning ||
     getSelectedReasoningForItem(params.item.id, model, apiBase);
   const advanced =
-    params.advanced ||
-    getAdvancedModelParamsForEntry(fallbackEntry?.entryId) ||
-    fallbackEntry?.advanced;
+    params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
   return {
     model,
     apiBase,
@@ -1441,6 +1633,111 @@ function waitForUiStep(): Promise<void> {
   });
 }
 
+const ROSE_LOADER_SVG_NS = "http://www.w3.org/2000/svg";
+
+function mountClaudeRoseThreeLoader(host: HTMLElement, startedAt: number): void {
+  const doc = host.ownerDocument;
+  if (!doc) return;
+  const win = doc.defaultView;
+  if (!win) return;
+
+  const svg = doc.createElementNS(ROSE_LOADER_SVG_NS, "svg") as unknown as SVGSVGElement;
+  svg.setAttribute("viewBox", "0 0 100 100");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("aria-hidden", "true");
+  svg.classList.add("llm-rose-loader-svg");
+
+  const group = doc.createElementNS(ROSE_LOADER_SVG_NS, "g") as unknown as SVGGElement;
+  const path = doc.createElementNS(ROSE_LOADER_SVG_NS, "path") as unknown as SVGPathElement;
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  path.setAttribute("stroke-width", "4.4");
+  path.setAttribute("opacity", "0.1");
+  group.appendChild(path);
+
+  const particleCount = 85;
+  const trailSpan = 0.34;
+  const durationMs = 4600;
+  const rotationDurationMs = 28000;
+  const pulseDurationMs = 4200;
+  const spiralR = 5.0;
+  const spiralr = 1.0;
+  const spiralScale = 2.2;
+  const spiralBreath = 0.45;
+  const spirald = 3.0;
+  const particles = Array.from({ length: particleCount }, () => {
+    const circle = doc.createElementNS(ROSE_LOADER_SVG_NS, "circle") as unknown as SVGCircleElement;
+    circle.setAttribute("fill", "currentColor");
+    group.appendChild(circle);
+    return circle;
+  });
+
+  svg.appendChild(group);
+  host.replaceChildren(svg);
+
+  const normalizeProgress = (progress: number) => ((progress % 1) + 1) % 1;
+  const getDetailScale = (elapsedMs: number) => {
+    const pulseProgress = (elapsedMs % pulseDurationMs) / pulseDurationMs;
+    const pulseAngle = pulseProgress * Math.PI * 2;
+    return 0.52 + ((Math.sin(pulseAngle + 0.55) + 1) / 2) * 0.48;
+  };
+  const getRotation = (elapsedMs: number) =>
+    -((elapsedMs % rotationDurationMs) / rotationDurationMs) * 360;
+  const getPoint = (progress: number, detailScale: number) => {
+    const t = progress * Math.PI * 2;
+    const d = spirald + detailScale * 0.25;
+    const baseX =
+      (spiralR - spiralr) * Math.cos(t) +
+      d * Math.cos(((spiralR - spiralr) / spiralr) * t);
+    const baseY =
+      (spiralR - spiralr) * Math.sin(t) -
+      d * Math.sin(((spiralR - spiralr) / spiralr) * t);
+    const scale = spiralScale + detailScale * spiralBreath;
+    return {
+      x: 50 + baseX * scale,
+      y: 50 + baseY * scale,
+    };
+  };
+  const buildPath = (detailScale: number, steps = 480) => {
+    let d = "";
+    for (let index = 0; index <= steps; index += 1) {
+      const point = getPoint(index / steps, detailScale);
+      d += `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)} `;
+    }
+    return d.trim();
+  };
+
+  let rafId = 0;
+  const render = () => {
+    if (!host.isConnected) {
+      if (rafId) win.cancelAnimationFrame(rafId);
+      return;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    const progress = (elapsedMs % durationMs) / durationMs;
+    const detailScale = getDetailScale(elapsedMs);
+    group.setAttribute("transform", `rotate(${getRotation(elapsedMs).toFixed(3)} 50 50)`);
+    path.setAttribute("d", buildPath(detailScale));
+    for (let index = 0; index < particles.length; index += 1) {
+      const tailOffset = index / Math.max(1, particleCount - 1);
+      const point = getPoint(
+        normalizeProgress(progress - tailOffset * trailSpan),
+        detailScale,
+      );
+      const fade = Math.pow(1 - tailOffset, 0.56);
+      const particle = particles[index]!;
+      particle.setAttribute("cx", point.x.toFixed(2));
+      particle.setAttribute("cy", point.y.toFixed(2));
+      particle.setAttribute("r", (0.9 + fade * 2.7).toFixed(2));
+      particle.setAttribute("opacity", (0.04 + fade * 0.96).toFixed(3));
+    }
+    rafId = win.requestAnimationFrame(render);
+  };
+
+  rafId = win.requestAnimationFrame(render);
+}
+
 export type LatestRetryPair = {
   userIndex: number;
   userMessage: Message;
@@ -1454,6 +1751,7 @@ type AssistantMessageSnapshot = Pick<
   | "modelName"
   | "modelEntryId"
   | "modelProviderLabel"
+  | "pendingAgentTraceEvents"
   | "reasoningSummary"
   | "reasoningDetails"
   | "reasoningOpen"
@@ -1483,6 +1781,9 @@ function takeAssistantSnapshot(message: Message): AssistantMessageSnapshot {
     modelName: message.modelName,
     modelEntryId: message.modelEntryId,
     modelProviderLabel: message.modelProviderLabel,
+    pendingAgentTraceEvents: message.pendingAgentTraceEvents
+      ? message.pendingAgentTraceEvents.map((entry) => ({ ...entry, payload: { ...entry.payload } }))
+      : undefined,
     reasoningSummary: message.reasoningSummary,
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: message.reasoningOpen,
@@ -1500,6 +1801,9 @@ function restoreAssistantSnapshot(
   message.modelName = snapshot.modelName;
   message.modelEntryId = snapshot.modelEntryId;
   message.modelProviderLabel = snapshot.modelProviderLabel;
+  message.pendingAgentTraceEvents = snapshot.pendingAgentTraceEvents
+    ? snapshot.pendingAgentTraceEvents.map((entry) => ({ ...entry, payload: { ...entry.payload } }))
+    : undefined;
   message.reasoningSummary = snapshot.reasoningSummary;
   message.reasoningDetails = snapshot.reasoningDetails;
   message.reasoningOpen = snapshot.reasoningOpen;
@@ -1524,6 +1828,7 @@ function finalizeCancelledAssistantMessage(
   message.reasoningOpen = hasReasoning
     ? message.reasoningOpen !== false
     : false;
+  message.pendingAgentTraceEvents = undefined;
   message.streaming = false;
   message.webchatRunState = undefined;
   message.webchatCompletionReason = null;
@@ -1946,7 +2251,8 @@ export async function editLatestUserMessageAndRetry(
     selectedTextPaperContexts, selectedTextNoteContexts, screenshotImages,
     paperContexts, fullTextPaperContexts, attachments, pdfUploadSystemMessages,
     targetRuntimeMode,
-    expected, model, apiBase, apiKey, reasoning, advanced,
+    expected, model, apiBase, apiKey, authMode, providerProtocol,
+    modelEntryId, modelProviderLabel, reasoning, advanced,
   } = opts;
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
@@ -2049,7 +2355,7 @@ export async function editLatestUserMessageAndRetry(
   retryPair.userMessage.attachmentActiveIndex = undefined;
 
   try {
-    await updateStoredLatestUserMessage(conversationKey, {
+    await updateStoredLatestUserMessageByConversation(conversationKey, {
       text: retryPair.userMessage.text,
       timestamp: retryPair.userMessage.timestamp,
       runMode: retryPair.userMessage.runMode,
@@ -2065,7 +2371,7 @@ export async function editLatestUserMessageAndRetry(
       attachments: retryPair.userMessage.attachments,
     });
 
-    const storedMessages = await loadConversation(
+    const storedMessages = await loadStoredConversationByKey(
       conversationKey,
       PERSISTED_HISTORY_LIMIT,
     );
@@ -2088,6 +2394,10 @@ export async function editLatestUserMessageAndRetry(
       model,
       apiBase,
       apiKey,
+      authMode,
+      providerProtocol,
+      modelEntryId,
+      modelProviderLabel,
       reasoning,
       advanced,
     );
@@ -2098,6 +2408,10 @@ export async function editLatestUserMessageAndRetry(
       model,
       apiBase,
       apiKey,
+      authMode,
+      providerProtocol,
+      modelEntryId,
+      modelProviderLabel,
       reasoning,
       advanced,
       pdfUploadSystemMessages,
@@ -2112,6 +2426,10 @@ export async function retryLatestAssistantResponse(
   model?: string,
   apiBase?: string,
   apiKey?: string,
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat",
+  providerProtocol?: ProviderProtocol,
+  modelEntryId?: string,
+  modelProviderLabel?: string,
   reasoning?: LLMReasoningConfig,
   advanced?: AdvancedModelParams,
   pdfUploadSystemMessages?: string[],
@@ -2139,6 +2457,24 @@ export async function retryLatestAssistantResponse(
   assistantMessage.runMode = "chat";
   assistantMessage.agentRunId = undefined;
   assistantMessage.streaming = true;
+  const effectiveRequestConfig = resolveEffectiveRequestConfig({
+    item,
+    model,
+    apiBase,
+    apiKey,
+    authMode,
+    providerProtocol,
+    modelEntryId,
+    modelProviderLabel,
+    reasoning,
+    advanced,
+  });
+  assistantMessage.modelName = effectiveRequestConfig.model;
+  assistantMessage.modelEntryId = effectiveRequestConfig.modelEntryId;
+  assistantMessage.modelProviderLabel =
+    effectiveRequestConfig.modelProviderLabel;
+  assistantMessage.waitingAnimationStartedAt =
+    assistantMessage.modelProviderLabel === "Claude Code" ? Date.now() : undefined;
   const { refreshChatSafely, setStatusSafely } = createPanelUpdateHelpers(
     body,
     item,
@@ -2160,19 +2496,6 @@ export async function retryLatestAssistantResponse(
     return;
   }
 
-  const effectiveRequestConfig = resolveEffectiveRequestConfig({
-    item,
-    model,
-    apiBase,
-    apiKey,
-    reasoning,
-    advanced,
-  });
-  // Update model name before first refresh so streaming UI shows the correct model immediately
-  assistantMessage.modelName = effectiveRequestConfig.model;
-  assistantMessage.modelEntryId = effectiveRequestConfig.modelEntryId;
-  assistantMessage.modelProviderLabel =
-    effectiveRequestConfig.modelProviderLabel;
   refreshChatSafely();
   let streamedAnswer = "";
   let streamedReasoningSummary: string | undefined;
@@ -2185,7 +2508,8 @@ export async function retryLatestAssistantResponse(
   const finalizeCancelledAssistant = async () => {
     finalizeCancelledAssistantMessage(assistantMessage);
     refreshChatSafely();
-    await updateStoredLatestAssistantMessage(conversationKey, {
+    const latestContextSnapshot = contextUsageSnapshots.get(conversationKey);
+    await updateStoredLatestAssistantMessageByConversation(conversationKey, {
       text: assistantMessage.text,
       timestamp: assistantMessage.timestamp,
       runMode: assistantMessage.runMode,
@@ -2195,6 +2519,9 @@ export async function retryLatestAssistantResponse(
       modelProviderLabel: assistantMessage.modelProviderLabel,
       reasoningSummary: assistantMessage.reasoningSummary,
       reasoningDetails: assistantMessage.reasoningDetails,
+      compactMarker: assistantMessage.compactMarker,
+      contextTokens: latestContextSnapshot?.contextTokens,
+      contextWindow: latestContextSnapshot?.contextWindow,
     });
     setStatusSafely("Cancelled", "ready");
   };
@@ -2263,7 +2590,7 @@ export async function retryLatestAssistantResponse(
       contextPlan.fullTextPaperContexts.length
         ? contextPlan.fullTextPaperContexts
       : undefined;
-    await updateStoredLatestUserMessage(conversationKey, {
+    await updateStoredLatestUserMessageByConversation(conversationKey, {
       text: retryPair.userMessage.text,
       timestamp: retryPair.userMessage.timestamp,
       runMode: retryPair.userMessage.runMode,
@@ -2360,7 +2687,22 @@ export async function retryLatestAssistantResponse(
           conversationKey,
           usage.totalTokens,
         );
-        if (ui.tokenUsageEl) setTokenUsage(ui.tokenUsageEl, total);
+        const contextWindow =
+          resolveConversationSystemForItem(item) === "claude_code"
+            ? getContextInputWindow(effectiveRequestConfig)
+            : undefined;
+        contextUsageSnapshots.set(conversationKey, {
+          contextTokens: total,
+          contextWindow,
+        });
+        if (ui.tokenUsageEl) {
+          setTokenUsage(
+            ui.tokenUsageEl,
+            total,
+            contextWindow,
+            body.querySelector("#llm-claude-context-gauge") as HTMLElement | null,
+          );
+        }
       },
     );
 
@@ -2382,10 +2724,15 @@ export async function retryLatestAssistantResponse(
     assistantMessage.reasoningSummary = streamedReasoningSummary;
     assistantMessage.reasoningDetails = streamedReasoningDetails;
     assistantMessage.reasoningOpen = isReasoningExpandedByDefault();
+    assistantMessage.compactMarker = /^\/compact(?:\s|$)/i.test(question.trim());
+    if (assistantMessage.compactMarker && !assistantMessage.text.trim()) {
+      assistantMessage.text = "Conversation compacted";
+    }
     assistantMessage.streaming = false;
     refreshChatSafely();
 
-    await updateStoredLatestAssistantMessage(conversationKey, {
+    const latestContextSnapshot = contextUsageSnapshots.get(conversationKey);
+    await updateStoredLatestAssistantMessageByConversation(conversationKey, {
       text: assistantMessage.text,
       timestamp: assistantMessage.timestamp,
       runMode: assistantMessage.runMode,
@@ -2395,6 +2742,9 @@ export async function retryLatestAssistantResponse(
       modelProviderLabel: assistantMessage.modelProviderLabel,
       reasoningSummary: assistantMessage.reasoningSummary,
       reasoningDetails: assistantMessage.reasoningDetails,
+      compactMarker: assistantMessage.compactMarker,
+      contextTokens: latestContextSnapshot?.contextTokens,
+      contextWindow: latestContextSnapshot?.contextWindow,
     });
 
     setStatusSafely("Ready", "ready");
@@ -2449,6 +2799,10 @@ export async function editUserTurnAndRetry(opts: {
   model?: string;
   apiBase?: string;
   apiKey?: string;
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
+  providerProtocol?: ProviderProtocol;
+  modelEntryId?: string;
+  modelProviderLabel?: string;
   reasoning?: LLMReasoningConfig;
   advanced?: AdvancedModelParams;
 }): Promise<void> {
@@ -2458,7 +2812,8 @@ export async function editUserTurnAndRetry(opts: {
     selectedTextNoteContexts, screenshotImages, paperContexts,
     fullTextPaperContexts, attachments, pdfUploadSystemMessages,
     targetRuntimeMode,
-    model, apiBase, apiKey, reasoning, advanced,
+    model, apiBase, apiKey, authMode, providerProtocol,
+    modelEntryId, modelProviderLabel, reasoning, advanced,
   } = opts;
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
@@ -2506,7 +2861,15 @@ export async function editUserTurnAndRetry(opts: {
   // Delete persisted subsequent turns
   for (const p of subsequentPairs) {
     try {
-      await deleteStoredTurnMessages(conversationKey, p.userTs, p.assistantTs);
+      if (isClaudeConversationKey(conversationKey)) {
+        await deleteClaudeConversationTurnMessages(
+          conversationKey,
+          p.userTs,
+          p.assistantTs,
+        );
+      } else {
+        await deleteStoredTurnMessages(conversationKey, p.userTs, p.assistantTs);
+      }
     } catch (err) {
       ztoolkit.log("LLM: Failed to delete subsequent stored turn", err);
     }
@@ -2596,7 +2959,7 @@ export async function editUserTurnAndRetry(opts: {
 
   // Persist the updated user message
   try {
-    await updateStoredLatestUserMessage(conversationKey, {
+    await updateStoredLatestUserMessageByConversation(conversationKey, {
       text: userMsg.text,
       timestamp: userMsg.timestamp,
       runMode: userMsg.runMode,
@@ -2619,6 +2982,10 @@ export async function editUserTurnAndRetry(opts: {
   const resolvedModel = model || profile?.model;
   const resolvedApiBase = apiBase ?? profile?.apiBase;
   const resolvedApiKey = apiKey ?? profile?.apiKey;
+  const resolvedAuthMode = opts.authMode ?? profile?.authMode;
+  const resolvedProviderProtocol = opts.providerProtocol ?? profile?.providerProtocol;
+  const resolvedModelEntryId = opts.modelEntryId ?? profile?.entryId;
+  const resolvedModelProviderLabel = opts.modelProviderLabel ?? profile?.providerLabel;
   const resolvedReasoning =
     reasoning ||
     getSelectedReasoningForItem(item.id, resolvedModel || "", resolvedApiBase);
@@ -2635,6 +3002,10 @@ export async function editUserTurnAndRetry(opts: {
       resolvedModel,
       resolvedApiBase,
       resolvedApiKey,
+      resolvedAuthMode,
+      resolvedProviderProtocol,
+      resolvedModelEntryId,
+      resolvedModelProviderLabel,
       resolvedReasoning,
       resolvedAdvanced,
     );
@@ -2645,6 +3016,10 @@ export async function editUserTurnAndRetry(opts: {
       resolvedModel,
       resolvedApiBase,
       resolvedApiKey,
+      resolvedAuthMode,
+      resolvedProviderProtocol,
+      resolvedModelEntryId,
+      resolvedModelProviderLabel,
       resolvedReasoning,
       resolvedAdvanced,
       pdfUploadSystemMessages,
@@ -2738,6 +3113,17 @@ async function buildAgentRuntimeRequest(
     authMode: params.effectiveRequestConfig.authMode,
     providerProtocol: params.effectiveRequestConfig.providerProtocol,
     reasoning: params.effectiveRequestConfig.reasoning,
+    claudeEffortLevel:
+      typeof params.effectiveRequestConfig.reasoning?.level === "string"
+        ? ((params.effectiveRequestConfig.reasoning.level === "xhigh"
+            ? (getClaudeReasoningModePref() === "max" ? "max" : "xhigh")
+            : params.effectiveRequestConfig.reasoning.level) as
+            | "low"
+            | "medium"
+            | "high"
+            | "xhigh"
+            | "max")
+        : undefined,
     advanced: params.effectiveRequestConfig.advanced,
     history: params.history,
     item: params.item,
@@ -2745,10 +3131,21 @@ async function buildAgentRuntimeRequest(
     modelProviderLabel: params.effectiveRequestConfig.modelProviderLabel,
     libraryID: params.item.libraryID,
     activeNoteContext: buildActiveNoteRuntimeContext(params.item),
+    metadata: {
+      claudeAutoCompactEligible:
+        params.effectiveRequestConfig.modelProviderLabel === "Claude Code" &&
+        isClaudeAutoCompactEnabled() &&
+        !/^\/compact(?:\s|$)/i.test(params.userText.trim()),
+      claudeAutoCompactThresholdPercent:
+        params.effectiveRequestConfig.modelProviderLabel === "Claude Code"
+          ? getClaudeAutoCompactThresholdPercent()
+          : undefined,
+      claudeHistoryLength: params.history.length,
+    },
   };
 }
 
-function buildAgentEngineDeps(): AgentEngineDeps {
+function buildAgentEngineDeps(currentItem?: Zotero.Item): AgentEngineDeps {
   return {
     chatHistory,
     agentRunTraceCache,
@@ -2767,6 +3164,17 @@ function buildAgentEngineDeps(): AgentEngineDeps {
     buildLLMHistoryMessages,
     buildAgentRuntimeRequest,
     resolveEffectiveRequestConfig,
+    getConversationSystem: () => resolveConversationSystemForItem(currentItem) || "upstream",
+    accumulateSessionTokens,
+    getContextUsageSnapshot: (conversationKey: number) =>
+      contextUsageSnapshots.get(conversationKey),
+    setContextUsageSnapshot: (
+      conversationKey: number,
+      snapshot: { contextTokens: number; contextWindow?: number },
+    ) => {
+      contextUsageSnapshots.set(conversationKey, snapshot);
+    },
+    setTokenUsage,
     normalizeSelectedTexts,
     normalizeSelectedTextSources,
     normalizeSelectedTextPaperContextsByIndex,
@@ -2780,13 +3188,19 @@ function buildAgentEngineDeps(): AgentEngineDeps {
     waitForUiStep,
     finalizeCancelledAssistantMessage,
     sanitizeText,
-    accumulateSessionTokens,
-    setTokenUsage,
+    appendReasoningPart,
     persistConversationMessage,
-    updateStoredLatestUserMessage: updateStoredLatestUserMessage as AgentEngineDeps["updateStoredLatestUserMessage"],
-    updateStoredLatestAssistantMessage: updateStoredLatestAssistantMessage as AgentEngineDeps["updateStoredLatestAssistantMessage"],
+    updateStoredLatestUserMessage:
+      updateStoredLatestUserMessageByConversation as AgentEngineDeps["updateStoredLatestUserMessage"],
+    updateStoredLatestAssistantMessage:
+      updateStoredLatestAssistantMessageByConversation as AgentEngineDeps["updateStoredLatestAssistantMessage"],
     sendChatFallback: sendQuestion,
-    getAgentRuntime,
+    getAgentRuntime: () =>
+      resolveConversationSystemForItem(currentItem) === "claude_code"
+        ? (getClaudeBridgeRuntime(
+            getCoreAgentRuntime(),
+          ) as unknown as ReturnType<typeof getCoreAgentRuntime>)
+        : getCoreAgentRuntime(),
     maxSelectedImages: MAX_SELECTED_IMAGES,
   };
 }
@@ -2804,10 +3218,27 @@ async function retryLatestAgentResponse(
   model?: string,
   apiBase?: string,
   apiKey?: string,
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat",
+  providerProtocol?: ProviderProtocol,
+  modelEntryId?: string,
+  modelProviderLabel?: string,
   reasoning?: LLMReasoningConfig,
   advanced?: AdvancedModelParams,
 ): Promise<void> {
-  await retryAgentTurn(body, item, model, apiBase, apiKey, reasoning, advanced, buildAgentEngineDeps());
+  await retryAgentTurn(
+    body,
+    item,
+    model,
+    apiBase,
+    apiKey,
+    authMode,
+    providerProtocol,
+    modelEntryId,
+    modelProviderLabel,
+    reasoning,
+    advanced,
+    buildAgentEngineDeps(item),
+  );
 }
 
 async function sendAgentQuestion(opts: {
@@ -2818,6 +3249,10 @@ async function sendAgentQuestion(opts: {
   model?: string;
   apiBase?: string;
   apiKey?: string;
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
+  providerProtocol?: ProviderProtocol;
+  modelEntryId?: string;
+  modelProviderLabel?: string;
   reasoning?: LLMReasoningConfig;
   advanced?: AdvancedModelParams;
   displayQuestion?: string;
@@ -2832,7 +3267,7 @@ async function sendAgentQuestion(opts: {
   forcedSkillIds?: string[];
   pdfUploadSystemMessages?: string[];
 }): Promise<void> {
-  await sendAgentTurn(opts, buildAgentEngineDeps());
+  await sendAgentTurn(opts, buildAgentEngineDeps(opts.item));
 }
 
 export async function sendQuestion(opts: import("./types").SendQuestionOptions) {
@@ -2844,10 +3279,29 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
   } = opts;
   if (runtimeMode === "agent" && !skipAgentDispatch) {
     await sendAgentQuestion({
-      body, item, question, images, model, apiBase, apiKey, reasoning, advanced,
-      displayQuestion, selectedTexts, selectedTextSources, selectedTextPaperContexts,
-      selectedTextNoteContexts, paperContexts, fullTextPaperContexts, attachments,
-      pdfModePaperKeys, forcedSkillIds: opts.forcedSkillIds,
+      body,
+      item,
+      question,
+      images,
+      model,
+      apiBase,
+      apiKey,
+      authMode: opts.authMode,
+      providerProtocol: opts.providerProtocol,
+      modelEntryId: opts.modelEntryId,
+      modelProviderLabel: opts.modelProviderLabel,
+      reasoning,
+      advanced,
+      displayQuestion,
+      selectedTexts,
+      selectedTextSources,
+      selectedTextPaperContexts,
+      selectedTextNoteContexts,
+      paperContexts,
+      fullTextPaperContexts,
+      attachments,
+      pdfModePaperKeys,
+      forcedSkillIds: opts.forcedSkillIds,
       pdfUploadSystemMessages: opts.pdfUploadSystemMessages,
     });
     return;
@@ -2862,7 +3316,52 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
   // Show cancel, hide send
   setRequestUIBusy(body, ui, initialConversationKey, "Preparing request...");
 
+  const shownQuestion = displayQuestion || question;
   await ensureConversationLoaded(item);
+  const provisionalConversationKey = getConversationKey(item);
+  if (!chatHistory.has(provisionalConversationKey)) {
+    chatHistory.set(provisionalConversationKey, []);
+  }
+  const provisionalHistory = chatHistory.get(provisionalConversationKey)!;
+  const reuseAgentFallbackPlaceholder = runtimeMode === "agent" && skipAgentDispatch;
+  const existingFallbackUser =
+    reuseAgentFallbackPlaceholder && provisionalHistory.length >= 2
+      ? provisionalHistory[provisionalHistory.length - 2]
+      : null;
+  const existingFallbackAssistant =
+    reuseAgentFallbackPlaceholder && provisionalHistory.length >= 1
+      ? provisionalHistory[provisionalHistory.length - 1]
+      : null;
+  const optimisticUserMessage: Message = existingFallbackUser || {
+    role: "user",
+    text: shownQuestion,
+    timestamp: Date.now(),
+    runMode: runtimeMode,
+    agentRunId: agentRunId || undefined,
+  };
+  const optimisticAssistantMessage: Message = existingFallbackAssistant || {
+    role: "assistant",
+    text: "",
+    timestamp: Date.now(),
+    runMode: runtimeMode,
+    agentRunId: agentRunId || undefined,
+    modelName: model,
+    streaming: true,
+    waitingAnimationStartedAt: Date.now(),
+    reasoningOpen: isReasoningExpandedByDefault(),
+  };
+  if (!reuseAgentFallbackPlaceholder) {
+    provisionalHistory.push(optimisticUserMessage, optimisticAssistantMessage);
+  }
+  const optimisticHelpers = createPanelUpdateHelpers(
+    body,
+    item,
+    provisionalConversationKey,
+    ui,
+  );
+  optimisticHelpers.setStatusSafely("Checking the request against the attached context.", "sending");
+  optimisticHelpers.refreshChatSafely();
+
   const conversationKey = getConversationKey(item);
 
   // Add user message with attached selected text / screenshots metadata
@@ -2870,7 +3369,16 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     chatHistory.set(conversationKey, []);
   }
   const history = chatHistory.get(conversationKey)!;
-  const historyForLLM = history.slice();
+  const reuseOptimisticPair =
+    !reuseAgentFallbackPlaceholder &&
+    conversationKey === provisionalConversationKey &&
+    history === provisionalHistory &&
+    history.length >= 2 &&
+    history[history.length - 2] === optimisticUserMessage &&
+    history[history.length - 1] === optimisticAssistantMessage;
+  const historyForLLM = reuseOptimisticPair
+    ? history.slice(0, -2)
+    : history.slice();
   const effectiveRequestConfig = resolveEffectiveRequestConfig({
     item,
     model,
@@ -2883,7 +3391,6 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     authMode: effectiveRequestConfig.authMode,
     runtimeMode,
   });
-  const shownQuestion = displayQuestion || question;
   const selectedTextsForMessage = normalizeSelectedTexts(selectedTexts);
   const selectedTextSourcesForMessage = normalizeSelectedTextSources(
     selectedTextSources,
@@ -2925,7 +3432,7 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
   const userMessage: Message = {
     role: "user",
     text: userMessageText,
-    timestamp: Date.now(),
+    timestamp: optimisticUserMessage.timestamp,
     runMode: runtimeMode,
     agentRunId: agentRunId || undefined,
     selectedText: selectedTextForMessage || undefined,
@@ -2961,8 +3468,12 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
     screenshotActiveIndex: 0,
     attachments: attachments?.length ? attachments : undefined,
   };
-  history.push(userMessage);
-  await persistConversationMessage(conversationKey, {
+  if (reuseOptimisticPair) {
+    history[history.length - 2] = userMessage;
+  } else {
+    history.push(userMessage);
+  }
+  void persistConversationMessage(conversationKey, {
     role: "user",
     text: userMessage.text,
     timestamp: userMessage.timestamp,
@@ -2979,18 +3490,24 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
   });
 
   const assistantMessage: Message = {
-    role: "assistant",
-    text: "",
-    timestamp: Date.now(),
+    ...optimisticAssistantMessage,
+    timestamp: optimisticAssistantMessage.timestamp,
     runMode: runtimeMode,
     agentRunId: agentRunId || undefined,
     modelName: effectiveRequestConfig.model,
     modelEntryId: effectiveRequestConfig.modelEntryId,
     modelProviderLabel: effectiveRequestConfig.modelProviderLabel,
-    streaming: true,
+    waitingAnimationStartedAt:
+      effectiveRequestConfig.modelProviderLabel === "Claude Code"
+        ? optimisticAssistantMessage.waitingAnimationStartedAt || Date.now()
+        : undefined,
     reasoningOpen: isReasoningExpandedByDefault(),
   };
-  history.push(assistantMessage);
+  if (reuseOptimisticPair) {
+    history[history.length - 1] = assistantMessage;
+  } else {
+    history.push(assistantMessage);
+  }
   if (history.length > PERSISTED_HISTORY_LIMIT) {
     history.splice(0, history.length - PERSISTED_HISTORY_LIMIT);
   }
@@ -3180,7 +3697,7 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
       contextPlan.fullTextPaperContexts.length
         ? contextPlan.fullTextPaperContexts
       : undefined;
-    await updateStoredLatestUserMessage(conversationKey, {
+    await updateStoredLatestUserMessageByConversation(conversationKey, {
       text: userMessage.text,
       timestamp: userMessage.timestamp,
       runMode: userMessage.runMode,
@@ -3273,7 +3790,22 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
           conversationKey,
           usage.totalTokens,
         );
-        if (ui.tokenUsageEl) setTokenUsage(ui.tokenUsageEl, total);
+        const contextWindow =
+          resolveConversationSystemForItem(item) === "claude_code"
+            ? getContextInputWindow(effectiveRequestConfig)
+            : undefined;
+        contextUsageSnapshots.set(conversationKey, {
+          contextTokens: total,
+          contextWindow,
+        });
+        if (ui.tokenUsageEl) {
+          setTokenUsage(
+            ui.tokenUsageEl,
+            total,
+            contextWindow,
+            body.querySelector("#llm-claude-context-gauge") as HTMLElement | null,
+          );
+        }
       },
     );
 
@@ -3289,9 +3821,32 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
       sanitizeText(answer) || assistantMessage.text || "No response.";
     assistantMessage.runMode = runtimeMode;
     assistantMessage.agentRunId = agentRunId || assistantMessage.agentRunId;
+    assistantMessage.compactMarker = /^\/compact(?:\s|$)/i.test(question.trim());
+    if (assistantMessage.compactMarker && !assistantMessage.text.trim()) {
+      assistantMessage.text = "Conversation compacted";
+    }
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
+    if (resolveConversationSystemForItem(item) === "claude_code") {
+      const conversationKind = resolveDisplayConversationKind(item);
+      const baseItem = resolveConversationBaseItem(item);
+      await captureClaudeSessionInfo(
+        conversationKey,
+        buildClaudeScope({
+          libraryID: Number(item.libraryID || baseItem?.libraryID || 0),
+          kind: conversationKind === "global" ? "global" : "paper",
+          paperItemID:
+            conversationKind === "paper"
+              ? Number(baseItem?.id || 0) || undefined
+              : undefined,
+          paperTitle:
+            conversationKind === "paper"
+              ? String(baseItem?.getField?.("title") || "").trim() || undefined
+              : undefined,
+        }),
+      ).catch(() => null);
+    }
 
     // After the response is saved, kick off a background LLM summary of the
     // older history so it is ready for the next request.
@@ -3499,18 +4054,41 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
       ? cachedSnapshot
       : buildChatScrollSnapshot(chatBox);
   const history = chatHistory.get(conversationKey) || [];
-  if (tokenUsageEl)
-    setTokenUsage(
-      tokenUsageEl,
-      getOrSeedSessionTokens(conversationKey, history),
-    );
+  if (tokenUsageEl) {
+    const snapshot = contextUsageSnapshots.get(conversationKey);
+    if (isClaudeConversationSystemActive()) {
+      const contextTokens =
+        typeof snapshot?.contextTokens === "number" && snapshot.contextTokens > 0
+          ? snapshot.contextTokens
+          : 0;
+      const contextWindow =
+        typeof snapshot?.contextWindow === "number" && snapshot.contextWindow > 0
+          ? snapshot.contextWindow
+          : undefined;
+      setTokenUsage(
+        tokenUsageEl,
+        contextTokens,
+        contextWindow,
+        body.querySelector("#llm-claude-context-gauge") as HTMLElement | null,
+      );
+    } else {
+      const contextWindow = getContextInputWindow(resolveEffectiveRequestConfig({ item }));
+      const seededTokens = getOrSeedSessionTokens(conversationKey, history);
+      setTokenUsage(
+        tokenUsageEl,
+        seededTokens,
+        contextWindow,
+        body.querySelector("#llm-claude-context-gauge") as HTMLElement | null,
+      );
+    }
+  }
 
   if (history.length === 0) {
     // [webchat] Show webchat-specific welcome instead of generic instructions
-    const effectiveConfig = resolveEffectiveRequestConfig({ item });
-    if (effectiveConfig.providerProtocol === "web_sync") {
+    const effectiveRequestConfig = resolveEffectiveRequestConfig({ item });
+    if (effectiveRequestConfig.providerProtocol === "web_sync") {
       const { getWebChatTargetByModelName } = require("../../webchat/types") as typeof import("../../webchat/types");
-      const targetEntry = getWebChatTargetByModelName(effectiveConfig.model || "");
+      const targetEntry = getWebChatTargetByModelName(effectiveRequestConfig.model || "");
       chatBox.innerHTML = getWebChatWelcomeHtml(targetEntry?.label, targetEntry?.modelName);
     } else {
       const isStandalone = panelRoot?.dataset?.standalone === "true" || (body as HTMLElement).dataset?.standalone === "true";
@@ -4156,7 +4734,15 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
         index > 0 && history[index - 1]?.role === "user"
           ? history[index - 1]
           : null;
+      const isClaudeStreamingConversation = resolveConversationSystemForItem(item) === "claude_code";
       const agentRunId = msg.agentRunId?.trim();
+      const hasCachedTrace = agentRunId
+        ? agentRunTraceCache.has(agentRunId)
+        : false;
+      const cachedTraceEvents = agentRunId ? getCachedAgentRunEvents(agentRunId) : [];
+      const traceEvents = cachedTraceEvents.length
+        ? cachedTraceEvents
+        : msg.pendingAgentTraceEvents || [];
       let agentUsesInterleavedText = false;
       const agentTraceEl =
         msg.runMode === "agent"
@@ -4164,8 +4750,9 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
               doc,
               message: msg,
               userMessage: previousUserMessage,
-              events: getCachedAgentRunEvents(agentRunId),
+              events: traceEvents,
               onTraceMissing: agentRunId
+                && !hasCachedTrace
                 ? () => {
                     void ensureAgentRunTraceLoaded(agentRunId, body, item);
                   }
@@ -4176,7 +4763,12 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
       if (hasAnswerText && !agentUsesInterleavedText) {
         const safeText = sanitizeText(msg.text);
         if (msg.streaming) bubble.classList.add("streaming");
-        try {
+        if (msg.compactMarker) {
+          bubble.textContent = safeText || "Conversation compacted";
+          bubble.classList.add("llm-compact-marker");
+        } else if (msg.streaming && looksLikeStreamingMarkdownTable(safeText)) {
+          bubble.textContent = safeText;
+        } else try {
           // Build image resolver for MinerU figures (if applicable)
           const contextSource = resolveContextSourceItem(item);
           const ctxItem = contextSource.contextItem;
@@ -4185,6 +4777,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
             ? buildImageResolver(ctxItem.id)
             : undefined;
           bubble.innerHTML = renderMarkdown(safeText, { resolveImage });
+          attachRenderedCopyButtons(bubble, doc);
         } catch (err) {
           ztoolkit.log("LLM render error:", err);
           bubble.textContent = safeText;
@@ -4278,18 +4871,41 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
       const bubbleHeaderNodes: HTMLElement[] = [];
 
       if (hasModelName) {
+        const modelHeader = doc.createElement("div") as HTMLDivElement;
+        modelHeader.className = "llm-model-header";
+
         const modelName = doc.createElement("div") as HTMLDivElement;
         modelName.className = "llm-model-name";
         modelName.textContent = formatDisplayModelName(
           msg.modelName,
           msg.modelProviderLabel,
+          { suppressProviderPrefix: resolveConversationSystemForItem(item) === "claude_code" },
         );
-        bubbleHeaderNodes.push(modelName);
+        modelHeader.appendChild(modelName);
+
+        if (
+          !hasAnswerText &&
+          msg.streaming &&
+          isClaudeStreamingConversation
+        ) {
+          const roseLoader = doc.createElement("span") as HTMLSpanElement;
+          roseLoader.className = "llm-rose-loader llm-rose-loader-inline";
+          mountClaudeRoseThreeLoader(
+            roseLoader,
+            msg.waitingAnimationStartedAt || msg.timestamp || Date.now(),
+          );
+          modelHeader.appendChild(roseLoader);
+        }
+
+        bubbleHeaderNodes.push(modelHeader);
       }
 
       const hasReasoningSummary = Boolean(msg.reasoningSummary?.trim());
       const hasReasoningDetails = Boolean(msg.reasoningDetails?.trim());
-      if (hasReasoningSummary || hasReasoningDetails) {
+      const showTopReasoningPanel =
+        (hasReasoningSummary || hasReasoningDetails) &&
+        msg.runMode !== "agent";
+      if (showTopReasoningPanel) {
         const details = doc.createElement("details") as HTMLDetailsElement;
         details.className = "llm-agent-reasoning";
         details.open = Boolean(msg.reasoningOpen);
@@ -4332,6 +4948,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           text.className = "llm-agent-reasoning-text";
           try {
             text.innerHTML = renderMarkdown(msg.reasoningSummary || "");
+            attachRenderedCopyButtons(text, doc);
           } catch (err) {
             ztoolkit.log("LLM reasoning render error:", err);
             text.textContent = msg.reasoningSummary || "";
@@ -4350,6 +4967,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           text.className = "llm-agent-reasoning-text";
           try {
             text.innerHTML = renderMarkdown(msg.reasoningDetails || "");
+            attachRenderedCopyButtons(text, doc);
           } catch (err) {
             ztoolkit.log("LLM reasoning render error:", err);
             text.textContent = msg.reasoningDetails || "";
@@ -4370,7 +4988,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
         bubble.insertBefore(bubbleHeaderNodes[i], bubble.firstChild);
       }
 
-      if (msg.streaming || !hasAnswerText) {
+      if (!hasAnswerText && !(msg.streaming && isClaudeStreamingConversation)) {
         const typing = doc.createElement("div") as HTMLDivElement;
         typing.className = "llm-typing";
         typing.innerHTML =
