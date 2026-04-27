@@ -4736,6 +4736,9 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           : null;
       const isClaudeStreamingConversation = resolveConversationSystemForItem(item) === "claude_code";
       const agentRunId = msg.agentRunId?.trim();
+      const hasCachedTrace = agentRunId
+        ? agentRunTraceCache.has(agentRunId)
+        : false;
       const cachedTraceEvents = agentRunId ? getCachedAgentRunEvents(agentRunId) : [];
       const traceEvents = cachedTraceEvents.length
         ? cachedTraceEvents
@@ -4749,6 +4752,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
               userMessage: previousUserMessage,
               events: traceEvents,
               onTraceMissing: agentRunId
+                && !hasCachedTrace
                 ? () => {
                     void ensureAgentRunTraceLoaded(agentRunId, body, item);
                   }

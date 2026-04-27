@@ -2732,7 +2732,13 @@ export function renderAgentTrace({
   onInterleavedText,
 }: RenderAgentTraceParams): HTMLElement | null {
   const runId = message.agentRunId?.trim() || "pending";
-  if (!events.length && !message.pendingAgentTraceEvents?.length) return null;
+  if (
+    !events.length &&
+    !message.pendingAgentTraceEvents?.length &&
+    !onTraceMissing
+  ) {
+    return null;
+  }
   const wrap = doc.createElement("div");
   wrap.className = "llm-agent-activity";
   const list = doc.createElement("div");
