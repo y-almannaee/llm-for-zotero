@@ -124,10 +124,7 @@ function getBootstrapInstructionTemplate(managedBlock = getManagedInstructionBlo
 function upgradeManagedInstructionBlock(content: string): string {
   const normalized = normalizeManagedInstructionBlockContent(content);
   if (!normalized) return getDefaultClaudeManagedInstructionBlock();
-  if (
-    normalized.includes("Shared Zotero profile runtime root:") &&
-    !normalized.includes("parent `~/Zotero/agent-runtime/.claude/`")
-  ) {
+  if (normalized.includes("Shared Zotero profile runtime root:")) {
     return normalized;
   }
   const configModelIndex = normalized.indexOf("\n## Config model");
