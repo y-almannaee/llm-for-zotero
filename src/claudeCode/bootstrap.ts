@@ -55,7 +55,6 @@ function getConfigModelInstructionLines(): string[] {
     `- Shared Zotero skills go in \`${skillsDir}/\`; shared commands go in \`${commandsDir}/\`.`,
     "- Different Zotero profiles use different Claude runtime roots and different local conversation folders.",
     "- Local config is scoped to the current conversation runtime folder under the profile runtime root.",
-    "- Do not install Zotero-wide skills under the parent `~/Zotero/agent-runtime/.claude/`; that path is legacy and is not the active profile project config.",
   ];
 }
 
@@ -125,7 +124,10 @@ function getBootstrapInstructionTemplate(managedBlock = getManagedInstructionBlo
 function upgradeManagedInstructionBlock(content: string): string {
   const normalized = normalizeManagedInstructionBlockContent(content);
   if (!normalized) return getDefaultClaudeManagedInstructionBlock();
-  if (normalized.includes("Shared Zotero profile runtime root:")) {
+  if (
+    normalized.includes("Shared Zotero profile runtime root:") &&
+    !normalized.includes("parent `~/Zotero/agent-runtime/.claude/`")
+  ) {
     return normalized;
   }
   const configModelIndex = normalized.indexOf("\n## Config model");
