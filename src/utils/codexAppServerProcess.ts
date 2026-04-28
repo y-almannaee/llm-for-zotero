@@ -681,6 +681,7 @@ function normalizeCodexAppServerText(value: unknown): string {
 function extractCodexAppServerItem(rawParams: unknown): {
   id?: string;
   type?: string;
+  role?: string;
   summary?: string;
   details?: string;
 } | null {
@@ -695,6 +696,7 @@ function extractCodexAppServerItem(rawParams: unknown): {
   const item = source as {
     id?: unknown;
     type?: unknown;
+    role?: unknown;
     summary?: unknown;
     content?: unknown;
     text?: unknown;
@@ -709,6 +711,10 @@ function extractCodexAppServerItem(rawParams: unknown): {
       typeof item.type === "string" && item.type.trim()
         ? item.type.trim().toLowerCase()
         : undefined,
+    role:
+      typeof item.role === "string" && item.role.trim()
+        ? item.role.trim().toLowerCase()
+        : undefined,
     summary: normalizeCodexAppServerText(item.summary) || undefined,
     details:
       normalizeCodexAppServerText(item.content) ||
@@ -716,6 +722,47 @@ function extractCodexAppServerItem(rawParams: unknown): {
       normalizeCodexAppServerText(item.text) ||
       undefined,
   };
+}
+
+function extractCodexAppServerMessageItemId(rawParams: unknown): string {
+  if (!rawParams || typeof rawParams !== "object") return "";
+  const source =
+    rawParams &&
+    typeof (rawParams as { item?: unknown }).item === "object" &&
+    (rawParams as { item?: unknown }).item
+      ? (rawParams as { item: unknown }).item
+      : rawParams;
+  if (!source || typeof source !== "object") return "";
+  const typed = source as {
+    itemId?: unknown;
+    messageId?: unknown;
+    outputItemId?: unknown;
+    id?: unknown;
+    message?: { id?: unknown };
+  };
+  for (const value of [
+    typed.itemId,
+    typed.messageId,
+    typed.outputItemId,
+    typed.id,
+    typed.message?.id,
+  ]) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function isCodexAppServerAgentMessageItem(item: {
+  type?: string;
+  role?: string;
+}): boolean {
+  const normalized = (item.type || "").replace(/[-_\s]+/g, "").toLowerCase();
+  const role = (item.role || "").replace(/[-_\s]+/g, "").toLowerCase();
+  return (
+    normalized === "agentmessage" ||
+    normalized === "assistantmessage" ||
+    (normalized === "message" && (role === "assistant" || role === "agent"))
+  );
 }
 
 function extractCodexAppServerNotificationTurnId(rawParams: unknown): string {
@@ -753,6 +800,15 @@ export function waitForCodexAppServerTurnCompletion(params: {
     let settled = false;
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
     let lastEmittedUsageTotals: UsageStats | null = null;
+    let lastMessageItemId = "";
+    const messageTextByItemId = new Map<string, string>();
+    const getResolvedMessageText = () => {
+      if (lastMessageItemId) {
+        const text = messageTextByItemId.get(lastMessageItemId);
+        if (typeof text === "string") return text;
+      }
+      return accumulated;
+    };
     const reasoningState = new Map<
       string,
       { sawSummaryDelta: boolean; sawDetailsDelta: boolean }
@@ -892,10 +948,22 @@ export function waitForCodexAppServerTurnCompletion(params: {
       (rawParams: unknown) => {
         const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
         if (eventTurnId && eventTurnId !== turnId) return;
-        const notification = rawParams as { delta?: string };
-        const delta = notification.delta ?? "";
+        const notification = rawParams as { delta?: unknown; text?: unknown };
+        const delta = normalizeCodexAppServerText(
+          notification.delta ?? notification.text,
+        );
         if (!delta) return;
+        const itemId = extractCodexAppServerMessageItemId(rawParams);
         accumulated += delta;
+        if (itemId) {
+          lastMessageItemId = itemId;
+          messageTextByItemId.set(
+            itemId,
+            `${messageTextByItemId.get(itemId) || ""}${delta}`,
+          );
+        } else {
+          lastMessageItemId = "";
+        }
         try {
           onTextDelta?.(delta);
         } catch {
@@ -998,7 +1066,16 @@ export function waitForCodexAppServerTurnCompletion(params: {
         const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
         if (eventTurnId && eventTurnId !== turnId) return;
         const item = extractCodexAppServerItem(rawParams);
-        if (!item || item.type !== "reasoning") return;
+        if (!item) return;
+        if (isCodexAppServerAgentMessageItem(item)) {
+          const text = item.details || item.summary || "";
+          if (text && item.id) {
+            lastMessageItemId = item.id;
+            messageTextByItemId.set(item.id, text);
+          }
+          return;
+        }
+        if (item.type !== "reasoning") return;
         const state = item.id ? getReasoningState(item.id) : undefined;
         if (item.summary && !state?.sawSummaryDelta) {
           emitReasoning({ summary: item.summary, stepId: item.id });
@@ -1031,7 +1108,7 @@ export function waitForCodexAppServerTurnCompletion(params: {
               ? notification.status
               : undefined;
         if (status === "completed") {
-          settle(() => resolve(accumulated));
+          settle(() => resolve(getResolvedMessageText()));
           return;
         }
         settle(() =>

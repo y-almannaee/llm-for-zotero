@@ -2446,14 +2446,20 @@ function compactAgentTraceEvents(
   return compact;
 }
 
-function hasInterleavedTextAndTools(events: AgentRunEventRecord[]): boolean {
+function hasInterleavedTextAndTools(
+  events: AgentRunEventRecord[],
+  options: { preserveRolledBackText?: boolean } = {},
+): boolean {
   let visibleDraftLength = 0;
   for (const entry of events) {
     if (entry.payload.type === "message_delta") {
       visibleDraftLength += (entry.payload.text || "").length;
       continue;
     }
-    if (entry.payload.type === "message_rollback") {
+    if (
+      entry.payload.type === "message_rollback" &&
+      !options.preserveRolledBackText
+    ) {
       const rollbackLength =
         typeof entry.payload.length === "number" && entry.payload.length > 0
           ? entry.payload.length
@@ -2480,7 +2486,9 @@ export function buildAgentTraceDisplayItems(
   const items: AgentTraceDisplayItem[] = [];
   const isCodexTrace = assistantMessage?.modelProviderLabel === "Codex";
   const compactedEvents = compactAgentTraceEvents(events);
-  const isInterleaved = hasInterleavedTextAndTools(events);
+  const isInterleaved = hasInterleavedTextAndTools(events, {
+    preserveRolledBackText: isCodexTrace,
+  });
   const requestChips = buildAgentTraceRequestChips(userMessage);
   const requestSummary = buildAgentTraceRequestSummary(userMessage);
   const pendingActions = new Map<string, AgentPendingAction>();

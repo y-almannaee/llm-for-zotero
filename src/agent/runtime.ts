@@ -590,8 +590,15 @@ export class AgentRuntime {
       step: Extract<AgentModelStep, { kind: "final" }>,
       stepStreamedText: string,
     ): Promise<AgentRuntimeOutcome> => {
-      const finalText =
-        step.text || stepStreamedText || currentAnswerText || "No response.";
+      const returnedText = step.text || "";
+      const streamedTextOffset = stepStreamedText
+        ? returnedText.indexOf(stepStreamedText)
+        : -1;
+      const finalText = stepStreamedText
+        ? streamedTextOffset >= 0
+          ? returnedText.slice(streamedTextOffset)
+          : stepStreamedText
+        : returnedText || currentAnswerText || "No response.";
       if (finalText) {
         if (!stepStreamedText) {
           currentAnswerText = finalText;

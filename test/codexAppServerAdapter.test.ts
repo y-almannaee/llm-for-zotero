@@ -838,6 +838,114 @@ describe("CodexAppServerAdapter", function () {
     }
   });
 
+  it("uses the latest app-server assistant message item as the final text", async function () {
+    const originalChromeUtils = (
+      globalThis as typeof globalThis & {
+        ChromeUtils?: unknown;
+      }
+    ).ChromeUtils;
+    const originalCodexPath = globalThis.process?.env?.CODEX_PATH;
+    const stdout = new MockStdout();
+    const processKey = "codex_app_server_latest_message_item_test";
+
+    try {
+      if (globalThis.process?.env) {
+        globalThis.process.env.CODEX_PATH = "/mock/codex";
+      }
+
+      (
+        globalThis as typeof globalThis & {
+          ChromeUtils?: {
+            importESModule: (path: string) => {
+              Subprocess: { call: () => Promise<unknown> };
+            };
+          };
+        }
+      ).ChromeUtils = {
+        importESModule: (path: string) => {
+          assert.include(path, "Subprocess");
+          return {
+            Subprocess: {
+              call: async () => ({
+                stdout,
+                stdin: {
+                  write: (chunk: string) => {
+                    for (const line of chunk.split("\n")) {
+                      if (!line.trim()) continue;
+                      const message = JSON.parse(line) as {
+                        id?: number;
+                        method?: string;
+                      };
+                      if (message.method === "initialize") {
+                        stdout.push(
+                          `${JSON.stringify({ id: message.id, result: {} })}\n`,
+                        );
+                        continue;
+                      }
+                      if (message.method === "thread/start") {
+                        stdout.push(
+                          `${JSON.stringify({ id: message.id, result: { id: "thread-1" } })}\n`,
+                        );
+                        continue;
+                      }
+                      if (message.method === "turn/start") {
+                        stdout.push(
+                          `${JSON.stringify({ id: message.id, result: { id: "turn-1" } })}\n`,
+                        );
+                        setTimeout(() => {
+                          stdout.push(
+                            `${JSON.stringify({ method: "item/agentMessage/delta", params: { turnId: "turn-1", itemId: "msg-pre", delta: "I'm reading." } })}\n`,
+                          );
+                          stdout.push(
+                            `${JSON.stringify({ method: "item/agentMessage/delta", params: { turnId: "turn-1", itemId: "msg-final", delta: "Final answer." } })}\n`,
+                          );
+                          stdout.push(
+                            `${JSON.stringify({ method: "item/completed", params: { turnId: "turn-1", item: { id: "msg-final", type: "agent_message", content: "Final answer." } } })}\n`,
+                          );
+                          stdout.push(
+                            `${JSON.stringify({ method: "turn/completed", params: { turnId: "turn-1", status: "completed" } })}\n`,
+                          );
+                        }, 0);
+                      }
+                    }
+                  },
+                },
+                kill: () => undefined,
+              }),
+            },
+          };
+        },
+      };
+
+      const adapter = new CodexAppServerAdapter(processKey);
+      const chunks: string[] = [];
+      const step = await adapter.runStep({
+        request: makeRequest(),
+        messages: [{ role: "user", content: "Summarize this note." }],
+        tools: [],
+        onTextDelta: async (delta) => {
+          chunks.push(delta);
+        },
+      });
+
+      assert.equal(step.kind, "final");
+      assert.equal(step.text, "Final answer.");
+      assert.deepEqual(chunks, ["I'm reading.", "Final answer."]);
+    } finally {
+      destroyCachedCodexAppServerProcess(processKey);
+      if (globalThis.process?.env) {
+        if (typeof originalCodexPath === "string") {
+          globalThis.process.env.CODEX_PATH = originalCodexPath;
+        } else {
+          delete globalThis.process.env.CODEX_PATH;
+        }
+      }
+      (
+        globalThis as typeof globalThis & { ChromeUtils?: unknown }
+      ).ChromeUtils = originalChromeUtils;
+    }
+  });
+
   it("forwards app-server reasoning events into the shared reasoning callback", async function () {
     const originalChromeUtils = (
       globalThis as typeof globalThis & {

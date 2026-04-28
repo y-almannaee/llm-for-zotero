@@ -78,6 +78,12 @@ import type { StoredChatMessage } from "../../../utils/chatStore";
 import type { Message } from "../types";
 import { isClaudeBlockStreamingEnabled } from "../../../claudeCode/prefs";
 
+function shouldSyncVisibleRollbackText(message: Message): boolean {
+  return (
+    isClaudeBlockStreamingEnabled() || message.modelProviderLabel === "Codex"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Types for panel helpers (defined inline to avoid importing from chat.ts)
 // ---------------------------------------------------------------------------
@@ -819,7 +825,7 @@ export async function sendAgentTurn(
                 0,
                 Math.max(0, (assistantMessage.pendingFinalText || "").length - event.length),
               );
-              if (isClaudeBlockStreamingEnabled()) {
+              if (shouldSyncVisibleRollbackText(assistantMessage)) {
                 assistantMessage.text = assistantMessage.pendingFinalText || "";
                 queueRefresh();
               }
@@ -1256,7 +1262,7 @@ export async function retryAgentTurn(
                 0,
                 Math.max(0, (assistantMessage.pendingFinalText || "").length - event.length),
               );
-              if (isClaudeBlockStreamingEnabled()) {
+              if (shouldSyncVisibleRollbackText(assistantMessage)) {
                 assistantMessage.text = assistantMessage.pendingFinalText || "";
                 queueRefresh();
               }

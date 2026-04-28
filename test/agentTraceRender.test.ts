@@ -465,6 +465,132 @@ describe("agentTrace render", function () {
     assert.notInclude(messageTexts, "Let me inspect this first.");
   });
 
+  it("shows rolled-back Codex scratch text inline before the tool call", function () {
+    const events: AgentRunEventRecord[] = [
+      {
+        runId: "run-1",
+        seq: 1,
+        eventType: "message_delta",
+        payload: {
+          type: "message_delta",
+          text: "I'm reading the parsed paper text.",
+        },
+        createdAt: 1,
+      },
+      {
+        runId: "run-1",
+        seq: 2,
+        eventType: "message_rollback",
+        payload: {
+          type: "message_rollback",
+          length: "I'm reading the parsed paper text.".length,
+          text: "I'm reading the parsed paper text.",
+        },
+        createdAt: 2,
+      },
+      {
+        runId: "run-1",
+        seq: 3,
+        eventType: "tool_call",
+        payload: {
+          type: "tool_call",
+          callId: "call-1",
+          name: "read_paper",
+          args: { operation: "full_text" },
+        },
+        createdAt: 3,
+      },
+      {
+        runId: "run-1",
+        seq: 4,
+        eventType: "tool_result",
+        payload: {
+          type: "tool_result",
+          callId: "call-1",
+          name: "read_paper",
+          ok: true,
+          content: { ok: true, filePath: "/tmp/full.md", chars: 81283 },
+        },
+        createdAt: 4,
+      },
+      {
+        runId: "run-1",
+        seq: 5,
+        eventType: "message_delta",
+        payload: {
+          type: "message_delta",
+          text: "This paper is about working memory.",
+        },
+        createdAt: 5,
+      },
+      {
+        runId: "run-1",
+        seq: 6,
+        eventType: "final",
+        payload: {
+          type: "final",
+          text: "This paper is about working memory.",
+        },
+        createdAt: 6,
+      },
+    ];
+
+    const { items, isInterleaved } = buildAgentTraceDisplayItems(
+      events,
+      null,
+      {
+        role: "assistant",
+        text: "This paper is about working memory.",
+        timestamp: 1,
+        runMode: "agent",
+        modelProviderLabel: "Codex",
+      },
+    );
+    const inlineTexts = items
+      .filter(
+        (
+          item,
+        ): item is Extract<(typeof items)[number], { type: "inline_text" }> =>
+          item.type === "inline_text",
+      )
+      .map((item) => item.text);
+    const scratchIndex = items.findIndex(
+      (item) =>
+        item.type === "inline_text" &&
+        item.text === "I'm reading the parsed paper text.",
+    );
+    const toolIndex = items.findIndex(
+      (item) => item.type === "action" && item.row.kind === "tool",
+    );
+    const finalIndex = items.findIndex(
+      (item) =>
+        item.type === "inline_text" &&
+        item.text === "This paper is about working memory.",
+    );
+    const messageTexts = items
+      .filter(
+        (item): item is Extract<(typeof items)[number], { type: "message" }> =>
+          item.type === "message",
+      )
+      .map((item) => item.text);
+    const doneActions = items.filter(
+      (item) => item.type === "action" && item.row.kind === "done",
+    );
+
+    assert.isTrue(isInterleaved);
+    assert.deepEqual(inlineTexts, [
+      "I'm reading the parsed paper text.",
+      "This paper is about working memory.",
+    ]);
+    assert.isAtLeast(scratchIndex, 0);
+    assert.isAtLeast(toolIndex, 0);
+    assert.isAtLeast(finalIndex, 0);
+    assert.isBelow(scratchIndex, toolIndex);
+    assert.isAbove(finalIndex, toolIndex);
+    assert.notInclude(messageTexts, "This paper is about working memory.");
+    assert.lengthOf(doneActions, 1);
+  });
+
   it("keeps visible text before a tool call marked as interleaved", function () {
     const events: AgentRunEventRecord[] = [
       {

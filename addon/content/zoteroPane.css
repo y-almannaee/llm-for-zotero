@@ -438,8 +438,8 @@
 .llm-codex-system-toggle-icon {
   display: inline-block;
   flex: none;
-  width: 20px;
-  height: 20px;
+  width: 16px;
+  height: 16px;
   background: url("icons/codex-app-server.svg") center / contain no-repeat;
   filter: invert(72%) grayscale(1);
   opacity: 0.62;

@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AgentRuntime } from "../src/agent/runtime";
+import { getAgentRunTrace } from "../src/agent/store/traceStore";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import {
   MAX_AGENT_ROUNDS,
@@ -907,6 +908,115 @@ describe("AgentRuntime", function () {
           { type: "message_rollback", text: "Let me inspect this first." },
           { type: "tool_call", name: "read_context" },
           { type: "message_delta", text: "Done." },
+        ],
+      );
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("prefers post-rollback streamed text when final step text includes scratch text", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "read_context",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({ ok: true }),
+      });
+
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: true,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            await params.onTextDelta?.("I'm reading the parsed paper text.");
+            await params.onToolCall?.({
+              id: "call-1",
+              name: "read_context",
+              arguments: {},
+            });
+            await params.onTextDelta?.("This paper is about working memory.");
+            return {
+              kind: "final",
+              text:
+                "I'm reading the parsed paper text." +
+                "This paper is about working memory.",
+              assistantMessage: {
+                role: "assistant",
+                content:
+                  "I'm reading the parsed paper text." +
+                  "This paper is about working memory.",
+              },
+            };
+          },
+        }),
+      });
+
+      const events: AgentEvent[] = [];
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 1,
+          mode: "agent",
+          userText: "what is this paper about?",
+          model: "gpt-5.4",
+          apiBase: "https://api.openai.com/v1/responses",
+          apiKey: "test",
+        },
+        onEvent: async (event) => {
+          events.push(event);
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "This paper is about working memory.");
+      const trace = await getAgentRunTrace(outcome.runId);
+      assert.equal(trace.run?.finalText, "This paper is about working memory.");
+      assert.deepEqual(
+        events
+          .filter((event) =>
+            ["message_delta", "message_rollback", "tool_call", "final"].includes(
+              event.type,
+            ),
+          )
+          .map((event) =>
+            event.type === "message_delta"
+              ? { type: event.type, text: event.text }
+              : event.type === "message_rollback"
+                ? { type: event.type, text: event.text }
+                : event.type === "tool_call"
+                  ? { type: event.type, name: event.name }
+                  : { type: event.type, text: event.text },
+          ),
+        [
+          {
+            type: "message_delta",
+            text: "I'm reading the parsed paper text.",
+          },
+          {
+            type: "message_rollback",
+            text: "I'm reading the parsed paper text.",
+          },
+          { type: "tool_call", name: "read_context" },
+          {
+            type: "message_delta",
+            text: "This paper is about working memory.",
+          },
+          { type: "final", text: "This paper is about working memory." },
         ],
       );
     } finally {
