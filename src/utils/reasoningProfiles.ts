@@ -57,6 +57,18 @@ export type QwenReasoningProfile = {
   levelToEnableThinking: Partial<Record<ReasoningLevel, boolean | null>>;
   defaultLevel: ReasoningLevel;
 };
+export type DeepseekThinkingType = "enabled" | "disabled";
+export type DeepseekReasoningEffort = "high" | "max";
+export type DeepseekReasoningProfile = {
+  defaultThinkingType: DeepseekThinkingType | null;
+  defaultReasoningEffort: DeepseekReasoningEffort | null;
+  levelToThinkingType: Partial<Record<ReasoningLevel, DeepseekThinkingType>>;
+  levelToReasoningEffort: Partial<
+    Record<ReasoningLevel, DeepseekReasoningEffort | null>
+  >;
+  defaultLevel: ReasoningLevel;
+  omitTemperatureWhenThinking: boolean;
+};
 
 type ProviderProfile = {
   supportsReasoning: boolean;
@@ -81,7 +93,15 @@ type ProviderProfile = {
     defaultEnableThinking: boolean | null;
     levelToEnableThinking: Partial<Record<ReasoningLevel, boolean | null>>;
   };
-  deepseekThinkingEnabled?: boolean;
+  deepseek?: {
+    defaultThinkingType: DeepseekThinkingType | null;
+    defaultReasoningEffort: DeepseekReasoningEffort | null;
+    levelToThinkingType: Partial<Record<ReasoningLevel, DeepseekThinkingType>>;
+    levelToReasoningEffort: Partial<
+      Record<ReasoningLevel, DeepseekReasoningEffort | null>
+    >;
+    omitTemperatureWhenThinking?: boolean;
+  };
 };
 
 type ProfileRule = {
@@ -339,9 +359,47 @@ const DEEPSEEK_REASONER_PROFILE: ProviderProfile = singleEnabledOptionProfile(
   "default",
   "enabled",
   {
-    deepseekThinkingEnabled: true,
+    deepseek: {
+      defaultThinkingType: "enabled",
+      defaultReasoningEffort: null,
+      levelToThinkingType: {
+        default: "enabled",
+      },
+      levelToReasoningEffort: {
+        default: null,
+      },
+      omitTemperatureWhenThinking: false,
+    },
   },
 );
+
+const DEEPSEEK_V4_PROFILE: ProviderProfile = {
+  supportsReasoning: true,
+  defaultLevel: "default",
+  options: [
+    option("default", "high"),
+    option("minimal", "disabled"),
+    option("high", "high"),
+    option("xhigh", "max"),
+  ],
+  deepseek: {
+    defaultThinkingType: "enabled",
+    defaultReasoningEffort: "high",
+    levelToThinkingType: {
+      default: "enabled",
+      minimal: "disabled",
+      high: "enabled",
+      xhigh: "enabled",
+    },
+    levelToReasoningEffort: {
+      default: "high",
+      minimal: null,
+      high: "high",
+      xhigh: "max",
+    },
+    omitTemperatureWhenThinking: true,
+  },
+};
 
 const DEEPSEEK_CHAT_PROFILE: ProviderProfile = {
   supportsReasoning: false,
@@ -493,11 +551,15 @@ const PROFILE_RULES: Record<
   deepseek: {
     rules: [
       {
-        match: /^deepseek-(?:reasoner|r1)(?:\b|[.-])/,
+        match: /(^|[/:])deepseek-v4-(?:flash|pro)(?:\b|[.-])/,
+        profile: DEEPSEEK_V4_PROFILE,
+      },
+      {
+        match: /(^|[/:])deepseek-(?:reasoner|r1)(?:\b|[.-])/,
         profile: DEEPSEEK_REASONER_PROFILE,
       },
       {
-        match: /^deepseek-chat(?:\b|[.-])/,
+        match: /(^|[/:])deepseek-chat(?:\b|[.-])/,
         profile: DEEPSEEK_CHAT_PROFILE,
       },
     ],
@@ -643,7 +705,27 @@ export function getReasoningDefaultLevelForModel(
 
 export function shouldUseDeepseekThinkingPayload(modelName?: string): boolean {
   const profile = resolveProviderProfile("deepseek", modelName);
-  return Boolean(profile.deepseekThinkingEnabled);
+  return Boolean(profile.deepseek?.defaultThinkingType);
+}
+
+export function getDeepseekReasoningProfileForModel(
+  modelName?: string,
+): DeepseekReasoningProfile {
+  const profile = resolveProviderProfile("deepseek", modelName);
+  const deepseekProfile = profile.deepseek;
+  const defaultLevel = getResolvedDefaultLevel("deepseek", modelName, "default");
+  return {
+    defaultThinkingType: deepseekProfile?.defaultThinkingType ?? null,
+    defaultReasoningEffort: deepseekProfile?.defaultReasoningEffort ?? null,
+    levelToThinkingType: cloneLevelMap(deepseekProfile?.levelToThinkingType),
+    levelToReasoningEffort: cloneLevelMap(
+      deepseekProfile?.levelToReasoningEffort,
+    ),
+    defaultLevel,
+    omitTemperatureWhenThinking: Boolean(
+      deepseekProfile?.omitTemperatureWhenThinking,
+    ),
+  };
 }
 
 export function getOpenAIReasoningProfileForModel(

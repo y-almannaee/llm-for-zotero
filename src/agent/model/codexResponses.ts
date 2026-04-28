@@ -105,6 +105,7 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
           true,
           request.model,
           request.apiBase,
+          "codex_responses",
         );
         return {
           model: request.model,

@@ -60,7 +60,7 @@ describe("llmClient prepareChatRequest", function () {
     const prepared = prepareChatRequest({
       prompt: "Summarize the paper.",
       context: "A".repeat(700000),
-      model: "deepseek-chat",
+      model: "deepseek-custom",
       apiBase: "https://api.example.com/v1",
     });
 
@@ -230,6 +230,22 @@ describe("llmClient prepareChatRequest", function () {
     assert.equal(prepared.authMode, "codex_auth");
   });
 
+  it("strips image content from DeepSeek V4 chat requests", function () {
+    const prepared = prepareChatRequest({
+      prompt: "Describe this image.",
+      images: ["data:image/png;base64,AAAA"],
+      model: "deepseek-v4-pro",
+      apiBase: "https://api.deepseek.com/v1",
+    });
+
+    const lastMessage = prepared.messages[prepared.messages.length - 1];
+    assert.equal(lastMessage.role, "user");
+    assert.isString(lastMessage.content);
+    assert.include(String(lastMessage.content), "Describe this image.");
+    assert.include(String(lastMessage.content), "image input");
+    assert.notInclude(JSON.stringify(prepared.messages), "image_url");
+  });
+
   it("normalizes blank codex app server apiBase values for chat requests", async function () {
     const originalChromeUtils = (globalThis as typeof globalThis & {
       ChromeUtils?: unknown;
@@ -376,6 +392,7 @@ describe("llmClient prepareChatRequest", function () {
     const stdout = new MockStdout();
     let lastTurnInput: unknown = "";
     let lastInjectedItems: unknown = null;
+    let lastThreadStartParams: Record<string, unknown> | null = null;
     let lastTurnParams: Record<string, unknown> | null = null;
     const reasoning: string[] = [];
     const usage: Array<{
@@ -421,6 +438,8 @@ describe("llmClient prepareChatRequest", function () {
                       }
                       if (message.method === "thread/start") {
                         assert.equal(message.params?.ephemeral, true);
+                        lastThreadStartParams = (message.params ||
+                          {}) as Record<string, unknown>;
                         stdout.push(
                           `${JSON.stringify({ id: message.id, result: { id: "thread-1" } })}\n`,
                         );
@@ -525,6 +544,10 @@ describe("llmClient prepareChatRequest", function () {
       assert.equal(lastTurnParams?.model, "gpt-5.4");
       assert.equal(lastTurnParams?.effort, "high");
       assert.equal(lastTurnParams?.summary, "detailed");
+      assert.equal(
+        lastThreadStartParams?.developerInstructions,
+        (prepared.messages[0] as { content: string }).content,
+      );
       assert.isArray(lastTurnInput);
       const input = lastTurnInput as Array<Record<string, unknown>>;
       const textParts = input
@@ -536,16 +559,6 @@ describe("llmClient prepareChatRequest", function () {
         path: "C:\\Users\\alice\\figure.png",
       });
       assert.deepEqual(lastInjectedItems, [
-        {
-          type: "message",
-          role: "system",
-          content: [
-            {
-              type: "input_text",
-              text: (prepared.messages[0] as { content: string }).content,
-            },
-          ],
-        },
         {
           type: "message",
           role: "user",
@@ -702,29 +715,25 @@ describe("llmClient prepareChatRequest", function () {
       assert.equal(injectAttemptCount, 1);
       assert.deepEqual(
         turnInputs[0],
-        firstPrepared.messages.map((message) => ({
-          type: "text",
-          text: `${
-            message.role === "system"
-              ? "System"
-              : message.role === "assistant"
-                ? "Assistant"
-                : "User"
-          }:\n${String(message.content)}`,
-        })),
+        firstPrepared.messages
+          .filter((message) => message.role !== "system")
+          .map((message) => ({
+            type: "text",
+            text: `${
+              message.role === "assistant" ? "Assistant" : "User"
+            }:\n${String(message.content)}`,
+          })),
       );
       assert.deepEqual(
         turnInputs[1],
-        secondPrepared.messages.map((message) => ({
-          type: "text",
-          text: `${
-            message.role === "system"
-              ? "System"
-              : message.role === "assistant"
-                ? "Assistant"
-                : "User"
-          }:\n${String(message.content)}`,
-        })),
+        secondPrepared.messages
+          .filter((message) => message.role !== "system")
+          .map((message) => ({
+            type: "text",
+            text: `${
+              message.role === "assistant" ? "Assistant" : "User"
+            }:\n${String(message.content)}`,
+          })),
       );
     } finally {
       destroyCachedCodexAppServerProcess("codex_app_server_chat");

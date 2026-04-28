@@ -8,7 +8,7 @@ import {
 } from "../utils/llmDefaults";
 import { HTML_NS } from "../utils/domHelpers";
 import {
-  normalizeMaxTokens,
+  normalizeMaxTokensForModel,
   normalizeOptionalInputTokenCap,
   normalizeTemperature,
 } from "../utils/normalization";
@@ -148,7 +148,7 @@ const PROVIDER_PROFILES: ProviderProfile[] = [
   { label: "Provider C", modelPlaceholder: "gemini-2.5-pro", defaultModel: "" },
   {
     label: "Provider D",
-    modelPlaceholder: "deepseek-reasoner",
+    modelPlaceholder: "deepseek-v4-flash",
     defaultModel: "",
   },
 ];
@@ -1579,7 +1579,10 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
         const commitAdvanced = () => {
           modelEntry.temperature = normalizeTemperature(tempField.input.value);
-          modelEntry.maxTokens = normalizeMaxTokens(maxTokField.input.value);
+          modelEntry.maxTokens = normalizeMaxTokensForModel(
+            maxTokField.input.value,
+            modelEntry.model,
+          );
           modelEntry.inputTokenCap = normalizeOptionalInputTokenCap(
             inputCapField.input.value,
           );

@@ -184,6 +184,37 @@ describe("modelProviders", function () {
     assert.isUndefined(entries[0].advanced.inputTokenCap);
   });
 
+  it("preserves large DeepSeek V4 output token settings", function () {
+    const groups: ModelProviderGroup[] = [
+      {
+        id: "provider-1",
+        apiBase: "https://api.deepseek.com/v1",
+        apiKey: "sk-deepseek",
+        authMode: "api_key",
+        providerProtocol: "openai_chat_compat",
+        models: [
+          {
+            id: "model-1",
+            model: "deepseek-v4-pro",
+            temperature: 0.3,
+            maxTokens: 384000,
+          },
+        ],
+      },
+    ];
+
+    setModelProviderGroups(groups);
+    (
+      globalThis.Zotero.Prefs as {
+        set: (key: string, value: unknown, global?: boolean) => void;
+      }
+    ).set(`${config.prefsPrefix}.modelProviderGroupsMigrationVersion`, 3, true);
+    const entries = getRuntimeModelEntries();
+
+    assert.lengthOf(entries, 1);
+    assert.equal(entries[0].advanced.maxTokens, 384000);
+  });
+
   it("normalizes missing authMode to api_key for stored groups", function () {
     (
       globalThis.Zotero.Prefs as {

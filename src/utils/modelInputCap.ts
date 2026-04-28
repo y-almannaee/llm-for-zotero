@@ -86,7 +86,8 @@ const MODEL_INPUT_LIMIT_RULES: ModelInputLimitRule[] = [
   { pattern: /^codestral(?:[.-]|$)/, limit: 128_000 },
 
   // DeepSeek
-  { pattern: /^deepseek-(?:chat|reasoner)(?:[.-]|$)/, limit: 128_000 },
+  { pattern: /^deepseek-v4-(?:flash|pro)(?:[.-]|$)/, limit: 1_000_000 },
+  { pattern: /^deepseek-(?:chat|reasoner)(?:[.-]|$)/, limit: 1_000_000 },
   { pattern: /^deepseek(?:[.-]|$)/, limit: 128_000 },
 ];
 

@@ -374,6 +374,7 @@ export type AgentUserMessage = {
 export type AgentAssistantMessage = {
   role: "assistant";
   content: string | AgentModelContentPart[];
+  reasoning_content?: string;
   tool_calls?: AgentToolCall[];
 };
 

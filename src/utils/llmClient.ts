@@ -8,13 +8,13 @@ import { config } from "../../package.json";
 import { DEFAULT_SYSTEM_PROMPT } from "./llmDefaults";
 import {
   getAnthropicReasoningProfileForModel,
+  getDeepseekReasoningProfileForModel,
   getGeminiReasoningProfileForModel,
   getGrokReasoningProfileForModel,
   getOpenAIReasoningProfileForModel,
   getQwenReasoningProfileForModel,
   getReasoningDefaultLevelForModel,
   getRuntimeReasoningOptionsForModel,
-  shouldUseDeepseekThinkingPayload,
   supportsReasoningForModel,
 } from "./reasoningProfiles";
 import type {
@@ -39,7 +39,7 @@ import {
 import { getLocalParentPath, joinLocalPath, pathToFileUrl } from "./localPath";
 import {
   normalizeTemperature,
-  normalizeMaxTokens,
+  normalizeMaxTokensForModel,
   normalizeInputTokenCap,
 } from "./normalization";
 import {
@@ -84,6 +84,7 @@ import {
   getModelInputTokenLimit,
   type InputCapResult,
 } from "./modelInputCap";
+import { isTextOnlyModel } from "../providers/modelChecks";
 
 // =============================================================================
 // Types
@@ -1422,6 +1423,34 @@ function buildMessages(
   return messages;
 }
 
+function stripUnsupportedImageContent(
+  messages: ChatMessage[],
+  modelName: string,
+): ChatMessage[] {
+  if (!isTextOnlyModel(modelName)) return messages;
+  return messages.map((message) => {
+    if (typeof message.content === "string") return message;
+    const omittedImageCount = message.content.filter(
+      (part) => part.type === "image_url",
+    ).length;
+    const textParts = message.content
+      .filter((part): part is TextContent => part.type === "text")
+      .map((part) => part.text)
+      .filter((text) => text.trim());
+    const omittedNotice =
+      omittedImageCount > 0
+        ? `[${omittedImageCount} image input${
+            omittedImageCount === 1 ? "" : "s"
+          } omitted because ${modelName || "the selected model"} does not support image input.]`
+        : "";
+    const content = [...textParts, omittedNotice].filter(Boolean).join("\n\n");
+    return {
+      ...message,
+      content: content || omittedNotice || "",
+    };
+  });
+}
+
 export function prepareChatRequest(params: ChatParams): PreparedChatRequest {
   const { apiBase, apiKey, authMode, model, systemPrompt, providerProtocol } =
     getApiConfig({
@@ -1431,7 +1460,10 @@ export function prepareChatRequest(params: ChatParams): PreparedChatRequest {
       model: params.model,
       providerProtocol: params.providerProtocol,
     });
-  const rawMessages = buildMessages(params, systemPrompt);
+  const rawMessages = stripUnsupportedImageContent(
+    buildMessages(params, systemPrompt),
+    model,
+  );
   const inputCap = applyModelInputTokenCap(
     rawMessages,
     model,
@@ -1488,7 +1520,10 @@ export function estimateAvailableContextBudget(params: {
     modelLimitTokens,
   );
   const softLimitTokens = Math.max(1, Math.floor(limitTokens * 0.9));
-  const outputReserveTokens = normalizeMaxTokens(params.maxTokens);
+  const outputReserveTokens = normalizeMaxTokensForModel(
+    params.maxTokens,
+    normalizedModel,
+  );
   const reasoningReserveTokens = getReasoningReserveTokens(params.reasoning);
 
   const baseMessages = buildMessages(
@@ -1954,6 +1989,7 @@ export function buildReasoningPayload(
   useResponses: boolean,
   modelName?: string,
   apiBase?: string,
+  providerProtocol?: ProviderProtocol,
 ): { extra: Record<string, unknown>; omitTemperature: boolean } {
   if (!reasoning) {
     return emptyReasoningPayload();
@@ -2051,16 +2087,32 @@ export function buildReasoningPayload(
   }
 
   if (reasoning.provider === "deepseek") {
-    if (!shouldUseDeepseekThinkingPayload(modelName)) {
+    const profile = getDeepseekReasoningProfileForModel(modelName);
+    const thinkingType =
+      profile.levelToThinkingType[reasoning.level] ??
+      profile.defaultThinkingType;
+    if (!thinkingType) {
       return emptyReasoningPayload();
     }
-    return {
-      extra: {
-        thinking: {
-          type: "enabled",
-        },
+    const reasoningEffort =
+      profile.levelToReasoningEffort[reasoning.level] ??
+      profile.defaultReasoningEffort;
+    const extra: Record<string, unknown> = {
+      thinking: {
+        type: thinkingType,
       },
-      omitTemperature: false,
+    };
+    if (thinkingType === "enabled" && reasoningEffort) {
+      if (providerProtocol === "anthropic_messages") {
+        extra.output_config = { effort: reasoningEffort };
+      } else {
+        extra.reasoning_effort = reasoningEffort;
+      }
+    }
+    return {
+      extra,
+      omitTemperature:
+        thinkingType === "enabled" && profile.omitTemperatureWhenThinking,
     };
   }
 
@@ -2099,6 +2151,8 @@ function buildAnthropicMessagesPayload(params: {
   effectiveMaxTokens: number;
   effectiveTemperature: number;
   stream: boolean;
+  reasoning?: ReasoningConfig;
+  apiBase?: string;
 }): Record<string, unknown> {
   const systemParts = params.messages
     .filter((m) => m.role === "system")
@@ -2138,8 +2192,19 @@ function buildAnthropicMessagesPayload(params: {
     max_tokens: params.effectiveMaxTokens,
     messages: nonSystemMessages,
   };
+  const reasoningPayload = buildReasoningPayload(
+    params.reasoning,
+    false,
+    params.model,
+    params.apiBase,
+    "anthropic_messages",
+  );
+  Object.assign(payload, reasoningPayload.extra);
   if (systemParts.length > 0) {
     payload.system = systemParts.join("\n\n");
+  }
+  if (params.reasoning && !reasoningPayload.omitTemperature) {
+    payload.temperature = params.effectiveTemperature;
   }
   if (params.stream) {
     payload.stream = true;
@@ -2352,6 +2417,7 @@ function createChatPayloadBuilder(params: {
   responseFileIds?: string[];
   authMode: ModelProviderAuthMode;
   apiBase: string;
+  providerProtocol?: ProviderProtocol;
   effectiveTemperature: number;
   effectiveMaxTokens: number;
   stream: boolean;
@@ -2363,6 +2429,7 @@ function createChatPayloadBuilder(params: {
     responseFileIds,
     authMode,
     apiBase,
+    providerProtocol,
     effectiveTemperature,
     effectiveMaxTokens,
     stream,
@@ -2415,6 +2482,7 @@ function createChatPayloadBuilder(params: {
       useResponses,
       model,
       apiBase,
+      providerProtocol,
     );
     const temperatureParam = reasoningPayload.omitTemperature
       ? {}
@@ -2859,6 +2927,7 @@ async function callNativeProtocol(params: {
   onDelta?: (delta: string) => void;
   onUsage?: (usage: UsageStats) => void;
   attachments?: ChatFileAttachment[];
+  reasoning?: ReasoningConfig;
 }): Promise<string> {
   const {
     protocol,
@@ -2907,6 +2976,8 @@ async function callNativeProtocol(params: {
           effectiveMaxTokens,
           effectiveTemperature,
           stream: isStreaming,
+          reasoning: params.reasoning,
+          apiBase,
         })
       : buildGeminiNativePayload({
           messages,
@@ -3054,10 +3125,11 @@ export async function callLLM(params: ChatParams): Promise<string> {
       apiKey,
       model,
       messages,
-      effectiveMaxTokens: normalizeMaxTokens(params.maxTokens),
+      effectiveMaxTokens: normalizeMaxTokensForModel(params.maxTokens, model),
       effectiveTemperature: normalizeTemperature(params.temperature),
       signal: params.signal,
       attachments: params.attachments,
+      reasoning: params.reasoning,
     });
   }
   if (authMode === "codex_auth" || authMode === "codex_app_server") {
@@ -3103,7 +3175,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
       })
     : [];
   const effectiveTemperature = normalizeTemperature(params.temperature);
-  const effectiveMaxTokens = normalizeMaxTokens(params.maxTokens);
+  const effectiveMaxTokens = normalizeMaxTokensForModel(params.maxTokens, model);
 
   const url = resolveProviderTransportEndpoint({
     protocol: providerProtocol,
@@ -3124,6 +3196,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
     responseFileIds,
     authMode,
     apiBase,
+    providerProtocol,
     effectiveTemperature,
     effectiveMaxTokens,
     stream: false,
@@ -3181,12 +3254,13 @@ export async function callLLMStream(
       apiKey,
       model,
       messages,
-      effectiveMaxTokens: normalizeMaxTokens(params.maxTokens),
+      effectiveMaxTokens: normalizeMaxTokensForModel(params.maxTokens, model),
       effectiveTemperature: normalizeTemperature(params.temperature),
       signal: params.signal,
       onDelta,
       onUsage,
       attachments: params.attachments,
+      reasoning: params.reasoning,
     });
   }
   if (authMode === "codex_app_server") {
@@ -3245,7 +3319,7 @@ export async function callLLMStream(
       })
     : [];
   const effectiveTemperature = normalizeTemperature(params.temperature);
-  const effectiveMaxTokens = normalizeMaxTokens(params.maxTokens);
+  const effectiveMaxTokens = normalizeMaxTokensForModel(params.maxTokens, model);
 
   const url = resolveProviderTransportEndpoint({
     protocol: providerProtocol,
@@ -3266,6 +3340,7 @@ export async function callLLMStream(
     responseFileIds,
     authMode,
     apiBase,
+    providerProtocol,
     effectiveTemperature,
     effectiveMaxTokens,
     stream: true,

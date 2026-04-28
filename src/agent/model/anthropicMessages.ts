@@ -1,6 +1,6 @@
 import { buildReasoningPayload } from "../../utils/llmClient";
 import {
-  normalizeMaxTokens,
+  normalizeMaxTokensForModel,
   normalizeTemperature,
 } from "../../utils/normalization";
 import {
@@ -27,6 +27,7 @@ import {
   groupToolContinuationMessages,
 } from "./shared";
 import { resolveContentParts } from "./adapterUtils";
+import { isTextOnlyModel } from "../../providers";
 
 type AnthropicContentBlock = {
   type: string;
@@ -52,6 +53,11 @@ type AnthropicNormalizedResponse = {
 type AnthropicStreamBlockState = {
   block: AnthropicContentBlock;
   partialJson?: string;
+};
+
+type AnthropicBuildOptions = {
+  allowMedia: boolean;
+  modelName?: string;
 };
 
 function buildAnthropicTools(tools: ToolSpec[]) {
@@ -85,7 +91,41 @@ function normalizeAnthropicContentBlock(
 
 async function buildAnthropicParts(
   message: AgentModelMessage,
+  options: AnthropicBuildOptions,
 ): Promise<AnthropicContentBlock[]> {
+  if (!options.allowMedia) {
+    const target = (options.modelName || "The selected model").trim();
+    if (typeof message.content === "string") {
+      return [{ type: "text", text: message.content }];
+    }
+    const textParts: string[] = [];
+    let imageCount = 0;
+    let fileCount = 0;
+    for (const part of message.content) {
+      if (part.type === "text") {
+        if (part.text.trim()) textParts.push(part.text);
+        continue;
+      }
+      if (part.type === "image_url") {
+        imageCount += 1;
+      } else {
+        fileCount += 1;
+      }
+    }
+    const omitted: string[] = [];
+    if (imageCount) {
+      omitted.push(`${imageCount} image${imageCount === 1 ? "" : "s"}`);
+    }
+    if (fileCount) {
+      omitted.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);
+    }
+    if (omitted.length) {
+      textParts.push(
+        `[${omitted.join(" and ")} omitted because ${target} does not support image or document input.]`,
+      );
+    }
+    return [{ type: "text", text: textParts.join("\n\n") }];
+  }
   const resolved = await resolveContentParts(message);
   return resolved.map((part): AnthropicContentBlock => {
     switch (part.type) {
@@ -97,7 +137,10 @@ async function buildAnthropicParts(
   });
 }
 
-async function buildInitialAnthropicMessages(messages: AgentModelMessage[]): Promise<{
+async function buildInitialAnthropicMessages(
+  messages: AgentModelMessage[],
+  options: AnthropicBuildOptions,
+): Promise<{
   system?: string;
   messages: AnthropicMessage[];
 }> {
@@ -114,7 +157,7 @@ async function buildInitialAnthropicMessages(messages: AgentModelMessage[]): Pro
       anthropicMessages.push({
         role: "assistant",
         content: [
-          ...(await buildAnthropicParts(message)),
+          ...(await buildAnthropicParts(message, options)),
           ...(Array.isArray(message.tool_calls)
             ? message.tool_calls.map((call) => ({
                 type: "tool_use" as const,
@@ -129,7 +172,7 @@ async function buildInitialAnthropicMessages(messages: AgentModelMessage[]): Pro
     }
     anthropicMessages.push({
       role: "user",
-      content: await buildAnthropicParts(message),
+      content: await buildAnthropicParts(message, options),
     });
   }
   return {
@@ -140,6 +183,7 @@ async function buildInitialAnthropicMessages(messages: AgentModelMessage[]): Pro
 
 async function buildAnthropicContinuationMessages(
   messages: AgentModelMessage[],
+  options: AnthropicBuildOptions,
 ): Promise<AnthropicMessage[]> {
   const { toolMessages, followupUserMessages } =
     groupToolContinuationMessages(messages);
@@ -157,7 +201,7 @@ async function buildAnthropicContinuationMessages(
   for (const message of followupUserMessages) {
     anthropicMessages.push({
       role: "user",
-      content: await buildAnthropicParts(message),
+      content: await buildAnthropicParts(message, options),
     });
   }
   return anthropicMessages;
@@ -434,13 +478,21 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
 
   async runStep(params: AgentStepParams): Promise<AgentModelStep> {
     const request = params.request;
-    const initial = await buildInitialAnthropicMessages(params.messages);
+    const buildOptions = {
+      allowMedia: !isTextOnlyModel(request.model || ""),
+      modelName: request.model,
+    };
+    const initial = await buildInitialAnthropicMessages(
+      params.messages,
+      buildOptions,
+    );
     if (!this.conversationMessages) {
       this.conversationMessages = initial.messages;
       this.systemPrompt = initial.system;
     }
     const continuation = await buildAnthropicContinuationMessages(
       getToolContinuationMessages(params.messages),
+      buildOptions,
     );
     const messages =
       continuation.length && this.conversationMessages
@@ -451,6 +503,7 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
       false,
       request.model,
       request.apiBase,
+      "anthropic_messages",
     );
     // Anthropic requires temperature === 1 when extended thinking is enabled.
     // Any other value causes a 400 "temperature may only be set to 1" error.
@@ -463,7 +516,10 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
       : normalizeTemperature(request.advanced?.temperature);
     const payload = {
       model: request.model,
-      max_tokens: normalizeMaxTokens(request.advanced?.maxTokens),
+      max_tokens: normalizeMaxTokensForModel(
+        request.advanced?.maxTokens,
+        request.model,
+      ),
       messages,
       system: this.systemPrompt,
       tools: buildAnthropicTools(params.tools),

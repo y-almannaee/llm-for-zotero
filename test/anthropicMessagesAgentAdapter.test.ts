@@ -272,4 +272,115 @@ describe("AnthropicMessagesAgentAdapter", function () {
       input: { query: "methods" },
     });
   });
+
+  it("uses DeepSeek Anthropic-style thinking effort payloads", async function () {
+    const adapter = new AnthropicMessagesAgentAdapter();
+    let capturedBody: Record<string, unknown> | null = null;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              content: [{ type: "text", text: "Done" }],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    await adapter.runStep({
+      request: makeRequest({
+        model: "deepseek-v4-pro",
+        apiBase: "https://api.deepseek.com/anthropic",
+        reasoning: { provider: "deepseek", level: "xhigh" },
+        advanced: { maxTokens: 384000 },
+      }),
+      messages: [{ role: "user", content: "Think" }],
+      tools,
+    });
+
+    assert.deepEqual(capturedBody?.thinking, { type: "enabled" });
+    assert.deepEqual(capturedBody?.output_config, { effort: "max" });
+    assert.notProperty(capturedBody || {}, "reasoning_effort");
+    assert.notProperty(capturedBody || {}, "temperature");
+    assert.equal(capturedBody?.max_tokens, 384000);
+  });
+
+  it("does not send image or document blocks for DeepSeek text-only models", async function () {
+    const adapter = new AnthropicMessagesAgentAdapter();
+    let capturedBody: Record<string, unknown> | null = null;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              content: [{ type: "text", text: "Done" }],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    await adapter.runStep({
+      request: makeRequest({
+        model: "deepseek-v4-flash",
+        apiBase: "https://api.deepseek.com/anthropic",
+      }),
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Use extracted text." },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,AAAA" },
+            },
+            {
+              type: "file_ref",
+              file_ref: {
+                name: "paper.pdf",
+                mimeType: "application/pdf",
+                storedPath: "/tmp/nonexistent-paper.pdf",
+              },
+            },
+          ],
+        },
+      ],
+      tools,
+    });
+
+    const serialized = JSON.stringify(capturedBody);
+    assert.notInclude(serialized, '"type":"image"');
+    assert.notInclude(serialized, '"type":"document"');
+    assert.include(serialized, "Use extracted text.");
+    assert.include(serialized, "does not support image or document input");
+  });
 });

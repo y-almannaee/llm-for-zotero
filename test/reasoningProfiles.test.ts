@@ -1,9 +1,11 @@
 import { assert } from "chai";
 import {
+  getDeepseekReasoningProfileForModel,
   getOpenAIReasoningProfileForModel,
   getReasoningDefaultLevelForModel,
   getRuntimeReasoningOptionsForModel,
 } from "../src/utils/reasoningProfiles";
+import { buildReasoningPayload } from "../src/utils/llmClient";
 
 describe("reasoningProfiles", function () {
   describe("OpenAI GPT-5 family profiles", function () {
@@ -72,6 +74,98 @@ describe("reasoningProfiles", function () {
       assert.deepEqual(
         gpt53Codex.map((option) => option.level),
         ["low", "medium", "high", "xhigh"],
+      );
+    });
+  });
+
+  describe("DeepSeek V4 profiles", function () {
+    it("supports disabled, high, and max thinking modes", function () {
+      const options = getRuntimeReasoningOptionsForModel(
+        "deepseek",
+        "deepseek-v4-pro",
+      );
+      assert.deepEqual(
+        options.map((option) => option.level),
+        ["default", "minimal", "high", "xhigh"],
+      );
+
+      const profile = getDeepseekReasoningProfileForModel(
+        "deepseek/deepseek-v4-flash",
+      );
+      assert.equal(profile.defaultLevel, "default");
+      assert.equal(profile.defaultThinkingType, "enabled");
+      assert.equal(profile.defaultReasoningEffort, "high");
+      assert.isTrue(profile.omitTemperatureWhenThinking);
+      assert.equal(profile.levelToThinkingType.minimal, "disabled");
+      assert.equal(profile.levelToReasoningEffort.xhigh, "max");
+    });
+
+    it("builds documented DeepSeek V4 thinking payloads", function () {
+      assert.deepEqual(
+        buildReasoningPayload(
+          { provider: "deepseek", level: "minimal" },
+          false,
+          "deepseek-v4-pro",
+        ),
+        {
+          extra: { thinking: { type: "disabled" } },
+          omitTemperature: false,
+        },
+      );
+      assert.deepEqual(
+        buildReasoningPayload(
+          { provider: "deepseek", level: "high" },
+          false,
+          "deepseek-v4-pro",
+        ),
+        {
+          extra: {
+            thinking: { type: "enabled" },
+            reasoning_effort: "high",
+          },
+          omitTemperature: true,
+        },
+      );
+      assert.deepEqual(
+        buildReasoningPayload(
+          { provider: "deepseek", level: "xhigh" },
+          false,
+          "deepseek-v4-pro",
+        ),
+        {
+          extra: {
+            thinking: { type: "enabled" },
+            reasoning_effort: "max",
+          },
+          omitTemperature: true,
+        },
+      );
+      assert.deepEqual(
+        buildReasoningPayload(
+          { provider: "deepseek", level: "xhigh" },
+          false,
+          "deepseek-v4-pro",
+          "https://api.deepseek.com/anthropic",
+          "anthropic_messages",
+        ),
+        {
+          extra: {
+            thinking: { type: "enabled" },
+            output_config: { effort: "max" },
+          },
+          omitTemperature: true,
+        },
+      );
+      assert.deepEqual(
+        buildReasoningPayload(
+          { provider: "deepseek", level: "default" },
+          false,
+          "deepseek-reasoner",
+        ),
+        {
+          extra: { thinking: { type: "enabled" } },
+          omitTemperature: false,
+        },
       );
     });
   });

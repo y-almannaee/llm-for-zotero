@@ -4,6 +4,7 @@ import { encodeBytesBase64 } from "./model/shared";
 import { recordAgentTurn } from "./store/conversationMemory";
 import type {
   AgentInheritedApproval,
+  AgentModelCapabilities,
   AgentModelContentPart,
   AgentConfirmationResolution,
   AgentEvent,
@@ -112,11 +113,50 @@ function summarizeArtifacts(artifacts: AgentToolArtifact[]): string {
   return parts.join(" ");
 }
 
+function summarizeTextOnlyArtifacts(
+  artifacts: AgentToolArtifact[],
+  modelName?: string,
+): string {
+  const imageCount = artifacts.filter((artifact) => artifact.kind === "image")
+    .length;
+  const fileCount = artifacts.filter((artifact) => artifact.kind === "file_ref")
+    .length;
+  return summarizeTextOnlyOmittedParts(imageCount, fileCount, modelName);
+}
+
+function summarizeTextOnlyOmittedParts(
+  imageCount: number,
+  fileCount: number,
+  modelName?: string,
+): string {
+  const omitted: string[] = [];
+  if (imageCount) {
+    omitted.push(`${imageCount} image${imageCount === 1 ? "" : "s"}`);
+  }
+  if (fileCount) {
+    omitted.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);
+  }
+  const target = (modelName || "The selected model").trim();
+  const omittedLabel = omitted.length ? omitted.join(" and ") : "artifacts";
+  return (
+    `${omittedLabel} prepared by the tool were not attached because ${target} does not support image or file input. ` +
+    "Use the tool result text, MinerU manifest/full.md content, captions, and surrounding extracted text instead. " +
+    "If direct visual inspection is required, say that a vision-capable model is needed."
+  );
+}
+
 async function buildArtifactFollowupMessage(
   result: AgentToolResult,
+  options: { multimodal?: boolean; modelName?: string } = {},
 ): Promise<AgentModelMessage | null> {
   const artifacts = Array.isArray(result.artifacts) ? result.artifacts : [];
   if (!artifacts.length || !result.ok) return null;
+  if (options.multimodal === false) {
+    return {
+      role: "user",
+      content: summarizeTextOnlyArtifacts(artifacts, options.modelName),
+    };
+  }
   const parts: AgentModelContentPart[] = [
     {
       type: "text",
@@ -160,6 +200,40 @@ async function buildArtifactFollowupMessage(
         content: parts,
       }
     : null;
+}
+
+function filterFollowupMessageForCapabilities(
+  message: AgentModelMessage | null,
+  capabilities: AgentModelCapabilities,
+  modelName?: string,
+): AgentModelMessage | null {
+  if (!message || capabilities.multimodal) return message;
+  if (typeof message.content === "string") return message;
+
+  const textParts: string[] = [];
+  let omittedImages = 0;
+  let omittedFiles = 0;
+  for (const part of message.content) {
+    if (part.type === "text") {
+      if (part.text.trim()) textParts.push(part.text);
+      continue;
+    }
+    if (part.type === "image_url") {
+      omittedImages += 1;
+      continue;
+    }
+    omittedFiles += 1;
+  }
+
+  if (omittedImages || omittedFiles) {
+    textParts.push(
+      summarizeTextOnlyOmittedParts(omittedImages, omittedFiles, modelName),
+    );
+  }
+  return {
+    ...message,
+    content: textParts.filter(Boolean).join("\n\n"),
+  };
 }
 
 type ToolWorkflowDelivery = {
@@ -394,6 +468,7 @@ export class AgentRuntime {
     const request = params.request;
     const runId = createRunId();
     const adapter = this.adapterFactory(request);
+    const adapterCapabilities = adapter.getCapabilities(request);
     let eventSeq = 0;
     let currentAnswerText = "";
     const item = request.item || null;
@@ -782,10 +857,26 @@ export class AgentRuntime {
             ...context,
             currentAnswerText,
           })
-        : await buildArtifactFollowupMessage(toolResult);
-      const followupMessages = [...extraFollowupMessages];
-      if (followupMessage) {
-        followupMessages.push(followupMessage);
+        : await buildArtifactFollowupMessage(toolResult, {
+            multimodal: adapterCapabilities.multimodal,
+            modelName: request.model,
+          });
+      const filteredFollowupMessage = filterFollowupMessageForCapabilities(
+        followupMessage,
+        adapterCapabilities,
+        request.model,
+      );
+      const followupMessages = extraFollowupMessages
+        .map((message) =>
+          filterFollowupMessageForCapabilities(
+            message,
+            adapterCapabilities,
+            request.model,
+          ),
+        )
+        .filter((message): message is AgentModelMessage => Boolean(message));
+      if (filteredFollowupMessage) {
+        followupMessages.push(filteredFollowupMessage);
       }
       return {
         callId,

@@ -1,7 +1,7 @@
 import { config } from "../../package.json";
 import { DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE } from "./llmDefaults";
 import {
-  normalizeMaxTokens,
+  normalizeMaxTokensForModel,
   normalizeOptionalInputTokenCap,
   normalizeTemperature,
 } from "./normalization";
@@ -140,12 +140,16 @@ function normalizeProviderAuthMode(value: unknown): ModelProviderAuthMode {
 
 function normalizeAdvancedModelConfig(
   value?: AdvancedModelConfigInput | null,
+  modelName?: string,
 ): AdvancedModelConfig {
   return {
     temperature: normalizeTemperature(
       `${value?.temperature ?? DEFAULT_TEMPERATURE}`,
     ),
-    maxTokens: normalizeMaxTokens(`${value?.maxTokens ?? DEFAULT_MAX_TOKENS}`),
+    maxTokens: normalizeMaxTokensForModel(
+      `${value?.maxTokens ?? DEFAULT_MAX_TOKENS}`,
+      modelName,
+    ),
     inputTokenCap: normalizeOptionalInputTokenCap(value?.inputTokenCap),
   };
 }
@@ -273,11 +277,14 @@ function normalizeGroupModel(model: unknown): ModelProviderModel | null {
     providerProtocol?: unknown;
   };
   const modelName = normalizeString(rawModel.model);
-  const advanced = normalizeAdvancedModelConfig({
-    temperature: Number(rawModel.temperature),
-    maxTokens: Number(rawModel.maxTokens),
-    inputTokenCap: rawModel.inputTokenCap as number | string | undefined,
-  });
+  const advanced = normalizeAdvancedModelConfig(
+    {
+      temperature: Number(rawModel.temperature),
+      maxTokens: Number(rawModel.maxTokens),
+      inputTokenCap: rawModel.inputTokenCap as number | string | undefined,
+    },
+    modelName,
+  );
   const modelProtocol = isProviderProtocol(rawModel.providerProtocol)
     ? rawModel.providerProtocol
     : undefined;
@@ -356,8 +363,9 @@ function resolveLegacyModelSlot(
   const temperature = normalizeTemperature(
     getStringPref(`temperature${suffix}`) || `${DEFAULT_TEMPERATURE}`,
   );
-  const maxTokens = normalizeMaxTokens(
+  const maxTokens = normalizeMaxTokensForModel(
     getStringPref(`maxTokens${suffix}`) || `${DEFAULT_MAX_TOKENS}`,
+    modelName,
   );
   const inputTokenCap = normalizeOptionalInputTokenCap(
     getStringPref(`inputTokenCap${suffix}`),
@@ -417,7 +425,7 @@ export function buildModelProviderGroupsFromLegacySlots(
     const entry: ModelProviderModel = {
       id: createId("model"),
       model: slot.model.trim(),
-      ...normalizeAdvancedModelConfig(slot),
+      ...normalizeAdvancedModelConfig(slot, slot.model),
     };
     group.models.push(entry);
     legacyToEntryId[slot.key] = entry.id;
@@ -496,7 +504,7 @@ export function createProviderModelEntry(
   return {
     id: createId("model"),
     model: model.trim(),
-    ...normalizeAdvancedModelConfig(advanced),
+    ...normalizeAdvancedModelConfig(advanced, model),
     ...(providerProtocol ? { providerProtocol } : {}),
   };
 }
@@ -558,7 +566,7 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
           duplicateCount > 1
             ? `${baseModelLabel} #${duplicateCount}`
             : baseModelLabel,
-        advanced: normalizeAdvancedModelConfig(modelEntry),
+        advanced: normalizeAdvancedModelConfig(modelEntry, modelName),
       });
     }
   }

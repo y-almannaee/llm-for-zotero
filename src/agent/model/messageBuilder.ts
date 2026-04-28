@@ -369,6 +369,17 @@ function buildRuntimePlatformSection(): string {
   return buildRuntimePlatformGuidanceText();
 }
 
+function buildTextOnlyModelInstruction(request: AgentRuntimeRequest): string {
+  if (!isTextOnlyModel(request.model || "")) return "";
+  const modelLabel = (request.model || "selected model").trim();
+  return (
+    `MODEL LIMITATION: ${modelLabel} is treated as text-only in this plugin. ` +
+    "Do not rely on screenshots, PDF page images, or image-file visual inspection. " +
+    "For MinerU-cached papers, prefer `manifest.json`, `full.md` section offsets, captions, tables, formulas, and surrounding extracted text. " +
+    "If the user asks for information that requires direct visual inspection and only an image is available, state that this model cannot inspect the image directly and answer only from extracted text/captions."
+  );
+}
+
 export async function buildAgentInitialMessages(
   request: AgentRuntimeRequest,
   tools: AgentToolDefinition<any, any>[],
@@ -393,6 +404,10 @@ export async function buildAgentInitialMessages(
     {
       id: "runtime-platform",
       lines: [buildRuntimePlatformSection()],
+    },
+    {
+      id: "model-limitations",
+      lines: [buildTextOnlyModelInstruction(request)],
     },
     {
       id: "custom-instructions",

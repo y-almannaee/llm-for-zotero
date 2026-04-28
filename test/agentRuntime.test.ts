@@ -11,6 +11,7 @@ import {
 import type {
   AgentEvent,
   AgentModelCapabilities,
+  AgentModelMessage,
   AgentModelStep,
   AgentRuntimeRequest,
 } from "../src/agent/types";
@@ -451,6 +452,105 @@ describe("AgentRuntime", function () {
       (
         globalThis as typeof globalThis & { btoa?: (value: string) => string }
       ).btoa = restoreBtoa;
+      restoreDb();
+    }
+  });
+
+  it("does not pass image or PDF artifacts to non-multimodal models", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "prepare_visual_artifacts",
+          description: "prepare visual artifacts",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({
+          content: { pageTexts: [{ pageLabel: "1", text: "Extracted text" }] },
+          artifacts: [
+            {
+              kind: "image" as const,
+              mimeType: "image/png",
+              storedPath: "/tmp/nonexistent-page.png",
+              pageLabel: "1",
+            },
+            {
+              kind: "file_ref" as const,
+              name: "paper.pdf",
+              mimeType: "application/pdf",
+              storedPath: "/tmp/nonexistent-paper.pdf",
+            },
+          ],
+        }),
+      });
+
+      let stepIndex = 0;
+      let continuationMessages: AgentModelMessage[] = [];
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            if (stepIndex === 0) {
+              stepIndex += 1;
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "call-1",
+                    name: "prepare_visual_artifacts",
+                    arguments: {},
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "call-1",
+                      name: "prepare_visual_artifacts",
+                      arguments: {},
+                    },
+                  ],
+                },
+              };
+            }
+            continuationMessages = params.messages;
+            return {
+              kind: "final",
+              text: "done",
+              assistantMessage: { role: "assistant", content: "done" },
+            };
+          },
+        }),
+      });
+
+      await runtime.runTurn({
+        request: {
+          conversationKey: 99,
+          mode: "agent",
+          userText: "inspect the figure",
+          model: "deepseek-v4-pro",
+        },
+      });
+
+      const serialized = JSON.stringify(continuationMessages);
+      assert.notInclude(serialized, "image_url");
+      assert.notInclude(serialized, "file_ref");
+      assert.include(serialized, "does not support image or file input");
+      assert.include(serialized, "Extracted text");
+    } finally {
       restoreDb();
     }
   });

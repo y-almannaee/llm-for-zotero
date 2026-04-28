@@ -5,7 +5,10 @@ import {
   uploadFilesForResponses,
   type ChatFileAttachment,
 } from "../../utils/llmClient";
-import { normalizeMaxTokens, normalizeTemperature } from "../../utils/normalization";
+import {
+  normalizeMaxTokensForModel,
+  normalizeTemperature,
+} from "../../utils/normalization";
 import { resolveProviderTransportEndpoint } from "../../utils/providerTransport";
 import type {
   AgentModelCapabilities,
@@ -109,6 +112,7 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
           true,
           request.model,
           request.apiBase,
+          "responses_api",
         );
         return {
           model: request.model,
@@ -119,7 +123,10 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
           tool_choice: "auto",
           store: false,
           stream: true,
-          max_output_tokens: normalizeMaxTokens(request.advanced?.maxTokens),
+          max_output_tokens: normalizeMaxTokensForModel(
+            request.advanced?.maxTokens,
+            request.model,
+          ),
           ...reasoningPayload.extra,
           ...(reasoningPayload.omitTemperature
             ? {}
