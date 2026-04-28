@@ -28,6 +28,7 @@ export type PendingHistoryDeletion = {
   kind: "paper" | "global";
   conversationKey: number;
   libraryID: number;
+  conversationSystem: "upstream" | "claude_code";
   paperItemID?: number;
   title: string;
   wasActive: boolean;

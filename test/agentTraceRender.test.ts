@@ -41,6 +41,7 @@ describe("agentTrace render", function () {
     assert.deepInclude(reasoningItem, {
       type: "reasoning",
       summary: "Let me read the paper first.",
+      label: "Thinking",
     });
   });
 
@@ -137,6 +138,53 @@ describe("agentTrace render", function () {
       label: "Thinking for step 1",
       summary: "Read manifest.",
     });
+  });
+
+  it("splits reasoning into a new thinking block after a tool call", function () {
+    const events: AgentRunEventRecord[] = [
+      {
+        runId: "run-1",
+        seq: 1,
+        eventType: "reasoning",
+        payload: {
+          type: "reasoning",
+          round: 1,
+          details: "First thought.",
+        },
+        createdAt: 1,
+      },
+      {
+        runId: "run-1",
+        seq: 2,
+        eventType: "tool_call",
+        payload: {
+          type: "tool_call",
+          callId: "call-1",
+          name: "Read",
+          args: {},
+        },
+        createdAt: 2,
+      },
+      {
+        runId: "run-1",
+        seq: 3,
+        eventType: "reasoning",
+        payload: {
+          type: "reasoning",
+          round: 1,
+          details: "Second thought.",
+        },
+        createdAt: 3,
+      },
+    ];
+
+    const items = buildAgentTraceDisplayItems(events, null).filter(
+      (item) => item.type === "reasoning",
+    );
+
+    assert.lengthOf(items, 2);
+    assert.deepInclude(items[0], { type: "reasoning", summary: "First thought.", label: "Thinking" });
+    assert.deepInclude(items[1], { type: "reasoning", summary: "Second thought.", label: "Thinking" });
   });
 
   it("uses a single primary action surface for multi-action review cards", function () {
@@ -360,5 +408,84 @@ describe("agentTrace render", function () {
       type: "inline_text",
       text: "Working through the evidence.",
     });
+  });
+
+  it("omits generic completed rows when a tool already has no specific success summary", function () {
+    const events: AgentRunEventRecord[] = [
+      {
+        runId: "run-1",
+        seq: 1,
+        eventType: "tool_call",
+        payload: {
+          type: "tool_call",
+          callId: "call-1",
+          name: "unknown_tool",
+          args: {},
+        },
+        createdAt: 1,
+      },
+      {
+        runId: "run-1",
+        seq: 2,
+        eventType: "tool_result",
+        payload: {
+          type: "tool_result",
+          callId: "call-1",
+          name: "unknown_tool",
+          ok: true,
+          content: { ok: true },
+        },
+        createdAt: 2,
+      },
+      {
+        runId: "run-1",
+        seq: 3,
+        eventType: "final",
+        payload: {
+          type: "final",
+          text: "Done",
+        },
+        createdAt: 3,
+      },
+    ];
+
+    const { items } = buildAgentTraceDisplayItems(events, null);
+    const actionTexts = items
+      .filter(
+        (item): item is Extract<(typeof items)[number], { type: "action" }> =>
+          item.type === "action",
+      )
+      .map((item) => item.row.text);
+
+    assert.notInclude(actionTexts, "Completed Unknown tool");
+    assert.include(actionTexts, "Response ready");
+  });
+
+  it("shows the concrete skill name instead of a generic skill label", function () {
+    const events: AgentRunEventRecord[] = [
+      {
+        runId: "run-1",
+        seq: 1,
+        eventType: "tool_call",
+        payload: {
+          type: "tool_call",
+          callId: "call-1",
+          name: "Skill",
+          args: { skill: "graphwalk" },
+        },
+        createdAt: 1,
+      },
+    ];
+
+    const { items } = buildAgentTraceDisplayItems(events, null);
+    const actionTexts = items
+      .filter(
+        (item): item is Extract<(typeof items)[number], { type: "action" }> =>
+          item.type === "action",
+      )
+      .map((item) => item.row.text);
+
+    assert.include(actionTexts, "Using Skill: graphwalk");
+    assert.notInclude(actionTexts, "Using Skill");
   });
 });

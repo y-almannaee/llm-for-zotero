@@ -64,6 +64,9 @@ export interface Message {
   modelEntryId?: string;
   modelProviderLabel?: string;
   streaming?: boolean;
+  pendingFinalText?: string;
+  waitingAnimationStartedAt?: number;
+  pendingAgentTraceEvents?: import("../../agent/types").AgentRunEventRecord[];
   reasoningSummary?: string;
   reasoningDetails?: string;
   reasoningOpen?: boolean;
@@ -71,6 +74,9 @@ export interface Message {
   webchatCompletionReason?: "settled" | "forced_cancel" | "timeout" | "error" | null;
   webchatChatUrl?: string;
   webchatChatId?: string;
+  compactMarker?: boolean;
+  runtimeMarkerText?: string;
+  modelSwitchMarkerText?: string;
 }
 
 export type ChatRuntimeMode = "chat" | "agent";
@@ -234,6 +240,33 @@ export type PaperPortalItem = {
   isRegularItem: () => boolean;
 };
 
+export type ClaudeGlobalPortalItem = {
+  __llmClaudeGlobalPortalItem: true;
+  __llmClaudeConversationKind: "global";
+  id: number;
+  libraryID: number;
+  parentID?: number;
+  attachmentContentType?: string;
+  isAttachment: () => boolean;
+  getAttachments: () => number[];
+  getField: (field: string) => string;
+  isRegularItem: () => boolean;
+};
+
+export type ClaudePaperPortalItem = {
+  __llmClaudePaperPortalItem: true;
+  __llmClaudeConversationKind: "paper";
+  __llmClaudePaperPortalBaseItemID: number;
+  id: number;
+  libraryID: number;
+  parentID?: number;
+  attachmentContentType?: string;
+  isAttachment: () => boolean;
+  getAttachments: () => number[];
+  getField: (field: string) => string;
+  isRegularItem: () => boolean;
+};
+
 export type ChunkStat = {
   index: number;
   length: number;
@@ -259,6 +292,10 @@ export type SendQuestionOptions = {
   model?: string;
   apiBase?: string;
   apiKey?: string;
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
+  providerProtocol?: import("../../utils/providerProtocol").ProviderProtocol;
+  modelEntryId?: string;
+  modelProviderLabel?: string;
   reasoning?: LLMReasoningConfig;
   advanced?: AdvancedModelParams;
   displayQuestion?: string;
@@ -281,6 +318,7 @@ export type SendQuestionOptions = {
   webchatSendPdf?: boolean;
   /** [webchat] When true, send the prompt into a fresh ChatGPT conversation. */
   webchatForceNewChat?: boolean;
+  skipAutoCompact?: boolean;
 };
 
 export type EditRetryOptions = {
@@ -301,6 +339,10 @@ export type EditRetryOptions = {
   model?: string;
   apiBase?: string;
   apiKey?: string;
+  authMode?: "api_key" | "codex_auth" | "codex_app_server" | "copilot_auth" | "webchat";
+  providerProtocol?: import("../../utils/providerProtocol").ProviderProtocol;
+  modelEntryId?: string;
+  modelProviderLabel?: string;
   reasoning?: LLMReasoningConfig;
   advanced?: AdvancedModelParams;
 };

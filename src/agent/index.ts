@@ -18,6 +18,12 @@ import type {
   AgentRuntimeRequest,
   AgentToolDefinition,
 } from "./types";
+import {
+  getConversationSystemPref,
+  isClaudeCodeModeEnabled,
+} from "../claudeCode/prefs";
+import { getClaudeCommandCatalog } from "../claudeCode/commandCatalog";
+import { getClaudeBridgeRuntime, resetClaudeBridgeRuntime } from "../claudeCode/runtime";
 
 let runtime: AgentRuntime | null = null;
 let _actionRegistry: ActionRegistry | null = null;
@@ -49,7 +55,6 @@ export async function initAgentSubsystem(): Promise<AgentRuntime> {
     adapterFactory: (request) => createAgentModelAdapter(request),
   });
 
-  // Initialize action registry and MCP server
   _actionRegistry = createBuiltInActionRegistry();
   registerMcpServer({
     actionRegistry: _actionRegistry,
@@ -64,15 +69,24 @@ export function shutdownAgentSubsystem(): void {
   unregisterMcpServer();
   _actionRegistry = null;
   _toolRegistry = null;
+  resetClaudeBridgeRuntime();
   runtime = null;
   _zoteroGateway = null;
 }
 
-export function getAgentRuntime(): AgentRuntime {
+export function getCoreAgentRuntime(): AgentRuntime {
   if (!runtime) {
     throw new Error("Agent subsystem is not initialized");
   }
   return runtime;
+}
+
+export function getAgentRuntime(): AgentRuntime {
+  const coreRuntime = getCoreAgentRuntime();
+  if (getConversationSystemPref() === "claude_code" && isClaudeCodeModeEnabled()) {
+    return getClaudeBridgeRuntime(coreRuntime) as unknown as AgentRuntime;
+  }
+  return coreRuntime;
 }
 
 /**
@@ -114,6 +128,7 @@ export function getAgentApi() {
       requestId: string,
       resolve: (resolution: AgentConfirmationResolution) => void,
     ) => getAgentRuntime().registerPendingConfirmation(requestId, resolve),
+    listSlashCommands: () => getClaudeCommandCatalog(getCoreAgentRuntime()),
 
     // ── Extension API ──────────────────────────────────────────────────────
     /**

@@ -14,6 +14,7 @@ import {
   isGlobalPortalItem,
   isPaperPortalItem,
   resolveActiveNoteSession,
+  resolveConversationSystemForItem,
   resolveDisplayConversationKind,
 } from "./portalScope";
 
@@ -126,6 +127,8 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
       ? "global"
       : "paper"
     : "";
+  container.dataset.conversationSystem =
+    resolveConversationSystemForItem(item) || "upstream";
   container.dataset.basePaperItemId =
     basePaperItemId > 0 ? `${basePaperItemId}` : "";
   container.dataset.noteKind = activeNoteSession?.noteKind || "";
@@ -179,19 +182,20 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
   historyToggle.setAttribute("aria-expanded", "false");
   historyToggle.style.display = activeNoteSession ? "none" : "";
 
+  const isStandaloneBody = (body as HTMLElement).dataset?.standalone === "true";
+  const headerModeControls = createElement(doc, "div", "llm-header-mode-controls", {
+    id: "llm-header-mode-controls",
+  });
+
   // Mode chip: single pill showing current mode + lock
   const modeSwitchWrap = createElement(doc, "div", "llm-mode-switch", {
     id: "llm-mode-capsule",
   });
   modeSwitchWrap.dataset.mode = hasItem && isGlobalMode ? "global" : "paper";
 
-  const isStandaloneBody = (body as HTMLElement).dataset?.standalone === "true";
-
-  // In sidepanels, the mode chip is a non-clickable indicator (always "Paper chat").
-  // In the standalone window, it shows "Library chat".
   const modeChipLabel = activeNoteSession
     ? t("Note editing")
-    : (isStandaloneBody ? t("Library chat") : t("Paper chat"));
+    : (isGlobalMode ? t("Library chat") : t("Paper chat"));
   const modeChipBtn = createElement(doc, "button", "llm-mode-chip", {
     id: "llm-mode-chip",
     type: "button",
@@ -199,9 +203,6 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
     title: modeChipLabel,
   });
   modeChipBtn.setAttribute("aria-label", modeChipLabel);
-  if (!isStandaloneBody) {
-    modeChipBtn.style.cursor = "default";
-  }
 
   // Lock button, right of chip (only visible in standalone open-chat mode)
   const modeLockBtn = createElement(doc, "div", "llm-mode-lock", {
@@ -217,7 +218,26 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
 
   modeSwitchWrap.append(modeChipBtn, modeLockBtn);
 
-  historyBar.append(historyNewBtn, historyToggle, modeSwitchWrap);
+  const claudeToggleBtn = createElement(doc, "button", "llm-claude-system-toggle", {
+    id: "llm-claude-system-toggle",
+    type: "button",
+    title: "Claude Code",
+  });
+  claudeToggleBtn.setAttribute("aria-label", "Claude Code");
+  const claudeToggleIcon = createElement(doc, "span", "llm-claude-system-toggle-icon", {
+    id: "llm-claude-system-toggle-icon",
+  });
+  claudeToggleIcon.setAttribute("aria-hidden", "true");
+  claudeToggleBtn.appendChild(claudeToggleIcon);
+
+  const claudeContextGauge = createElement(doc, "div", "llm-claude-context-gauge", {
+    id: "llm-claude-context-gauge",
+  }) as HTMLDivElement;
+  claudeContextGauge.style.display = "none";
+  claudeContextGauge.setAttribute("aria-hidden", "true");
+
+  headerModeControls.append(modeSwitchWrap, claudeToggleBtn, claudeContextGauge);
+  historyBar.append(historyNewBtn, historyToggle, headerModeControls);
 
   headerInfo.append(title, historyBar);
   headerTop.appendChild(headerInfo);
@@ -740,6 +760,12 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
   commandRow.appendChild(commandRowHeader);
   composeArea.appendChild(commandRow);
 
+  const queueBar = createElement(doc, "div", "llm-queued-input-bar", {
+    id: "llm-queued-input-bar",
+  });
+  queueBar.style.display = "none";
+  composeArea.appendChild(queueBar);
+
   const inputBox = createElement(doc, "textarea", "llm-input", {
     id: "llm-input",
     placeholder: hasItem
@@ -792,14 +818,14 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
     {
       id: "llm-upload-file",
       type: "button",
-      textContent: UPLOAD_FILE_EXPANDED_LABEL,
-      title: t("Context actions"),
+      textContent: "/",
+      title: t("Slash commands"),
       disabled: !hasItem,
     },
   );
   uploadBtn.setAttribute("aria-haspopup", "menu");
   uploadBtn.setAttribute("aria-expanded", "false");
-  uploadBtn.setAttribute("aria-label", t("Context actions"));
+  uploadBtn.setAttribute("aria-label", t("Slash commands"));
   const uploadInput = createElement(doc, "input", "", {
     id: "llm-upload-input",
     type: "file",

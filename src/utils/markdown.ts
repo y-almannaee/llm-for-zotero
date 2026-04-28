@@ -85,6 +85,24 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (m) => HTML_ESCAPE_MAP[m]);
 }
 
+function escapeAttribute(text: string): string {
+  return escapeHtml(text).replace(/\r/g, "&#13;").replace(/\n/g, "&#10;");
+}
+
+function wrapCopyable(
+  html: string,
+  copySource: string,
+  kind: "code" | "math" | "table",
+  display: "block" | "inline" = "block",
+): string {
+  const className =
+    display === "inline"
+      ? `llm-copyable llm-copyable-${kind} llm-copyable-inline`
+      : `llm-copyable llm-copyable-${kind}`;
+  const tag = display === "inline" ? "span" : "div";
+  return `<${tag} class="${className}" data-llm-copy-source="${escapeAttribute(copySource)}">${html}</${tag}>`;
+}
+
 /** Count non-overlapping occurrences of a pattern */
 function countOccurrences(text: string, pattern: string | RegExp): number {
   const regex =
@@ -450,13 +468,15 @@ function splitTextBlocks(text: string): TextBlock[] {
       continue;
     }
 
-    // Table (starts with |)
+    // Table
     if (trimmed.includes("|") && i + 1 < lines.length) {
       const nextTrimmed = lines[i + 1]?.trim() || "";
-      if (/^[\s|:-]+$/.test(nextTrimmed) && nextTrimmed.includes("-")) {
+      if (/^\|?[\s:-]+(?:\|[\s:-]+)+\|?$/.test(nextTrimmed) && nextTrimmed.includes("-")) {
         const tableLines: string[] = [line, lines[i + 1]];
         i += 2;
-        while (i < lines.length && lines[i].trim().includes("|")) {
+        while (i < lines.length) {
+          const rowTrimmed = lines[i].trim();
+          if (!rowTrimmed || !rowTrimmed.includes("|")) break;
           tableLines.push(lines[i]);
           i++;
         }
@@ -593,13 +613,16 @@ function renderCodeBlock(code: string, raw: string): string {
   const langMatch = raw.match(/^```(\w*)/);
   const lang = langMatch?.[1] || "";
   const langClass = lang ? ` class="lang-${lang}"` : "";
-  return `<pre${langClass}><code>${escapeHtml(code.trim())}</code></pre>`;
+  const html = `<pre${langClass}><code>${escapeHtml(code.trim())}</code></pre>`;
+  if (zoteroNoteMode) return html;
+  return wrapCopyable(html, raw.trim(), "code");
 }
 
 /** Render display math block */
 function renderMathBlock(content: string): string {
   // Remove $$ or \[...\] delimiters
-  let math = content.trim();
+  const copySource = content.trim();
+  let math = copySource;
   if (math.startsWith("$$") && math.endsWith("$$")) {
     math = math.slice(2, -2);
   } else {
@@ -614,7 +637,7 @@ function renderMathBlock(content: string): string {
   }
 
   const rendered = renderDisplayLatex(math);
-  return `<div class="math-display">${rendered}</div>`;
+  return wrapCopyable(`<div class="math-display">${rendered}</div>`, copySource, "math");
 }
 
 /** Render header */
@@ -682,14 +705,34 @@ function renderTable(content: string): string {
     return `<p>${escapeHtml(content)}</p>`;
   }
 
-  const readCells = (row: string) =>
-    row
-      .split("|")
-      .map((cell) => cell.trim())
-      .filter((cell, idx, arr) => {
-        const isEdge = (idx === 0 || idx === arr.length - 1) && cell === "";
-        return !isEdge;
-      });
+  const readCells = (row: string) => {
+    const cells: string[] = [];
+    let current = "";
+    let escaped = false;
+    for (const char of row) {
+      if (escaped) {
+        current += char;
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "|") {
+        cells.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+    if (escaped) current += "\\";
+    cells.push(current.trim());
+    return cells.filter((cell, idx, arr) => {
+      const isEdge = (idx === 0 || idx === arr.length - 1) && cell === "";
+      return !isEdge;
+    });
+  };
 
   const headerCells = readCells(lines[0]);
   // Skip divider line (lines[1])
@@ -703,7 +746,9 @@ function renderTable(content: string): string {
     )
     .join("");
 
-  return `<table><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table>`;
+  const html = `<div class="llm-table-scroll"><table><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table></div>`;
+  if (zoteroNoteMode) return html;
+  return wrapCopyable(html, content.trim(), "table");
 }
 
 /** Render paragraph */
@@ -736,6 +781,7 @@ function renderInline(text: string): string {
   if (hasBalancedInlineDelimiter(result, "$")) {
     // Display math first ($$...$$)
     result = result.replace(/\$\$([^$]+?)\$\$/g, (_match, math) => {
+      const copySource = `$$${math}$$`;
       if (zoteroNoteMode) {
         // Zotero note-editor: <span class="math">$LaTeX$</span>
         return protect(
@@ -743,7 +789,14 @@ function renderInline(text: string): string {
         );
       }
       const rendered = renderDisplayLatex(math.trim());
-      return protect(`<span class="math-display-inline">${rendered}</span>`);
+      return protect(
+        wrapCopyable(
+          `<span class="math-display-inline">${rendered}</span>`,
+          copySource,
+          "math",
+          "inline",
+        ),
+      );
     });
 
     // Inline math ($...$)
@@ -758,7 +811,14 @@ function renderInline(text: string): string {
         return protect(`<span class="math">$${escapeHtml(trimmed)}$</span>`);
       }
       const rendered = renderLatex(trimmed, false);
-      return protect(`<span class="math-inline">${rendered}</span>`);
+      return protect(
+        wrapCopyable(
+          `<span class="math-inline">${rendered}</span>`,
+          `$${inner}$`,
+          "math",
+          "inline",
+        ),
+      );
     });
   }
 
@@ -844,7 +904,8 @@ function renderInline(text: string): string {
   // 11. Links [text](url)
   result = result.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener">$1</a>',
+    (_match, text: string, href: string) =>
+      `<a href="${escapeAttribute(href.trim())}" target="_blank" rel="noopener">${escapeHtml(text)}</a>`,
   );
 
   // 11. Restore protected blocks.
