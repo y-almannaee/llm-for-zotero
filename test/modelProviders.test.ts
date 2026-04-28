@@ -10,8 +10,12 @@ import {
   type ModelProviderGroup,
 } from "../src/utils/modelProviders";
 
+let originalZotero: typeof Zotero | undefined;
+
 describe("modelProviders", function () {
-  const originalZotero = globalThis.Zotero;
+  before(function () {
+    originalZotero = globalThis.Zotero;
+  });
 
   beforeEach(function () {
     const prefStore = new Map<string, unknown>();
@@ -152,6 +156,88 @@ describe("modelProviders", function () {
     assert.equal(entries[1].displayModelLabel, "gpt-4o-mini #2");
     assert.equal(entries[0].providerLabel, "OpenAI");
     assert.equal(entries[0].authMode, "api_key");
+    assert.equal(entries[0].providerProtocol, "openai_chat_compat");
+  });
+
+  it("infers Anthropic protocol for customized providers with default chat protocol", function () {
+    const groups: ModelProviderGroup[] = [
+      {
+        id: "provider-1",
+        apiBase: "https://proxy.example.com/anthropic",
+        apiKey: "sk-anthropic",
+        authMode: "api_key",
+        providerProtocol: "openai_chat_compat",
+        presetIdOverride: "customized",
+        models: [
+          {
+            id: "model-1",
+            model: "claude-sonnet-4-5",
+            temperature: 0.3,
+            maxTokens: 4096,
+          },
+        ],
+      },
+    ];
+
+    setModelProviderGroups(groups);
+    const entries = getRuntimeModelEntries();
+
+    assert.lengthOf(entries, 1);
+    assert.equal(entries[0].providerProtocol, "anthropic_messages");
+  });
+
+  it("infers Responses protocol for customized providers with canonical responses URLs", function () {
+    const groups: ModelProviderGroup[] = [
+      {
+        id: "provider-1",
+        apiBase: "https://proxy.example.com/v1/responses",
+        apiKey: "sk-responses",
+        authMode: "api_key",
+        providerProtocol: "openai_chat_compat",
+        presetIdOverride: "customized",
+        models: [
+          {
+            id: "model-1",
+            model: "gpt-5.4",
+            temperature: 0.3,
+            maxTokens: 4096,
+          },
+        ],
+      },
+    ];
+
+    setModelProviderGroups(groups);
+    const entries = getRuntimeModelEntries();
+
+    assert.lengthOf(entries, 1);
+    assert.equal(entries[0].providerProtocol, "responses_api");
+  });
+
+  it("keeps per-model protocol override above customized URL inference", function () {
+    const groups: ModelProviderGroup[] = [
+      {
+        id: "provider-1",
+        apiBase: "https://proxy.example.com/anthropic",
+        apiKey: "sk-chat",
+        authMode: "api_key",
+        providerProtocol: "openai_chat_compat",
+        presetIdOverride: "customized",
+        models: [
+          {
+            id: "model-1",
+            model: "chat-compatible-model",
+            temperature: 0.3,
+            maxTokens: 4096,
+            providerProtocol: "openai_chat_compat",
+          },
+        ],
+      },
+    ];
+
+    setModelProviderGroups(groups);
+    const entries = getRuntimeModelEntries();
+
+    assert.lengthOf(entries, 1);
     assert.equal(entries[0].providerProtocol, "openai_chat_compat");
   });
 

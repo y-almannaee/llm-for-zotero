@@ -276,6 +276,7 @@ const zhCN: Record<string, string> = {
   "Provider": "服务商",
   "Customized": "自定义",
   "Protocol": "协议",
+  "API protocol override": "API 协议覆盖",
   "API URL": "API URL",
   "API Key": "API 密钥",
   "codex auth": "codex 认证",

@@ -5,6 +5,23 @@ import {
 } from "../src/utils/providerTransport";
 
 describe("providerTransport", function () {
+  it("keeps canonical Responses endpoint bases unchanged", function () {
+    assert.equal(
+      resolveProviderTransportEndpoint({
+        protocol: "responses_api",
+        apiBase: "https://proxy.example.com/v1/responses",
+      }),
+      "https://proxy.example.com/v1/responses",
+    );
+    assert.equal(
+      resolveProviderTransportEndpoint({
+        protocol: "responses_api",
+        apiBase: "https://proxy.example.com/responses",
+      }),
+      "https://proxy.example.com/responses",
+    );
+  });
+
   it("maps MiniMax between Anthropic and OpenAI compatible bases", function () {
     assert.equal(
       resolveProviderTransportEndpoint({

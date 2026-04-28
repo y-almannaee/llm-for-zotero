@@ -245,29 +245,19 @@ function resolveSelectedProtocol(
     group.authMode === "codex_auth" || group.authMode === "codex_app_server"
       ? "codex_responses"
       : presetId === "customized"
-        ? "openai_chat_compat"
+        ? undefined
         : getProviderPreset(presetId).defaultProtocol;
   const allowed = getProtocolOptions(group.authMode, presetId);
+  const shouldInferCustomizedProtocol =
+    presetId === "customized" &&
+    group.providerProtocol === "openai_chat_compat";
   const normalized = normalizeProviderProtocolForAuthMode({
-    protocol: group.providerProtocol,
+    protocol: shouldInferCustomizedProtocol ? undefined : group.providerProtocol,
     authMode: group.authMode,
     apiBase: group.apiBase,
-    fallback,
+    ...(fallback ? { fallback } : {}),
   });
   return allowed.includes(normalized) ? normalized : allowed[0];
-}
-
-function getProtocolHelperText(
-  group: ModelProviderGroup,
-  protocol: ProviderProtocol,
-): string {
-  if (group.authMode === "codex_app_server") {
-    return t(CODEX_APP_SERVER_PROTOCOL_HELPER_TEXT);
-  }
-  if (group.authMode === "codex_auth") {
-    return t(LEGACY_CODEX_AUTH_PROTOCOL_HELPER_TEXT);
-  }
-  return getProviderProtocolSpec(protocol).helperText;
 }
 
 // ── DOM helpers ────────────────────────────────────────────────────
@@ -939,54 +929,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         providerPresetWrap.append(providerPresetLabel, providerPresetSelect);
       }
 
-      // ── Protocol ────────────────────────────────────────────────
-      const protocolWrap = el(
-        doc,
-        "div",
-        "display: flex; flex-direction: column;",
-      );
-      const protocolLabel = el(doc, "label", LABEL_STYLE, t("Protocol"));
-      const protocolSelect = el(
-        doc,
-        "select",
-        INPUT_STYLE,
-      ) as HTMLSelectElement;
-      protocolSelect.id = `${config.addonRef}-provider-protocol-${group.id}`;
-      protocolLabel.setAttribute("for", protocolSelect.id);
-      const protocolOptions = getProtocolOptions(
-        group.authMode,
-        selectedPresetId,
-      );
-      for (const protocol of protocolOptions) {
-        const option = el(doc, "option") as HTMLOptionElement;
-        option.value = protocol;
-        option.textContent = getProviderProtocolSpec(protocol).label;
-        option.selected = protocol === group.providerProtocol;
-        protocolSelect.appendChild(option);
-      }
-      protocolSelect.disabled = protocolOptions.length <= 1;
-      protocolSelect.addEventListener("change", () => {
-        group.providerProtocol = resolveSelectedProtocol(
-          {
-            ...group,
-            providerProtocol: protocolSelect.value as ProviderProtocol,
-          },
-          selectedPresetId,
-        );
-        persistGroups(groups);
-        setTimeout(() => rerender(), 0);
-      });
-      protocolWrap.append(
-        protocolLabel,
-        protocolSelect,
-        el(
-          doc,
-          "span",
-          HELPER_STYLE,
-          getProtocolHelperText(group, group.providerProtocol),
-        ),
-      );
-
       // ── API URL ──────────────────────────────────────────────────
       const apiUrlWrap = el(
         doc,
@@ -1612,7 +1554,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           doc,
           "label",
           "font-size: 10.5px; font-weight: 600; color: var(--fill-primary, inherit);",
-          t("Protocol"),
+          t("API protocol override"),
         );
         const protocolFieldSelect = el(
           doc,
@@ -1635,6 +1577,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         }
         protocolFieldSelect.value = modelEntry.providerProtocol || "";
         protocolFieldWrap.append(protocolFieldLabel, protocolFieldSelect);
+        if (allowedProtocols.length <= 1) {
+          protocolFieldWrap.style.display = "none";
+        }
 
         advFields.append(
           tempField.wrap,
@@ -1811,7 +1756,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         cardBody.append(
           authModeWrap,
           copilotLoginWrap,
-          protocolWrap,
           apiUrlWrap,
           divider,
           modelsWrap,
@@ -1819,7 +1763,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       } else if (group.authMode === "codex_app_server") {
         cardBody.append(
           authModeWrap,
-          protocolWrap,
           apiUrlWrap,
           divider,
           modelsWrap,
@@ -1827,7 +1770,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       } else if (group.authMode === "codex_auth") {
         cardBody.append(
           authModeWrap,
-          protocolWrap,
           apiUrlWrap,
           apiKeyWrap,
           divider,
@@ -1837,7 +1779,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         cardBody.append(
           authModeWrap,
           providerPresetWrap,
-          protocolWrap,
           apiUrlWrap,
           apiKeyWrap,
           divider,

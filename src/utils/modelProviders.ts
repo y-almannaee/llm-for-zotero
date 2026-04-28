@@ -299,6 +299,42 @@ function normalizeGroupModel(model: unknown): ModelProviderModel | null {
   };
 }
 
+function resolveStoredPresetId(group: ModelProviderGroup): ProviderPresetId {
+  if (
+    group.authMode === "codex_auth" ||
+    group.authMode === "codex_app_server" ||
+    group.authMode === "copilot_auth" ||
+    group.authMode === "webchat"
+  ) {
+    return "customized";
+  }
+  return group.presetIdOverride ?? detectProviderPreset(group.apiBase);
+}
+
+function resolveRuntimeProviderProtocol(
+  group: ModelProviderGroup,
+  modelEntry?: ModelProviderModel,
+): ProviderProtocol {
+  const authMode = normalizeProviderAuthMode(group.authMode);
+  const presetId = resolveStoredPresetId(group);
+  const fallback =
+    presetId === "customized"
+      ? undefined
+      : getProviderPreset(presetId).defaultProtocol;
+  const shouldInferCustomizedProtocol =
+    presetId === "customized" &&
+    group.providerProtocol === "openai_chat_compat";
+  const protocol =
+    modelEntry?.providerProtocol ||
+    (shouldInferCustomizedProtocol ? undefined : group.providerProtocol);
+  return normalizeProviderProtocolForAuthMode({
+    protocol,
+    authMode,
+    apiBase: group.apiBase,
+    ...(fallback ? { fallback } : {}),
+  });
+}
+
 export function normalizeModelProviderGroups(
   raw: unknown,
 ): ModelProviderGroup[] {
@@ -584,11 +620,7 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
         apiBase: normalizeApiBase(group.apiBase),
         apiKey: group.apiKey.trim(),
         authMode,
-        providerProtocol: normalizeProviderProtocolForAuthMode({
-          protocol: modelEntry.providerProtocol || group.providerProtocol,
-          authMode,
-          apiBase: group.apiBase,
-        }),
+        providerProtocol: resolveRuntimeProviderProtocol(group, modelEntry),
         providerLabel,
         providerOrder: groupIndex,
         displayModelLabel:
