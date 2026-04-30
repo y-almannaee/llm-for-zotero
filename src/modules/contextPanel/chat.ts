@@ -556,6 +556,119 @@ function attachRenderedCopyButtons(root: ParentNode, doc: Document): void {
   }
 }
 
+const ASSISTANT_RESPONSE_CONTEXT_MENU_SUPPRESS_SELECTOR = [
+  ".llm-action-inline-card",
+  ".llm-agent-hitl-card",
+  "button",
+  "input",
+  "textarea",
+  "select",
+  "option",
+  "summary",
+  "[role='button']",
+  "[contenteditable='true']",
+].join(",");
+
+export function shouldSuppressAssistantResponseContextMenu(
+  target: EventTarget | null,
+): boolean {
+  const maybeElement = target as Element | null;
+  if (!maybeElement || typeof maybeElement.closest !== "function") {
+    return false;
+  }
+  return Boolean(
+    maybeElement.closest(ASSISTANT_RESPONSE_CONTEXT_MENU_SUPPRESS_SELECTOR),
+  );
+}
+
+export function shouldAttachAssistantResponseContextMenu(
+  message: Pick<Message, "text">,
+): boolean {
+  return Boolean(sanitizeText(message.text || "").trim());
+}
+
+function attachAssistantResponseContextMenu(params: {
+  body: Element;
+  doc: Document;
+  bubble: HTMLElement;
+  item: Zotero.Item;
+  message: Message;
+  pairedUserMessage: Message | null;
+  conversationKey: number;
+}): void {
+  const {
+    body,
+    doc,
+    bubble,
+    item,
+    message,
+    pairedUserMessage,
+    conversationKey,
+  } = params;
+  if (!shouldAttachAssistantResponseContextMenu(message)) return;
+
+  bubble.addEventListener("contextmenu", (e: Event) => {
+    if (shouldSuppressAssistantResponseContextMenu(e.target)) return;
+    const me = e as MouseEvent;
+    me.preventDefault();
+    me.stopPropagation();
+    if (typeof me.stopImmediatePropagation === "function") {
+      me.stopImmediatePropagation();
+    }
+    const responseMenu = body.querySelector(
+      "#llm-response-menu",
+    ) as HTMLDivElement | null;
+    const exportMenu = body.querySelector(
+      "#llm-export-menu",
+    ) as HTMLDivElement | null;
+    const promptMenu = body.querySelector(
+      "#llm-prompt-menu",
+    ) as HTMLDivElement | null;
+    const retryModelMenu = body.querySelector(
+      "#llm-retry-model-menu",
+    ) as HTMLDivElement | null;
+    const responseMenuDeleteBtn = responseMenu?.querySelector(
+      "#llm-response-menu-delete",
+    ) as HTMLButtonElement | null;
+    const canDeleteResponseTurn = Boolean(
+      pairedUserMessage?.role === "user" && !message.streaming,
+    );
+    if (!responseMenu) return;
+    if (responseMenuDeleteBtn) {
+      responseMenuDeleteBtn.disabled = !canDeleteResponseTurn;
+    }
+    if (exportMenu) exportMenu.style.display = "none";
+    if (promptMenu) promptMenu.style.display = "none";
+    if (retryModelMenu) {
+      retryModelMenu.classList.remove("llm-model-menu-open");
+      retryModelMenu.style.display = "none";
+    }
+    setPromptMenuTarget(null);
+    // If the user has text selected within this bubble, extract just that
+    // portion. Otherwise fall back to the full raw markdown source.
+    const selectedText = getSelectedTextWithinBubble(doc, bubble);
+    const fullMarkdown = sanitizeText(message.text || "").trim();
+    const contentText = selectedText || fullMarkdown;
+    if (!contentText) return;
+    setResponseMenuTarget({
+      item,
+      contentText,
+      modelName: message.modelName?.trim() || "unknown",
+      conversationKey,
+      userTimestamp:
+        pairedUserMessage?.role === "user"
+          ? Math.floor(pairedUserMessage.timestamp)
+          : 0,
+      assistantTimestamp: Math.floor(message.timestamp),
+      paperContexts:
+        pairedUserMessage?.role === "user"
+          ? pairedUserMessage.paperContexts
+          : undefined,
+    });
+    positionMenuAtPointer(body, responseMenu, me.clientX, me.clientY);
+  });
+}
+
 function getMessageSelectedTextExpandedIndex(
   message: Message,
   count: number,
@@ -5161,64 +5274,6 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
             ztoolkit.log("LLM citation decoration error:", decorateErr);
           }
         }
-        bubble.addEventListener("contextmenu", (e: Event) => {
-          const me = e as MouseEvent;
-          me.preventDefault();
-          me.stopPropagation();
-          if (typeof me.stopImmediatePropagation === "function") {
-            me.stopImmediatePropagation();
-          }
-          const responseMenu = body.querySelector(
-            "#llm-response-menu",
-          ) as HTMLDivElement | null;
-          const exportMenu = body.querySelector(
-            "#llm-export-menu",
-          ) as HTMLDivElement | null;
-          const promptMenu = body.querySelector(
-            "#llm-prompt-menu",
-          ) as HTMLDivElement | null;
-          const retryModelMenu = body.querySelector(
-            "#llm-retry-model-menu",
-          ) as HTMLDivElement | null;
-          const responseMenuDeleteBtn = responseMenu?.querySelector(
-            "#llm-response-menu-delete",
-          ) as HTMLButtonElement | null;
-          const pairedUserMessage = history[index - 1];
-          const canDeleteResponseTurn = Boolean(
-            pairedUserMessage?.role === "user" && !msg.streaming,
-          );
-          if (!responseMenu || !item) return;
-          if (responseMenuDeleteBtn) {
-            responseMenuDeleteBtn.disabled = !canDeleteResponseTurn;
-          }
-          if (exportMenu) exportMenu.style.display = "none";
-          if (promptMenu) promptMenu.style.display = "none";
-          if (retryModelMenu) {
-            retryModelMenu.classList.remove("llm-model-menu-open");
-            retryModelMenu.style.display = "none";
-          }
-          setPromptMenuTarget(null);
-          // If the user has text selected within this bubble, extract
-          // just that portion (with KaTeX math properly handled).
-          // Otherwise fall back to the full raw markdown source.
-          const selectedText = getSelectedTextWithinBubble(doc, bubble);
-          const fullMarkdown = sanitizeText(msg.text || "").trim();
-          const contentText = selectedText || fullMarkdown;
-          if (!contentText) return;
-          setResponseMenuTarget({
-            item,
-            contentText,
-            modelName: msg.modelName?.trim() || "unknown",
-            conversationKey,
-            userTimestamp:
-              pairedUserMessage?.role === "user"
-                ? Math.floor(pairedUserMessage.timestamp)
-                : 0,
-            assistantTimestamp: Math.floor(msg.timestamp),
-            paperContexts: pairedUserMessage?.paperContexts,
-          });
-          positionMenuAtPointer(body, responseMenu, me.clientX, me.clientY);
-        });
       }
 
       const bubbleHeaderNodes: HTMLElement[] = [];
@@ -5348,6 +5403,16 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           '<span class="llm-typing-dot"></span><span class="llm-typing-dot"></span><span class="llm-typing-dot"></span>';
         bubble.appendChild(typing);
       }
+
+      attachAssistantResponseContextMenu({
+        body,
+        doc,
+        bubble,
+        item,
+        message: msg,
+        pairedUserMessage: previousUserMessage,
+        conversationKey,
+      });
     }
 
     const meta = doc.createElement("div") as HTMLDivElement;
