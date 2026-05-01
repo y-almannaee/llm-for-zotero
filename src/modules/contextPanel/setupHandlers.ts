@@ -2225,11 +2225,12 @@ export function setupHandlers(
   const checkAndApplyMineruChipStyle = async (contextItemId: number): Promise<void> => {
     try {
       if (mineruAvailableIds.has(contextItemId)) return; // already detected
-      const { hasCachedMineruMd } = await import("./mineruCache");
+      const { getMineruAvailabilityForAttachmentId } = await import("./mineruSync");
       const { isMineruEnabled } = await import("../../utils/mineruConfig");
       if (!isMineruEnabled()) return;
-      const hasCache = await hasCachedMineruMd(contextItemId);
-      if (!hasCache) return;
+      const availability =
+        await getMineruAvailabilityForAttachmentId(contextItemId);
+      if (availability.status === "missing") return;
       mineruAvailableIds.add(contextItemId);
       // MinerU is now available — re-render chips so the default mode flips to "mineru"
       updatePaperPreviewPreservingScroll();

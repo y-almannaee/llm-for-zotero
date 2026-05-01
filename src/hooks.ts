@@ -116,6 +116,15 @@ async function onStartup() {
     ztoolkit.log("LLM: Failed to start MinerU auto-watch", err);
   }
 
+  try {
+    const { startMineruSyncMigrationIfEnabled } = await import(
+      "./modules/contextPanel/mineruSync"
+    );
+    startMineruSyncMigrationIfEnabled();
+  } catch (err) {
+    ztoolkit.log("LLM: Failed to start MinerU sync migration", err);
+  }
+
   registerPrefsPane();
 
   await Promise.all(
