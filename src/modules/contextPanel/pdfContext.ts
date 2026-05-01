@@ -17,8 +17,11 @@ import {
   CHUNK_TARGET_LENGTH,
   RETRIEVAL_TOP_K_PER_PAPER,
   RRF_K,
-  STOPWORDS,
 } from "./constants";
+import {
+  tokenizeRetrievalQuery,
+  tokenizeRetrievalText,
+} from "./retrievalTokenizer";
 import {
   buildPaperQuoteCitationGuidance,
   formatPaperCitationLabel,
@@ -1123,29 +1126,7 @@ export function formatSuggestedEvidenceCitation(
 }
 
 function tokenizeText(text: string): string[] {
-  const lower = text.toLowerCase();
-
-  // Unicode-aware word tokens (Latin, Cyrillic, accented, etc.)
-  const wordTokens = (lower.match(/[\p{L}\p{N}]+/gu) || []).filter(
-    (t) => t.length >= 2 && !STOPWORDS.has(t),
-  );
-
-  // CJK character bigrams (Chinese, Japanese Kanji, Korean Hanja)
-  const cjkChars =
-    lower.match(/[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/g) || [];
-  const cjkBigrams: string[] = [];
-  for (let i = 0; i < cjkChars.length - 1; i++) {
-    cjkBigrams.push(cjkChars[i] + cjkChars[i + 1]);
-  }
-
-  // Japanese Hiragana/Katakana bigrams
-  const kanaChars = lower.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || [];
-  const kanaBigrams: string[] = [];
-  for (let i = 0; i < kanaChars.length - 1; i++) {
-    kanaBigrams.push(kanaChars[i] + kanaChars[i + 1]);
-  }
-
-  return [...wordTokens, ...cjkBigrams, ...kanaBigrams];
+  return tokenizeRetrievalText(text);
 }
 
 function buildChunkIndex(chunks: string[]): {
@@ -1177,8 +1158,7 @@ function buildChunkIndex(chunks: string[]): {
 }
 
 function tokenizeQuery(query: string): string[] {
-  const tokens = tokenizeText(query);
-  return Array.from(new Set(tokens));
+  return tokenizeRetrievalQuery(query);
 }
 
 function scoreChunkBM25(

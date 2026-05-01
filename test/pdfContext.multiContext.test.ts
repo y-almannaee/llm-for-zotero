@@ -11,6 +11,7 @@ import {
   readManifest,
   writeMineruCacheFiles,
 } from "../src/modules/contextPanel/mineruCache";
+import { tokenizeRetrievalText } from "../src/modules/contextPanel/retrievalTokenizer";
 import { pdfTextCache } from "../src/modules/contextPanel/state";
 import type {
   ChunkStat,
@@ -154,9 +155,7 @@ function fullPaperRef(contextItemId: number): PaperContextRef {
 }
 
 function tokenize(text: string): string[] {
-  return (text.toLowerCase().match(/[a-z0-9]+/g) || []).filter(
-    (token) => token.length >= 3,
-  );
+  return tokenizeRetrievalText(text);
 }
 
 function buildPdfContext(chunks: string[]): PdfContext {
@@ -258,6 +257,31 @@ describe("pdfContext multi-context helpers", function () {
     assert.equal(candidates[0].paperKey, buildPaperKey(paper));
     assert.equal(candidates[0].itemId, 1);
     assert.isAtLeast(candidates[0].estimatedTokens, 1);
+  });
+
+  it("ranks matching Korean text with Hangul n-gram retrieval", async function () {
+    const paper: PaperContextRef = {
+      itemId: 1,
+      contextItemId: 11,
+      title: "Korean Paper",
+      firstCreator: "Kim",
+      year: "2026",
+    };
+    const context = buildPdfContext([
+      "이 논문은 표현학습방법을 제안하고 실험으로 검증한다.",
+      "This unrelated appendix describes baseline calibration.",
+    ]);
+    const candidates = await buildPaperRetrievalCandidates(
+      paper,
+      context,
+      "학습방법",
+      undefined,
+      { topK: 2 },
+    );
+
+    assert.lengthOf(candidates, 2);
+    assert.equal(candidates[0].chunkIndex, 0);
+    assert.isAbove(candidates[0].bm25Score, candidates[1].bm25Score);
   });
 
   it("renders full paper context with metadata", function () {

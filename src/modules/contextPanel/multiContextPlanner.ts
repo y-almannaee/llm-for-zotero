@@ -33,6 +33,7 @@ import {
 } from "./pdfContext";
 import { pdfTextCache } from "./state";
 import { sanitizeText } from "./textUtils";
+import { tokenizeRetrievalDiversity } from "./retrievalTokenizer";
 
 // ── Cross-turn retrieval cache ──────────────────────────────────────────────
 // Caches chunk candidates returned by buildPaperRetrievalCandidates so that
@@ -500,11 +501,7 @@ function normalizeScores(values: number[]): number[] {
 }
 
 function tokenizeForDiversity(text: string): Set<string> {
-  const tokens = (text.toLowerCase().match(/[a-z0-9]{3,}/g) || []).slice(
-    0,
-    256,
-  );
-  return new Set(tokens);
+  return tokenizeRetrievalDiversity(text);
 }
 
 function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
