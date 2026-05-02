@@ -871,6 +871,98 @@ describe("Zotero MCP server", function () {
     }
   });
 
+  it("falls back to the active turn scope for stale cached MCP write headers", async function () {
+    let pendingConversationKey: number | undefined;
+    const registry = new AgentToolRegistry();
+    registry.register({
+      spec: {
+        name: "apply_tags",
+        description: "Apply tags",
+        inputSchema: { type: "object", additionalProperties: true },
+        mutability: "write",
+        requiresConfirmation: false,
+      },
+      validate: (args) => ({ ok: true, value: args ?? {} }),
+      createPendingAction: async (_input, context: AgentToolContext) => {
+        pendingConversationKey = context.request.conversationKey;
+        return {
+          toolName: "apply_tags",
+          title: "Apply Tags",
+          confirmLabel: "Apply",
+          cancelLabel: "Cancel",
+          fields: [],
+        };
+      },
+      execute: async (_input, context: AgentToolContext) => ({
+        request: {
+          conversationKey: context.request.conversationKey,
+          libraryID: context.request.libraryID,
+          activeItemId: context.request.activeItemId,
+        },
+      }),
+    });
+    registerMcpServer({
+      toolRegistry: registry,
+      zoteroGateway: {} as never,
+    });
+    const staleScoped = registerScopedZoteroMcpScope(
+      {
+        profileSignature: "profile-stale",
+        conversationKey: 100,
+        libraryID: 1,
+        kind: "global",
+        activeItemId: 10,
+      },
+      { token: "stale-cached-scope-token" },
+    );
+    staleScoped.clear();
+    const clearActiveScope = setActiveZoteroMcpScope({
+      profileSignature: "profile-stale",
+      conversationKey: 200,
+      libraryID: 2,
+      kind: "global",
+      activeItemId: 20,
+    });
+    const clearHandler = addZoteroMcpConfirmationHandler(
+      {
+        profileSignature: "profile-stale",
+        conversationKey: 200,
+      },
+      async (request) => {
+        assert.equal(request.action.title, "Apply Tags");
+        return { approved: true };
+      },
+    );
+
+    try {
+      const response = await invokeMcpEndpoint({
+        token: getOrCreateZoteroMcpBearerToken(),
+        headers: { [ZOTERO_MCP_SCOPE_HEADER]: staleScoped.token },
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "apply_tags",
+            arguments: { itemIds: [1], tags: ["memory"] },
+          },
+        },
+      });
+      const payload = JSON.parse(response[2]);
+      const content = JSON.parse(payload.result.content[0].text);
+      assert.equal(content.ok, true);
+      assert.equal(pendingConversationKey, 200);
+      assert.deepEqual(content.result.request, {
+        conversationKey: 200,
+        libraryID: 2,
+        activeItemId: 20,
+      });
+    } finally {
+      clearHandler();
+      clearActiveScope();
+    }
+  });
+
   it("runs zotero_script through MCP without forcing a confirmation", async function () {
     let executed = false;
     const registry = new AgentToolRegistry();

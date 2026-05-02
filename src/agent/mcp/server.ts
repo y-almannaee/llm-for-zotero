@@ -658,12 +658,29 @@ function resolveScopedMcpScope(
   if (!token) return activeZoteroMcpScope;
   pruneExpiredScopedMcpScopes();
   const entry = scopedZoteroMcpScopes.get(token);
-  if (!entry) {
-    throw new Error(
-      "Zotero MCP scope token is invalid or expired. Start a new Codex turn from Zotero so tools bind to the current profile and library.",
-    );
+  if (entry) {
+    if (
+      activeZoteroMcpScope &&
+      scopesMatchCurrentProfile(entry.scope, activeZoteroMcpScope)
+    ) {
+      return activeZoteroMcpScope;
+    }
+    return entry.scope;
   }
-  return entry.scope;
+  if (activeZoteroMcpScope) {
+    logZoteroMcp(
+      "Zotero MCP scope token was stale; using active Codex turn scope",
+      {
+        conversationKey: activeZoteroMcpScope.conversationKey,
+        profileSignature: activeZoteroMcpScope.profileSignature,
+        libraryID: activeZoteroMcpScope.libraryID,
+      },
+    );
+    return activeZoteroMcpScope;
+  }
+  throw new Error(
+    "Zotero MCP scope token is invalid or expired. Start a new Codex turn from Zotero so tools bind to the current profile and library.",
+  );
 }
 
 function resolveMcpToolActivityScope(
@@ -742,6 +759,20 @@ function scopesMatchForConfirmation(
     return false;
   }
   return Boolean(handlerScope.profileSignature || handlerScope.conversationKey);
+}
+
+function scopesMatchCurrentProfile(
+  tokenScope: ZoteroMcpActiveScope,
+  currentScope: ZoteroMcpActiveScope,
+): boolean {
+  if (
+    tokenScope.profileSignature &&
+    currentScope.profileSignature &&
+    tokenScope.profileSignature !== currentScope.profileSignature
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function findZoteroMcpConfirmationHandler(
