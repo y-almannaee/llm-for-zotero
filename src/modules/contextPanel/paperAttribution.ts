@@ -1,4 +1,5 @@
 import type { PaperContextRef } from "./types";
+import { isSupportedContent } from "../../utils/mineruConfig";
 
 function normalizeText(value: unknown): string {
   if (typeof value !== "string") return "";
@@ -154,8 +155,14 @@ export function resolvePaperContextRefFromAttachment(
 ): PaperContextRef | null {
   if (
     !contextItem ||
-    !contextItem.isAttachment?.() ||
-    contextItem.attachmentContentType !== "application/pdf"
+    !contextItem.isAttachment?.()
+  ) {
+    return null;
+  }
+  const ct = contextItem.attachmentContentType;
+  if (
+    ct !== "application/pdf" &&
+    !isSupportedContent(contextItem)
   ) {
     return null;
   }
@@ -222,7 +229,7 @@ export function resolvePaperContextRefFromItem(
   if (!Number.isFinite(itemId) || itemId <= 0) return null;
   const normalizedItemId = Math.floor(itemId);
 
-  // Try to resolve contextItemId to a PDF child attachment so that
+  // Try to resolve contextItemId to a supported child attachment so that
   // openReaderForItem receives an attachment ID rather than a parent item ID.
   // Passing a parent item ID can cause "Unsupported attachment type" errors
   // when Zotero's Reader picks a non-PDF attachment as the best match.
@@ -232,7 +239,8 @@ export function resolvePaperContextRefFromItem(
     const attachment = Zotero.Items.get(attachmentId);
     if (
       attachment?.isAttachment?.() &&
-      attachment.attachmentContentType === "application/pdf"
+      (attachment.attachmentContentType === "application/pdf" ||
+        isSupportedContent(attachment))
     ) {
       contextItemId = Math.floor(attachment.id);
       break;

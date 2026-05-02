@@ -28,7 +28,10 @@ import { readNoteSnapshot } from "./notes";
 import { pdfTextCache, pdfTextLoadingTasks } from "./state";
 import { readCachedMineruMd, ensureManifest } from "./mineruCache";
 import type { MineruManifest, ManifestSection } from "./mineruCache";
-import { isMineruEnabled } from "../../utils/mineruConfig";
+import {
+  isMineruEnabled,
+  isSupportedContent,
+} from "../../utils/mineruConfig";
 import type {
   PdfContext,
   ChunkStat,

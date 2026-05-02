@@ -7,6 +7,59 @@ const MINERU_LOCAL_API_BASE_KEY = `${config.prefsPrefix}.mineruLocalApiBase`;
 const MINERU_LOCAL_BACKEND_KEY = `${config.prefsPrefix}.mineruLocalBackend`;
 const MINERU_AUTO_WATCH_KEY = `${config.prefsPrefix}.mineruAutoWatchCollections`;
 const MINERU_GLOBAL_AUTO_PARSE_KEY = `${config.prefsPrefix}.mineruGlobalAutoParse`;
+const MINERU_SUPPORTED_CONTENT_TYPES_KEY = `${config.prefsPrefix}.mineruSupportedContentTypes`;
+
+/** All MIME types MinerU can parse. */
+export const MINERU_SUPPORTED_CONTENT_TYPES: readonly string[] = [
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "image/png",
+  "image/jpeg",
+  "image/bmp",
+  "image/tiff",
+  "image/webp",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+] as const;
+
+/** Default: PDF only (backward-compatible). */
+export const DEFAULT_MINERU_SUPPORTED_TYPES = ["application/pdf"] as const;
+
+export function getMineruSupportedContentTypes(): Set<string> {
+  const raw = Zotero.Prefs.get(MINERU_SUPPORTED_CONTENT_TYPES_KEY, true);
+  if (typeof raw === "string" && raw.length > 0) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        const valid = parsed.filter(
+          (t): t is string =>
+            typeof t === "string" &&
+            MINERU_SUPPORTED_CONTENT_TYPES.includes(t as typeof MINERU_SUPPORTED_CONTENT_TYPES[number]),
+        );
+        if (valid.length > 0) return new Set(valid);
+      }
+    } catch {
+      /* fall through to default */
+    }
+  }
+  return new Set(DEFAULT_MINERU_SUPPORTED_TYPES);
+}
+
+export function setMineruSupportedContentTypes(types: string[]): void {
+  const valid = types.filter(
+    (t) =>
+      typeof t === "string" &&
+      MINERU_SUPPORTED_CONTENT_TYPES.includes(t as typeof MINERU_SUPPORTED_CONTENT_TYPES[number]),
+  );
+  Zotero.Prefs.set(MINERU_SUPPORTED_CONTENT_TYPES_KEY, JSON.stringify(valid), true);
+}
+
+export function isSupportedContent(item: Zotero.Item): boolean {
+  if (!item?.isAttachment?.()) return false;
+  const ct = item.attachmentContentType;
+  if (!ct) return false;
+  return getMineruSupportedContentTypes().has(ct);
+}
 
 export const DEFAULT_MINERU_LOCAL_API_BASE = "http://127.0.0.1:8000";
 export const DEFAULT_MINERU_LOCAL_BACKEND: MineruLocalBackend = "pipeline";

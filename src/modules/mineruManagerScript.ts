@@ -87,6 +87,14 @@ const MIN_COLUMN_WIDTHS = {
   dateAdded: 64,
 } as const;
 
+/** Module-level callback exposed for preferenceScript to trigger a file list refresh. */
+let _refreshFileList: (() => void) | null = null;
+
+/** Called by preferenceScript when supported file types change. */
+export function refreshMineruFileList(): void {
+  _refreshFileList?.();
+}
+
 export async function registerMineruManagerScript(
   win: Window,
   idPrefix = "llmforzotero",
@@ -1437,6 +1445,9 @@ export async function registerMineruManagerScript(
       renderItemsList();
     }, 1000);
   };
+
+  // Expose refresh for preferenceScript to call when file type checkboxes change
+  _refreshFileList = debouncedRefresh;
 
   let notifierId: string | null = null;
   try {

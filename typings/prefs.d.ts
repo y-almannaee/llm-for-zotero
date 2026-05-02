@@ -32,6 +32,16 @@ declare namespace _ZoteroTypes {
       "agentClaudeConfigSource": string;
       "agentPermissionMode": string;
       "conversationSystem": string;
+      "enableCodexAppServerMode": boolean;
+      "codexAppServerModel": string;
+      "codexAppServerReasoning": string;
+      "codexAppServerPath": string;
+      "codexAppServerConversationModeMap": string;
+      "codexAppServerGlobalConversationMap": string;
+      "codexAppServerPaperConversationMap": string;
+      "codexAppServerLastAllocatedConversationKeyMap": string;
+      "codexAppServerLastAllocatedGlobalConversationKey": number;
+      "codexAppServerLastAllocatedPaperConversationKey": number;
       "claudeCodeConversationModeMap": string;
       "claudeCodeGlobalConversationMap": string;
       "claudeCodePaperConversationMap": string;
@@ -55,6 +65,7 @@ declare namespace _ZoteroTypes {
       "mineruAutoWatchCollections": string;
       "mineruGlobalAutoParse": boolean;
       "mineruExcludePatterns": string;
+      "mineruSupportedContentTypes": string;
     };
   }
 }

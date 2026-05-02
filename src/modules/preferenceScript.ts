@@ -68,6 +68,8 @@ import {
   setGlobalAutoParseEnabled,
   getMineruExcludePatterns,
   setMineruExcludePatterns,
+  getMineruSupportedContentTypes,
+  setMineruSupportedContentTypes,
 } from "../utils/mineruConfig";
 import {
   getNotesDirectoryPath,
@@ -84,7 +86,10 @@ import {
   testMineruLocalConnection,
   testProxyConnection,
 } from "../utils/mineruClient";
-import { registerMineruManagerScript } from "./mineruManagerScript";
+import {
+  registerMineruManagerScript,
+  refreshMineruFileList,
+} from "./mineruManagerScript";
 import { getRuntimePlatformInfo } from "../utils/runtimePlatform";
 import {
   getClaudeAutoCompactThresholdPercent,
@@ -2999,6 +3004,43 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
     mineruGlobalAutoParseInput.addEventListener("change", () => {
       setGlobalAutoParseEnabled(mineruGlobalAutoParseInput.checked);
     });
+  }
+
+  // ── Supported file types ────────────────────────────────────────
+
+  const MINERU_TYPE_MAP: Record<string, string[]> = {
+    pdf: ["application/pdf"],
+    docx: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+    images: ["image/png", "image/jpeg", "image/bmp", "image/tiff", "image/webp"],
+    pptx: ["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+    xlsx: ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  };
+
+  const syncMineruSupportedTypes = () => {
+    const checked: string[] = [];
+    for (const [key, types] of Object.entries(MINERU_TYPE_MAP)) {
+      const input = doc.querySelector(
+        `#${config.addonRef}-mineru-type-${key}`,
+      ) as HTMLInputElement | null;
+      if (input?.checked) {
+        checked.push(...types);
+      }
+    }
+    setMineruSupportedContentTypes(checked);
+    // Refresh the file list so newly-enabled formats appear immediately
+    refreshMineruFileList();
+  };
+
+  // Load current types into checkboxes
+  const currentTypes = getMineruSupportedContentTypes();
+  for (const [key, types] of Object.entries(MINERU_TYPE_MAP)) {
+    const input = doc.querySelector(
+      `#${config.addonRef}-mineru-type-${key}`,
+    ) as HTMLInputElement | null;
+    if (input) {
+      input.checked = types.some((t) => currentTypes.has(t));
+      input.addEventListener("change", syncMineruSupportedTypes);
+    }
   }
 
   if (mineruLocalModeInput) {
