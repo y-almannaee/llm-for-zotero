@@ -8,6 +8,7 @@
 
 import { config } from "../../../package.json";
 import type { PaperContextRef } from "../../shared/types";
+import { readNoteSnapshot } from "../../modules/contextPanel/noteSnapshot";
 import type { AgentToolRegistry } from "../tools/registry";
 import type { ZoteroGateway } from "../services/zoteroGateway";
 import type {
@@ -98,6 +99,10 @@ export type ZoteroMcpActiveScope = {
   paperItemID?: number;
   activeItemId?: number;
   activeContextItemId?: number;
+  activeNoteId?: number;
+  activeNoteKind?: "item" | "standalone";
+  activeNoteTitle?: string;
+  activeNoteParentItemId?: number;
   libraryName?: string;
   title?: string;
   userText?: string;
@@ -362,6 +367,10 @@ function normalizePaperContext(
   };
 }
 
+function normalizeNoteKind(value: unknown): "item" | "standalone" | undefined {
+  return value === "item" || value === "standalone" ? value : undefined;
+}
+
 function normalizeActiveScope(
   scope: ZoteroMcpActiveScope,
 ): ZoteroMcpActiveScope {
@@ -380,6 +389,10 @@ function normalizeActiveScope(
     activeItemId:
       normalizePositiveInt(scope.activeItemId) || paperItemID || undefined,
     activeContextItemId,
+    activeNoteId: normalizePositiveInt(scope.activeNoteId),
+    activeNoteKind: normalizeNoteKind(scope.activeNoteKind),
+    activeNoteTitle: normalizeText(scope.activeNoteTitle),
+    activeNoteParentItemId: normalizePositiveInt(scope.activeNoteParentItemId),
     libraryName: normalizeText(scope.libraryName),
     title: normalizeText(scope.title),
     userText: normalizeText(scope.userText, 4000),
@@ -471,7 +484,8 @@ function formatToolTitle(name: string): string {
 
 function isMcpExposedTool(tool: ToolSpec): boolean {
   if (tool.mutability === "read") return CURATED_READ_TOOL_NAMES.has(tool.name);
-  if (tool.mutability === "write") return CURATED_WRITE_TOOL_NAMES.has(tool.name);
+  if (tool.mutability === "write")
+    return CURATED_WRITE_TOOL_NAMES.has(tool.name);
   return false;
 }
 
@@ -482,10 +496,12 @@ function handleToolsList(toolRegistry: AgentToolRegistry): McpToolsListResult {
     .map(({ name, description, inputSchema, mutability }) => ({
       name,
       title: formatToolTitle(name),
-      description: decorateMcpToolDescription(description, mutability),
+      description: decorateMcpToolDescription(name, description, mutability),
       inputSchema: decorateMcpToolSchema(inputSchema),
       annotations:
-        mutability === "read" ? READ_ONLY_TOOL_ANNOTATIONS : WRITE_TOOL_ANNOTATIONS,
+        mutability === "read"
+          ? READ_ONLY_TOOL_ANNOTATIONS
+          : WRITE_TOOL_ANNOTATIONS,
     }));
   return { tools };
 }
@@ -536,15 +552,18 @@ function extractMcpScopeArgs(rawArgs: unknown): {
 }
 
 function decorateMcpToolDescription(
+  toolName: string,
   description: string,
   mutability: ToolSpec["mutability"],
 ): string {
   const scopeGuidance =
     "Zotero MCP scope: omit libraryID, activeItemId, and activeContextItemId to use the current Codex Zotero chat scope. Use query_library to discover Zotero items, read_library for structured item state, search_paper for evidence retrieval, and read_paper/read_attachment/view_pdf_pages for deeper inspection. For counting questions, prefer query_library totalCount/returnedCount/limited metadata instead of hand-counting listed results.";
   const writeGuidance =
-    mutability === "write"
-      ? "Write operations pause in Zotero for user review before execution. For Zotero note requests, call edit_current_note instead of returning note-ready text in chat."
-      : "";
+    toolName === "zotero_script"
+      ? "zotero_script runs directly without a review card. Write scripts must call env.snapshot(item) before mutating items, or env.addUndoStep(fn) for custom changes, so undo_last_action can revert the operation."
+      : mutability === "write"
+        ? "Write operations pause in Zotero for user review before execution. For Zotero note requests, call edit_current_note instead of returning note-ready text in chat."
+        : "";
   return [description, scopeGuidance, writeGuidance]
     .filter(Boolean)
     .join("\n\n");
@@ -596,6 +615,39 @@ function resolveScopePaperContext(
     itemId,
     contextItemId,
     title: normalizeText(scope.title) || `Paper ${itemId}`,
+  };
+}
+
+function resolveScopeActiveNoteContext(
+  scope: ZoteroMcpActiveScope | null,
+): AgentRuntimeRequest["activeNoteContext"] {
+  const noteId = normalizePositiveInt(scope?.activeNoteId);
+  if (!noteId) return undefined;
+  const noteItem =
+    (
+      Zotero as unknown as {
+        Items?: { get?: (id: number) => Zotero.Item | false | null };
+      }
+    ).Items?.get?.(noteId) || null;
+  const snapshot = readNoteSnapshot(noteItem);
+  if (snapshot) {
+    return {
+      noteId: snapshot.noteId,
+      title: snapshot.title,
+      noteKind: snapshot.noteKind,
+      parentItemId: snapshot.parentItemId,
+      noteText: snapshot.text,
+      noteHtml: /<[^>]+\bstyle\s*=/i.test(snapshot.html)
+        ? snapshot.html.slice(0, 10_000)
+        : undefined,
+    };
+  }
+  return {
+    noteId,
+    title: normalizeText(scope?.activeNoteTitle) || `Note ${noteId}`,
+    noteKind: normalizeNoteKind(scope?.activeNoteKind) || "standalone",
+    parentItemId: normalizePositiveInt(scope?.activeNoteParentItemId),
+    noteText: "",
   };
 }
 
@@ -723,6 +775,7 @@ function createToolContext(
       ).Items?.get?.(itemLookupId) || null
     : null;
   const paperContext = resolveScopePaperContext(scope);
+  const activeNoteContext = resolveScopeActiveNoteContext(scope);
   const request: AgentRuntimeRequest = {
     conversationKey: scope?.conversationKey || 0,
     mode: "agent",
@@ -739,6 +792,7 @@ function createToolContext(
     authMode: "codex_app_server",
     selectedPaperContexts: paperContext ? [paperContext] : undefined,
     fullTextPaperContexts: paperContext ? [paperContext] : undefined,
+    activeNoteContext,
   };
   return {
     request,
@@ -772,7 +826,9 @@ function formatToolResult(
   };
 }
 
-function extractToolCallErrorText(result: McpToolCallResult): string | undefined {
+function extractToolCallErrorText(
+  result: McpToolCallResult,
+): string | undefined {
   if (!result.isError) return undefined;
   for (const part of result.content) {
     const text = normalizeText(part.text, 1000);
@@ -902,7 +958,10 @@ async function handleToolsCall(
         arguments: scopeArgs.toolArgs,
       },
       createToolContext(rawArgs, headers),
-      { forceConfirmation: tool.spec.mutability === "write" },
+      {
+        forceConfirmation:
+          tool.spec.mutability === "write" && name !== "zotero_script",
+      },
     );
 
     if (prepared.kind === "confirmation") {

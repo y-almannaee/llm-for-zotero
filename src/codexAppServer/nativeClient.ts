@@ -59,6 +59,10 @@ export type CodexNativeConversationScope = {
   paperItemID?: number;
   activeItemId?: number;
   activeContextItemId?: number;
+  activeNoteId?: number;
+  activeNoteKind?: "item" | "standalone";
+  activeNoteTitle?: string;
+  activeNoteParentItemId?: number;
   libraryName?: string;
   paperTitle?: string;
   paperContext?: PaperContextRef;
@@ -149,9 +153,9 @@ function normalizeRecord(value: unknown): Record<string, unknown> {
 }
 
 function isCodexAppServerApprovalRequestMethod(method: string): boolean {
-  return (CODEX_APP_SERVER_APPROVAL_REQUEST_METHODS as readonly string[]).includes(
-    method,
-  );
+  return (
+    CODEX_APP_SERVER_APPROVAL_REQUEST_METHODS as readonly string[]
+  ).includes(method);
 }
 
 function isTrustedZoteroMcpPayload(value: unknown): boolean {
@@ -212,7 +216,8 @@ function chooseToolUserInputAnswer(question: unknown): string[] {
     );
   const positivePattern =
     /\b(allow|approve|approved|accept|accepted|yes|continue|ok|trust|trusted)\b/i;
-  const negativePattern = /\b(deny|denied|reject|rejected|decline|cancel|no)\b/i;
+  const negativePattern =
+    /\b(deny|denied|reject|rejected|decline|cancel|no)\b/i;
   const preferred =
     choices.find(
       (choice) =>
@@ -224,7 +229,8 @@ function chooseToolUserInputAnswer(question: unknown): string[] {
         /\brecommended\b/i.test(choice.searchable) &&
         !negativePattern.test(choice.searchable),
     )?.answer ||
-    choices.find((choice) => !negativePattern.test(choice.searchable))?.answer ||
+    choices.find((choice) => !negativePattern.test(choice.searchable))
+      ?.answer ||
     choices[0]?.answer ||
     "approved";
   return [preferred];
@@ -344,7 +350,11 @@ export function resolveCodexNativeApprovalRequest(
 
 function summarizeApprovalResponseShape(response: unknown): string {
   if (!response || typeof response !== "object") return typeof response;
-  return Object.keys(response as Record<string, unknown>).sort().join(",") || "{}";
+  return (
+    Object.keys(response as Record<string, unknown>)
+      .sort()
+      .join(",") || "{}"
+  );
 }
 
 function logCodexNativeApprovalDecision(params: {
@@ -354,14 +364,17 @@ function logCodexNativeApprovalDecision(params: {
 }): void {
   ztoolkit.log("Codex app-server native approval", {
     method: params.method,
-    target: params.decision.target || getApprovalRequestTarget(params.requestParams),
+    target:
+      params.decision.target || getApprovalRequestTarget(params.requestParams),
     approved: params.decision.approved,
     reason: params.decision.reason,
     responseShape: summarizeApprovalResponseShape(params.decision.response),
   });
 }
 
-function buildGuardianAssessmentAction(action: Record<string, unknown>): unknown {
+function buildGuardianAssessmentAction(
+  action: Record<string, unknown>,
+): unknown {
   const type = normalizeNonEmptyString(action.type);
   if (type === "mcpToolCall" || type === "mcp_tool_call") {
     return {
@@ -372,8 +385,9 @@ function buildGuardianAssessmentAction(action: Record<string, unknown>): unknown
         normalizeNonEmptyString(action.connectorId || action.connector_id) ||
         null,
       connector_name:
-        normalizeNonEmptyString(action.connectorName || action.connector_name) ||
-        null,
+        normalizeNonEmptyString(
+          action.connectorName || action.connector_name,
+        ) || null,
       tool_title:
         normalizeNonEmptyString(action.toolTitle || action.tool_title) || null,
     };
@@ -381,7 +395,9 @@ function buildGuardianAssessmentAction(action: Record<string, unknown>): unknown
   return action;
 }
 
-function buildGuardianAssessmentEvent(rawParams: unknown): Record<string, unknown> {
+function buildGuardianAssessmentEvent(
+  rawParams: unknown,
+): Record<string, unknown> {
   const params = normalizeRecord(rawParams);
   const review = normalizeRecord(params.review);
   const action = normalizeRecord(params.action);
@@ -538,6 +554,20 @@ function buildZoteroEnvironmentManifest(params: {
     );
   }
 
+  if (scope.activeNoteId) {
+    lines.push(
+      ...[
+        formatScopeLine("Active note ID", scope.activeNoteId),
+        formatScopeLine("Active note title", scope.activeNoteTitle),
+        formatScopeLine("Active note kind", scope.activeNoteKind),
+        formatScopeLine(
+          "Active note parent item ID",
+          scope.activeNoteParentItemId,
+        ),
+      ].filter((line): line is string => Boolean(line)),
+    );
+  }
+
   if (!params.mcpEnabled) {
     lines.push(
       "- Zotero MCP tools: disabled for this turn. Do not claim access to Zotero library or PDF tools unless another tool source is available.",
@@ -555,9 +585,10 @@ function buildZoteroEnvironmentManifest(params: {
   lines.push(
     "- Zotero MCP tools: available. Use them to inspect and update Zotero data instead of assuming library or paper content is preloaded.",
     "- Critical: use only Zotero MCP tools for Zotero library, profile, item, PDF, and note data. If Zotero MCP tools are unavailable or fail, report the setup error. Do not inspect local Zotero profile folders, zotero.sqlite, WAL files, backups, or other filesystem copies to answer Zotero-library questions.",
-    "- Codex built-in shell access is disabled. Use Zotero MCP tools such as run_command, file_io, and zotero_script only when needed; they pause in Zotero for user review before execution.",
+    "- Codex built-in shell access is disabled. Use Zotero MCP tools such as run_command, file_io, and zotero_script only when needed.",
     "- Write workflow: use focused Zotero MCP write tools for requested changes. For Zotero note creation or editing, call edit_current_note; do not output note-ready text in chat as a substitute.",
-    "- Review workflow: write tools return only after the user approves or denies the Zotero review card. After approval, report the result from the tool call.",
+    "- Active-note workflow: when an active note ID is listed, edit_current_note can edit that note directly. Do not search the library to rediscover the same note before editing it.",
+    "- Review workflow: most write tools return only after the user approves or denies the Zotero review card. zotero_script runs directly; write scripts must use env.snapshot(item) or env.addUndoStep(fn) so undo_last_action can revert them.",
   );
   if (scope.kind === "paper") {
     lines.push(
@@ -887,11 +918,11 @@ function registerNativeApprovalRequestHandlers(params: {
           decision: {
             approved: Boolean(
               response &&
-                typeof response === "object" &&
-                ((response as Record<string, unknown>).approved === true ||
-                  (response as Record<string, unknown>).decision === "accept" ||
-                  (response as Record<string, unknown>).action === "accept" ||
-                  (response as Record<string, unknown>).answers),
+              typeof response === "object" &&
+              ((response as Record<string, unknown>).approved === true ||
+                (response as Record<string, unknown>).decision === "accept" ||
+                (response as Record<string, unknown>).action === "accept" ||
+                (response as Record<string, unknown>).answers),
             ),
             response,
             reason: "custom_handler",

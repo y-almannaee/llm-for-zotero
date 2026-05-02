@@ -1972,6 +1972,7 @@ function resolveCodexNativeConversationScope(params: {
 }): CodexNativeConversationScope {
   const baseItem = resolveConversationBaseItem(params.item);
   const displayKind = resolveDisplayConversationKind(params.item);
+  const activeNoteSession = resolveActiveNoteSession(params.item);
   const libraryID = Math.max(
     1,
     Math.floor(
@@ -2011,6 +2012,10 @@ function resolveCodexNativeConversationScope(params: {
     paperItemID,
     activeItemId: paperItemID,
     activeContextItemId: paperContext?.contextItemId,
+    activeNoteId: activeNoteSession?.noteId,
+    activeNoteKind: activeNoteSession?.noteKind,
+    activeNoteTitle: activeNoteSession?.title,
+    activeNoteParentItemId: activeNoteSession?.parentItemId,
     libraryName: resolveLibraryDisplayName(libraryID),
     paperTitle,
     paperContext: paperContext || undefined,

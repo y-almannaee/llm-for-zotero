@@ -570,9 +570,10 @@ describe("Zotero MCP server", function () {
         delivered: true,
         input: { attachFile: true },
       });
-      assert.deepEqual(requests.map((entry) => entry.toolName), [
-        "read_attachment",
-      ]);
+      assert.deepEqual(
+        requests.map((entry) => entry.toolName),
+        ["read_attachment"],
+      );
     } finally {
       clearHandler();
       scoped.clear();
@@ -746,6 +747,188 @@ describe("Zotero MCP server", function () {
       });
     } finally {
       clearHandler();
+      scoped.clear();
+    }
+  });
+
+  it("binds scoped active notes to edit_current_note diff review cards", async function () {
+    const noteItem = {
+      id: 501,
+      key: "NOTE501",
+      libraryID: 1,
+      parentID: undefined,
+      isNote: () => true,
+      getNote: () => "<p>Original active note</p>",
+      getDisplayTitle: () => "Active Note",
+    };
+    (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
+      ...globalThis.Zotero,
+      Items: {
+        get: (id: number) => (id === 501 ? noteItem : null),
+      },
+    } as unknown as typeof Zotero;
+    const registry = new AgentToolRegistry();
+    registry.register({
+      spec: {
+        name: "edit_current_note",
+        description: "Edit active note",
+        inputSchema: { type: "object", additionalProperties: true },
+        mutability: "write",
+        requiresConfirmation: false,
+      },
+      validate: (args) => ({ ok: true, value: args ?? {} }),
+      createPendingAction: async (_input, context) => {
+        assert.equal(context.request.activeNoteContext?.noteId, 501);
+        assert.equal(
+          context.request.activeNoteContext?.noteText,
+          "Original active note",
+        );
+        return {
+          toolName: "edit_current_note",
+          mode: "review",
+          title: "Review note update",
+          description: "Review the active note edit.",
+          confirmLabel: "Apply edit",
+          cancelLabel: "Cancel",
+          fields: [
+            {
+              type: "diff_preview" as const,
+              id: "noteDiff",
+              label: "Note changes",
+              before: context.request.activeNoteContext?.noteText || "",
+              after: "Updated active note",
+            },
+          ],
+        };
+      },
+      execute: async (_input, context) => ({
+        status: "updated",
+        noteId: context.request.activeNoteContext?.noteId,
+      }),
+    });
+    registerMcpServer({
+      toolRegistry: registry,
+      zoteroGateway: {} as never,
+    });
+    const scoped = registerScopedZoteroMcpScope(
+      {
+        profileSignature: "profile-note",
+        conversationKey: 5010,
+        libraryID: 1,
+        kind: "global",
+        activeNoteId: 501,
+        activeNoteKind: "standalone",
+        activeNoteTitle: "Active Note",
+      },
+      { token: "active-note-scope-token" },
+    );
+    const clearHandler = addZoteroMcpConfirmationHandler(
+      {
+        profileSignature: "profile-note",
+        conversationKey: 5010,
+      },
+      async (request) => {
+        assert.equal(request.action.title, "Review note update");
+        const diffField = request.action.fields[0] as {
+          type?: string;
+          before?: string;
+          after?: string;
+        };
+        assert.equal(diffField.type, "diff_preview");
+        assert.equal(diffField.before, "Original active note");
+        assert.equal(diffField.after, "Updated active note");
+        return { approved: true };
+      },
+    );
+
+    try {
+      const response = await invokeMcpEndpoint({
+        token: getOrCreateZoteroMcpBearerToken(),
+        headers: { [ZOTERO_MCP_SCOPE_HEADER]: scoped.token },
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "edit_current_note",
+            arguments: {
+              mode: "edit",
+              content: "Updated active note",
+            },
+          },
+        },
+      });
+      const payload = JSON.parse(response[2]);
+      const content = JSON.parse(payload.result.content[0].text);
+      assert.equal(content.ok, true);
+      assert.deepEqual(content.result, {
+        status: "updated",
+        noteId: 501,
+      });
+    } finally {
+      clearHandler();
+      scoped.clear();
+    }
+  });
+
+  it("runs zotero_script through MCP without forcing a confirmation", async function () {
+    let executed = false;
+    const registry = new AgentToolRegistry();
+    registry.register({
+      spec: {
+        name: "zotero_script",
+        description: "Run Zotero script",
+        inputSchema: { type: "object", additionalProperties: true },
+        mutability: "write",
+        requiresConfirmation: false,
+      },
+      validate: (args) => ({ ok: true, value: args ?? {} }),
+      createPendingAction: async () => {
+        throw new Error("zotero_script should not request confirmation");
+      },
+      execute: async () => {
+        executed = true;
+        return { status: "ran" };
+      },
+    });
+    registerMcpServer({
+      toolRegistry: registry,
+      zoteroGateway: {} as never,
+    });
+    const scoped = registerScopedZoteroMcpScope(
+      {
+        profileSignature: "profile-script",
+        conversationKey: 5020,
+        libraryID: 1,
+        kind: "global",
+      },
+      { token: "script-scope-token" },
+    );
+
+    try {
+      const response = await invokeMcpEndpoint({
+        token: getOrCreateZoteroMcpBearerToken(),
+        headers: { [ZOTERO_MCP_SCOPE_HEADER]: scoped.token },
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "zotero_script",
+            arguments: {
+              mode: "write",
+              description: "Run directly",
+              script: "env.addUndoStep(async () => {});",
+            },
+          },
+        },
+      });
+      const payload = JSON.parse(response[2]);
+      const content = JSON.parse(payload.result.content[0].text);
+      assert.equal(content.ok, true);
+      assert.deepEqual(content.result, { status: "ran" });
+      assert.isTrue(executed);
+    } finally {
       scoped.clear();
     }
   });

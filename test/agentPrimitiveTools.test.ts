@@ -2,6 +2,7 @@ import { assert } from "chai";
 import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
 import { EDITABLE_ARTICLE_METADATA_FIELDS } from "../src/agent/services/zoteroGateway";
 import { clearUndoStack, peekUndoEntry } from "../src/agent/store/undoStore";
+import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { PdfService } from "../src/agent/services/pdfService";
 import { RetrievalService } from "../src/agent/services/retrievalService";
 import { createQueryLibraryTool } from "../src/agent/tools/read/queryLibrary";
@@ -11,6 +12,8 @@ import { createSearchPaperTool } from "../src/agent/tools/read/searchPaper";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
 import { createEditCurrentNoteTool } from "../src/agent/tools/write/editCurrentNote";
 import { createApplyTagsTool } from "../src/agent/tools/write/applyTags";
+import { createUndoLastActionTool } from "../src/agent/tools/write/undoLastAction";
+import { createZoteroScriptTool } from "../src/agent/tools/write/zoteroScript";
 import type { AgentToolContext } from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
 import type { PdfContext } from "../src/modules/contextPanel/types";
@@ -44,8 +47,57 @@ function makePdfContext(chunks: string[]): PdfContext {
       uniqueTerms: [],
     })),
     docFreq: {},
-    avgChunkLength: chunks.length ? chunks.join(" ").split(/\s+/).length / chunks.length : 0,
+    avgChunkLength: chunks.length
+      ? chunks.join(" ").split(/\s+/).length / chunks.length
+      : 0,
     fullLength: chunks.join("\n\n").length,
+  };
+}
+
+function createFakeZoteroItem() {
+  return {
+    id: 101,
+    fields: { title: "Original title" } as Record<string, string>,
+    tags: new Set<string>(["existing"]),
+    collections: new Set<number>([5]),
+    creators: [] as unknown[],
+    saved: 0,
+    getField(field: string) {
+      return this.fields[field] || "";
+    },
+    setField(field: string, value: string) {
+      this.fields[field] = String(value);
+    },
+    getTags() {
+      return Array.from(this.tags).map((tag) => ({ tag }));
+    },
+    addTag(tag: string) {
+      this.tags.add(tag);
+    },
+    removeTag(tag: string) {
+      this.tags.delete(tag);
+    },
+    getCollections() {
+      return Array.from(this.collections);
+    },
+    addToCollection(id: number) {
+      this.collections.add(id);
+    },
+    removeFromCollection(id: number) {
+      this.collections.delete(id);
+    },
+    getCreatorsJSON() {
+      return this.creators;
+    },
+    setCreators(creators: unknown[]) {
+      this.creators = creators;
+    },
+    async saveTx() {
+      this.saved += 1;
+    },
+    isRegularItem() {
+      return true;
+    },
   };
 }
 
@@ -54,7 +106,9 @@ class FakePdfService extends PdfService {
     super();
   }
 
-  async ensurePaperContext(_paperContext: PaperContextRef): Promise<PdfContext> {
+  async ensurePaperContext(
+    _paperContext: PaperContextRef,
+  ): Promise<PdfContext> {
     return this.context;
   }
 }
@@ -131,7 +185,8 @@ describe("primitive agent tools", function () {
           collectionIds: [11],
         },
       ],
-      getEditableArticleMetadata: () => makeMetadataSnapshot(99, "Example Paper"),
+      getEditableArticleMetadata: () =>
+        makeMetadataSnapshot(99, "Example Paper"),
       getItem: () => ({ id: 99 }) as any,
       getActiveContextItem: () => null,
       listCollectionSummaries: () => [],
@@ -173,7 +228,8 @@ describe("primitive agent tools", function () {
 
     const result = await tool.execute(validated.value, baseContext);
     assert.deepEqual((result as { warnings: unknown[] }).warnings, []);
-    const first = (result as { results: Array<Record<string, unknown>> }).results[0];
+    const first = (result as { results: Array<Record<string, unknown>> })
+      .results[0];
     assert.equal(first.itemId, 99);
     assert.equal((first.metadata as { title?: string }).title, "Example Paper");
     assert.deepEqual(first.attachments, [
@@ -205,7 +261,11 @@ describe("primitive agent tools", function () {
         title: "Reader Context Paper",
       }),
       getItem: () => null,
-      findRelatedPapersInLibrary: async ({ referenceItemId }: { referenceItemId: number }) => {
+      findRelatedPapersInLibrary: async ({
+        referenceItemId,
+      }: {
+        referenceItemId: number;
+      }) => {
         receivedReferenceItemId = referenceItemId;
         return {
           referenceTitle: "Reader Context Paper",
@@ -275,7 +335,13 @@ describe("primitive agent tools", function () {
           title: "Paper Seven",
           firstCreator: "Dana Example",
           year: "2020",
-          attachments: [{ contextItemId: 701, title: "Main PDF", contentType: "application/pdf" }],
+          attachments: [
+            {
+              contextItemId: 701,
+              title: "Main PDF",
+              contentType: "application/pdf",
+            },
+          ],
           tags: ["alpha"],
           collectionIds: [12],
         },
@@ -299,7 +365,11 @@ describe("primitive agent tools", function () {
         },
       ],
       getAllChildAttachmentInfos: async () => [
-        { contextItemId: 701, title: "Main PDF", contentType: "application/pdf" },
+        {
+          contextItemId: 701,
+          title: "Main PDF",
+          contentType: "application/pdf",
+        },
       ],
       getCollectionSummary: () => ({
         collectionId: 12,
@@ -311,7 +381,13 @@ describe("primitive agent tools", function () {
 
     const validated = tool.validate({
       itemIds: [7],
-      sections: ["metadata", "notes", "annotations", "attachments", "collections"],
+      sections: [
+        "metadata",
+        "notes",
+        "annotations",
+        "attachments",
+        "collections",
+      ],
     });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
@@ -321,7 +397,9 @@ describe("primitive agent tools", function () {
     assert.equal(entry.title, "Paper Seven");
     assert.lengthOf(entry.notes, 1);
     assert.lengthOf(entry.annotations, 1);
-    assert.deepEqual(entry.attachments, [{ contextItemId: 701, title: "Main PDF", contentType: "application/pdf" }]);
+    assert.deepEqual(entry.attachments, [
+      { contextItemId: 701, title: "Main PDF", contentType: "application/pdf" },
+    ]);
     assert.deepEqual(entry.collections, [
       { collectionId: 12, name: "Reading", libraryID: 1, path: "Reading" },
     ]);
@@ -379,7 +457,10 @@ describe("primitive agent tools", function () {
     assert.include(userText, "Selected Zotero collection scopes:");
     assert.include(userText, "Methods [collectionId=55, libraryID=1]");
     assert.include(userText, "query_library with filters.collectionId");
-    assert.include(userText, "Do not assume all full text has already been read.");
+    assert.include(
+      userText,
+      "Do not assume all full text has already been read.",
+    );
     assert.include(userText, "plan a batch workflow");
   });
 
@@ -419,7 +500,10 @@ describe("primitive agent tools", function () {
     assert.include(userText, "source_label=(Smith, 2021)");
     assert.include(userText, "citationLabel=Smith, 2021");
     assert.include(userText, "sourceLabel=(Lee, 2022)");
-    assert.include(userText, "for direct quotes and substantive paper-grounded claims");
+    assert.include(
+      userText,
+      "for direct quotes and substantive paper-grounded claims",
+    );
   });
 
   it("file_io adds source metadata only for Codex app-server MinerU paper reads", async function () {
@@ -455,7 +539,8 @@ describe("primitive agent tools", function () {
           fullTextPaperContexts: [paperContext],
         },
       });
-      const codexContent = (codexResult as { content: Record<string, unknown> }).content;
+      const codexContent = (codexResult as { content: Record<string, unknown> })
+        .content;
       assert.equal(codexContent.citationLabel, "Chandra et al., 2025");
       assert.equal(codexContent.sourceLabel, "(Chandra et al., 2025)");
       assert.deepInclude(codexContent.paperContext as Record<string, unknown>, {
@@ -475,7 +560,9 @@ describe("primitive agent tools", function () {
           fullTextPaperContexts: [paperContext],
         },
       });
-      const normalContent = (normalResult as { content: Record<string, unknown> }).content;
+      const normalContent = (
+        normalResult as { content: Record<string, unknown> }
+      ).content;
       assert.notProperty(normalContent, "citationInstruction");
       assert.notProperty(normalContent, "sourceLabel");
     } finally {
@@ -492,7 +579,9 @@ describe("primitive agent tools", function () {
       year: "2023",
     };
     const tool = createReadPaperTool(
-      new FakePdfService(makePdfContext(["Abstract text.", "Introduction text."])),
+      new FakePdfService(
+        makePdfContext(["Abstract text.", "Introduction text."]),
+      ),
       {} as never,
     );
     const validated = tool.validate({
@@ -502,7 +591,8 @@ describe("primitive agent tools", function () {
     if (!validated.ok) return;
 
     const result = await tool.execute(validated.value, baseContext);
-    const first = (result as { results: Array<Record<string, unknown>> }).results[0];
+    const first = (result as { results: Array<Record<string, unknown>> })
+      .results[0];
     assert.equal(first.citationLabel, "Nguyen, 2023");
     assert.equal(first.sourceLabel, "(Nguyen, 2023)");
   });
@@ -550,7 +640,8 @@ describe("primitive agent tools", function () {
     if (!validated.ok) return;
 
     const result = await tool.execute(validated.value, baseContext);
-    const first = (result as { results: Array<Record<string, unknown>> }).results[0];
+    const first = (result as { results: Array<Record<string, unknown>> })
+      .results[0];
     assert.equal(first.citationLabel, "Rivera, 2024");
     assert.equal(first.sourceLabel, "(Rivera, 2024)");
   });
@@ -562,10 +653,7 @@ describe("primitive agent tools", function () {
         mode: "agent",
         userText: "can you help me tag these papers?",
       },
-      [
-        createQueryLibraryTool({} as never),
-        createApplyTagsTool({} as never),
-      ],
+      [createQueryLibraryTool({} as never), createApplyTagsTool({} as never)],
       [],
     );
     const systemText =
@@ -686,11 +774,7 @@ describe("primitive agent tools", function () {
         libraryID: 1,
         noteKind: "standalone",
       }),
-      replaceCurrentNote: async ({
-        content,
-      }: {
-        content: string;
-      }) => {
+      replaceCurrentNote: async ({ content }: { content: string }) => {
         assert.equal(content, "Approved *note*");
         return {
           noteId: 55,
@@ -751,6 +835,101 @@ describe("primitive agent tools", function () {
       request: noteRequest,
     });
     assert.equal((result as { noteText: string }).noteText, "Approved *note*");
+  });
+
+  it("zotero_script write mode runs directly and records undo snapshots", async function () {
+    const fakeItem = createFakeZoteroItem();
+    globalScope.Zotero = {
+      ...(globalScope.Zotero || {}),
+      Libraries: { userLibraryID: 1 },
+      Items: {
+        get: (id: number) => (id === fakeItem.id ? fakeItem : null),
+      },
+      debug: () => undefined,
+    };
+    const registry = new AgentToolRegistry();
+    registry.register(createZoteroScriptTool());
+
+    const prepared = await registry.prepareExecution(
+      {
+        id: "script-1",
+        name: "zotero_script",
+        arguments: {
+          mode: "write",
+          description: "Update one fake item",
+          script: `
+const item = Zotero.Items.get(101);
+env.snapshot(item);
+item.setField('title', 'Updated title');
+item.addTag('new-tag');
+item.addToCollection(9);
+await item.saveTx();
+env.log('updated');
+`,
+        },
+      },
+      baseContext,
+    );
+
+    assert.equal(prepared.kind, "result");
+    if (prepared.kind !== "result") return;
+    assert.equal(prepared.execution.result.ok, true);
+    assert.equal(fakeItem.getField("title"), "Updated title");
+    assert.sameMembers(Array.from(fakeItem.tags), ["existing", "new-tag"]);
+    assert.sameMembers(Array.from(fakeItem.collections), [5, 9]);
+    assert.exists(peekUndoEntry(baseContext.request.conversationKey));
+  });
+
+  it("undo_last_action reverts a zotero_script snapshot", async function () {
+    const fakeItem = createFakeZoteroItem();
+    globalScope.Zotero = {
+      ...(globalScope.Zotero || {}),
+      Libraries: { userLibraryID: 1 },
+      Items: {
+        get: (id: number) => (id === fakeItem.id ? fakeItem : null),
+      },
+      debug: () => undefined,
+    };
+    const scriptTool = createZoteroScriptTool();
+    const validated = scriptTool.validate({
+      mode: "write",
+      description: "Update then undo one fake item",
+      script: `
+const item = Zotero.Items.get(101);
+env.snapshot(item);
+item.setField('title', 'Temporary title');
+item.addTag('temporary');
+item.removeTag('existing');
+item.addToCollection(9);
+item.removeFromCollection(5);
+await item.saveTx();
+`,
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await scriptTool.execute(validated.value, baseContext);
+    assert.equal(fakeItem.getField("title"), "Temporary title");
+    assert.sameMembers(Array.from(fakeItem.tags), ["temporary"]);
+    assert.sameMembers(Array.from(fakeItem.collections), [9]);
+
+    const undoTool = createUndoLastActionTool();
+    await undoTool.execute({}, baseContext);
+    assert.equal(fakeItem.getField("title"), "Original title");
+    assert.sameMembers(Array.from(fakeItem.tags), ["existing"]);
+    assert.sameMembers(Array.from(fakeItem.collections), [5]);
+  });
+
+  it("zotero_script rejects write scripts without undo instrumentation", function () {
+    const tool = createZoteroScriptTool();
+    const validation = tool.validate({
+      mode: "write",
+      description: "Unsafe direct write",
+      script: "env.log('about to write without undo');",
+    });
+    assert.isFalse(validation.ok);
+    if (validation.ok) return;
+    assert.include(validation.error, "env.snapshot(item)");
   });
 
   it("includes the active note content in agent prompts", async function () {

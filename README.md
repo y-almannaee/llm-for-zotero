@@ -265,7 +265,7 @@ When enabled, the LLM becomes an autonomous agent that can read, search, and wri
 
 ### Available Tools
 
-The agent ships with focused tools split into **read** (no confirmation needed) and **write** (route through a confirmation card with batched undo).
+The agent ships with focused tools split into **read** (no confirmation needed) and **write** (usually routed through a confirmation card with batched undo).
 
 #### Library & PDF reading
 
@@ -296,11 +296,11 @@ The agent ships with focused tools split into **read** (no confirmation needed) 
 
 #### Filesystem & scripting
 
-| Tool            | Description                                                                                                |
-| --------------- | ---------------------------------------------------------------------------------------------------------- |
-| `file_io`       | Read or write files on the local filesystem — text and image, with offset/length for partial reads         |
-| `run_command`   | Run a shell command (zsh on macOS, bash on Linux, cmd.exe on Windows) — for analysis scripts and CLI tools |
-| `zotero_script` | Execute JavaScript inside Zotero's runtime — read mode for bulk data, write mode for custom mutations      |
+| Tool            | Description                                                                                                                              |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `file_io`       | Read or write files on the local filesystem — text and image, with offset/length for partial reads                                       |
+| `run_command`   | Run a shell command (zsh on macOS, bash on Linux, cmd.exe on Windows) — for analysis scripts and CLI tools                               |
+| `zotero_script` | Execute JavaScript inside Zotero's runtime — read mode for bulk data, write mode for custom mutations with required undo instrumentation |
 
 #### Safety net
 
@@ -308,7 +308,7 @@ The agent ships with focused tools split into **read** (no confirmation needed) 
 | ------------------ | ---------------------------------------------------------------------------------------------- |
 | `undo_last_action` | Undo the most recent write action in this conversation — keeps the last 10 entries per session |
 
-The design philosophy is **read tools are unrestricted; write tools always confirm and stay undoable**. Ask the agent what it can do — it will tell you.
+The design philosophy is **read tools are unrestricted; write tools stay undoable, with confirmation cards for focused user-reviewed edits**. Ask the agent what it can do — it will tell you.
 
 ### Demos
 

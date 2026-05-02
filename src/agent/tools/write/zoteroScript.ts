@@ -5,7 +5,7 @@
  *
  * Two modes:
  * - "read": gather data across many items, no confirmation needed
- * - "write": confirmation card shows script + description, then executes with undo
+ * - "write": executes directly with undo instrumentation required
  */
 import type { AgentToolDefinition, AgentToolContext } from "../../types";
 import { ok, fail, validateObject } from "../shared";
@@ -38,10 +38,24 @@ type ScriptResult = {
 // ── Snapshot fields ─────────────────────────────────────────────────────────
 
 const SNAPSHOT_FIELDS = [
-  "title", "shortTitle", "abstractNote", "publicationTitle",
-  "journalAbbreviation", "proceedingsTitle", "date", "volume",
-  "issue", "pages", "DOI", "url", "language", "extra",
-  "ISSN", "ISBN", "publisher", "place",
+  "title",
+  "shortTitle",
+  "abstractNote",
+  "publicationTitle",
+  "journalAbbreviation",
+  "proceedingsTitle",
+  "date",
+  "volume",
+  "issue",
+  "pages",
+  "DOI",
+  "url",
+  "language",
+  "extra",
+  "ISSN",
+  "ISBN",
+  "publisher",
+  "place",
 ];
 
 function captureItemSnapshot(item: any): ItemSnapshot {
@@ -49,20 +63,30 @@ function captureItemSnapshot(item: any): ItemSnapshot {
   for (const field of SNAPSHOT_FIELDS) {
     try {
       fields[field] = String(item.getField?.(field) ?? "");
-    } catch { /* field may not be valid for this item type */ }
+    } catch {
+      /* field may not be valid for this item type */
+    }
   }
   let tags: Array<{ tag: string }> = [];
   try {
-    tags = (item.getTags?.() || []).map((t: any) => ({ tag: String(t.tag || t) }));
-  } catch { /* ignore */ }
+    tags = (item.getTags?.() || []).map((t: any) => ({
+      tag: String(t.tag || t),
+    }));
+  } catch {
+    /* ignore */
+  }
   let collectionIds: number[] = [];
   try {
     collectionIds = item.getCollections?.() || [];
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   let creators: unknown[] = [];
   try {
     creators = item.getCreatorsJSON?.() || [];
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return { itemId: item.id, fields, tags, collectionIds, creators };
 }
 
@@ -81,7 +105,11 @@ function buildRevertFunction(
 
         // Restore fields
         for (const [field, value] of Object.entries(snapshot.fields)) {
-          try { item.setField(field, value); } catch { /* skip invalid fields */ }
+          try {
+            item.setField(field, value);
+          } catch {
+            /* skip invalid fields */
+          }
         }
 
         // Restore creators
@@ -89,21 +117,32 @@ function buildRevertFunction(
           if (Array.isArray(snapshot.creators) && item.setCreators) {
             item.setCreators(snapshot.creators);
           }
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
 
         // Restore tags: remove added, re-add removed
-        const currentTagList: string[] =
-          (item.getTags?.() || []).map((t: any) => String(t.tag || t));
+        const currentTagList: string[] = (item.getTags?.() || []).map(
+          (t: any) => String(t.tag || t),
+        );
         const currentTags = new Set(currentTagList);
         const snapshotTags = new Set(snapshot.tags.map((t) => t.tag));
         for (const tag of currentTagList) {
           if (!snapshotTags.has(tag)) {
-            try { item.removeTag(tag); } catch { /* ignore */ }
+            try {
+              item.removeTag(tag);
+            } catch {
+              /* ignore */
+            }
           }
         }
         for (const { tag } of snapshot.tags) {
           if (!currentTags.has(tag)) {
-            try { item.addTag(tag); } catch { /* ignore */ }
+            try {
+              item.addTag(tag);
+            } catch {
+              /* ignore */
+            }
           }
         }
 
@@ -112,12 +151,20 @@ function buildRevertFunction(
         const snapshotColls = new Set(snapshot.collectionIds);
         for (const id of currentColls) {
           if (!snapshotColls.has(id)) {
-            try { item.removeFromCollection(id); } catch { /* ignore */ }
+            try {
+              item.removeFromCollection(id);
+            } catch {
+              /* ignore */
+            }
           }
         }
         for (const id of snapshotColls) {
           if (!currentColls.has(id)) {
-            try { item.addToCollection(id); } catch { /* ignore */ }
+            try {
+              item.addToCollection(id);
+            } catch {
+              /* ignore */
+            }
           }
         }
 
@@ -133,7 +180,11 @@ function buildRevertFunction(
 
     // Run custom undo steps in reverse
     for (const step of [...undoSteps].reverse()) {
-      try { await step(); } catch { /* ignore */ }
+      try {
+        await step();
+      } catch {
+        /* ignore */
+      }
     }
   };
 }
@@ -171,7 +222,9 @@ async function executeScript(params: {
 
   try {
     // Use AsyncFunction constructor (like `new Function` but for async bodies)
-    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const AsyncFunction = Object.getPrototypeOf(
+      async function () {},
+    ).constructor;
     const fn = new AsyncFunction("Zotero", "env", params.script);
 
     const timeoutPromise = new Promise<"timeout">((resolve) =>
@@ -193,9 +246,11 @@ async function executeScript(params: {
     const maxLen = 8000;
     const output = logBuffer.join("\n");
     return {
-      output: output.length > maxLen
-        ? output.slice(0, maxLen) + `\n... [truncated, ${output.length} chars total]`
-        : output,
+      output:
+        output.length > maxLen
+          ? output.slice(0, maxLen) +
+            `\n... [truncated, ${output.length} chars total]`
+          : output,
       snapshots,
       undoSteps,
     };
@@ -210,22 +265,6 @@ async function executeScript(params: {
   }
 }
 
-// ── Safety scan ─────────────────────────────────────────────────────────────
-
-const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; warning: string }> = [
-  { pattern: /\.eraseTx\s*\(/, warning: "eraseTx() permanently deletes items — use trash instead" },
-  { pattern: /Zotero\.DB\b/, warning: "Direct database access (Zotero.DB) — use the Items/Collections API instead" },
-  { pattern: /Components\.classes/, warning: "Low-level XPCOM access (Components.classes)" },
-  { pattern: /ChromeUtils\.import/, warning: "Module import (ChromeUtils.import) — ensure this is necessary" },
-  { pattern: /Services\./, warning: "XPCOM Services access — ensure this is necessary" },
-];
-
-function scanForDangerousPatterns(script: string): string[] {
-  return DANGEROUS_PATTERNS
-    .filter(({ pattern }) => pattern.test(script))
-    .map(({ warning }) => warning);
-}
-
 // ── Library ID resolution ───────────────────────────────────────────────────
 
 function resolveLibraryID(context: AgentToolContext): number {
@@ -235,6 +274,10 @@ function resolveLibraryID(context: AgentToolContext): number {
   }
   return (Zotero as unknown as { Libraries: { userLibraryID: number } })
     .Libraries.userLibraryID;
+}
+
+function hasUndoInstrumentation(script: string): boolean {
+  return /\benv\s*\.\s*(?:snapshot|addUndoStep)\s*\(/.test(script);
 }
 
 // ── Guidance ────────────────────────────────────────────────────────────────
@@ -302,19 +345,22 @@ env.log(\`Total: \${count} items\`);
 3. Use \`env.log(msg)\` to report progress — this output is shown to the user
 4. The script body is an async function — top-level await is supported
 5. Do NOT use \`eraseTx()\` — use Zotero trash instead (item.deleted = true; await item.saveTx())
-6. Write straightforward code — no dry-run branching needed. The confirmation card lets the user review before execution.`;
+6. Write straightforward code — no dry-run branching needed. The script runs directly, and undo_last_action uses snapshots/custom undo steps to revert it.`;
 
 // ── Tool definition ─────────────────────────────────────────────────────────
 
-export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput, unknown> {
+export function createZoteroScriptTool(): AgentToolDefinition<
+  ZoteroScriptInput,
+  unknown
+> {
   return {
     spec: {
       name: "zotero_script",
       description:
         "Execute a JavaScript script inside Zotero's runtime with full API access. " +
         "Two modes: mode:'read' for gathering data across many items (no confirmation); " +
-        "mode:'write' for mutations (user reviews script in confirmation card, then it executes with undo support). " +
-        "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.libraryID).",
+        "mode:'write' for mutations (runs directly with undo support; env.snapshot(item) or env.addUndoStep(fn) is required). " +
+        "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.addUndoStep, env.libraryID).",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -324,7 +370,7 @@ export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput,
             type: "string",
             enum: ["read", "write"],
             description:
-              "'read' for gathering/computing data (no confirmation), 'write' for mutations (confirmation + undo).",
+              "'read' for gathering/computing data, 'write' for mutations (direct execution + undo).",
           },
           script: {
             type: "string",
@@ -338,12 +384,13 @@ export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput,
           },
           timeoutMs: {
             type: "number",
-            description: "Timeout in milliseconds (default: 30000, max: 120000).",
+            description:
+              "Timeout in milliseconds (default: 30000, max: 120000).",
           },
         },
       },
       mutability: "write",
-      requiresConfirmation: true,
+      requiresConfirmation: false,
     },
 
     guidance: {
@@ -358,18 +405,28 @@ export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput,
       label: "Zotero Script",
       summaries: {
         onCall: ({ args }) => {
-          const a = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+          const a =
+            args && typeof args === "object"
+              ? (args as Record<string, unknown>)
+              : {};
           const mode = String(a.mode || "script");
-          const desc = typeof a.description === "string" ? a.description : "Zotero operation";
-          return `${mode === "read" ? "Reading" : "Preparing"}: ${desc}`;
+          const desc =
+            typeof a.description === "string"
+              ? a.description
+              : "Zotero operation";
+          return `${mode === "read" ? "Reading" : "Running"}: ${desc}`;
         },
-        onPending: "Waiting for confirmation to run Zotero script",
+        onPending: "Preparing Zotero script",
         onApproved: "Executing Zotero script",
         onDenied: "Script cancelled",
         onSuccess: ({ content }) => {
-          const r = content && typeof content === "object" ? (content as Record<string, unknown>) : {};
+          const r =
+            content && typeof content === "object"
+              ? (content as Record<string, unknown>)
+              : {};
           if (r.error) return `Script error: ${String(r.error)}`;
-          const count = typeof r.itemsAffected === "number" ? r.itemsAffected : undefined;
+          const count =
+            typeof r.itemsAffected === "number" ? r.itemsAffected : undefined;
           return count !== undefined
             ? `Script completed — ${count} item${count === 1 ? "" : "s"} affected`
             : "Script completed successfully";
@@ -389,7 +446,15 @@ export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput,
         return fail("script is required: the JavaScript code to execute");
       }
       if (typeof args.description !== "string" || !args.description.trim()) {
-        return fail("description is required: a human-readable summary of what the script does");
+        return fail(
+          "description is required: a human-readable summary of what the script does",
+        );
+      }
+      const script = args.script.trim();
+      if (mode === "write" && !hasUndoInstrumentation(script)) {
+        return fail(
+          "mode 'write' scripts must call env.snapshot(item) before mutating Zotero items, or env.addUndoStep(fn) for custom changes, so undo_last_action can revert the operation",
+        );
       }
       const timeoutRaw =
         typeof args.timeoutMs === "number" && args.timeoutMs > 0
@@ -399,69 +464,14 @@ export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput,
 
       return ok<ZoteroScriptInput>({
         mode,
-        script: args.script.trim(),
+        script,
         description: args.description.trim(),
         timeoutMs,
       });
     },
 
-    shouldRequireConfirmation(input) {
-      // Read mode never needs confirmation
-      if (input.mode === "read") return false;
-      // Write mode always requires confirmation — user reviews the script
-      // before it executes.
-      return true;
-    },
-
-    createPendingAction(input) {
-      const warnings = scanForDangerousPatterns(input.script);
-
-      const fields: Array<any> = [
-        {
-          type: "text" as const,
-          id: "description",
-          label: "Description",
-          value: input.description,
-        },
-        {
-          type: "textarea" as const,
-          id: "script",
-          label: "Script",
-          value: input.script,
-          editorMode: "plain" as const,
-        },
-      ];
-
-      if (warnings.length) {
-        fields.push({
-          type: "text" as const,
-          id: "warnings",
-          label: "⚠ Warnings",
-          value: warnings.join("; "),
-        });
-      }
-
-      return {
-        toolName: "zotero_script",
-        title: "Run Zotero Script",
-        description: input.description,
-        confirmLabel: "Execute",
-        cancelLabel: "Cancel",
-        fields,
-      };
-    },
-
-    applyConfirmation(input, resolutionData) {
-      if (validateObject<Record<string, unknown>>(resolutionData)) {
-        // Allow user to edit the script in the confirmation card
-        if (typeof resolutionData.script === "string" && resolutionData.script.trim()) {
-          return ok<ZoteroScriptInput>({
-            ...input,
-            script: resolutionData.script.trim(),
-          });
-        }
-      }
-      return ok(input);
+    shouldRequireConfirmation() {
+      return false;
     },
 
     async execute(input, context) {
@@ -475,7 +485,10 @@ export function createZoteroScriptTool(): AgentToolDefinition<ZoteroScriptInput,
       });
 
       // Register undo for write mode
-      if (input.mode === "write" && (result.snapshots.size > 0 || result.undoSteps.length > 0)) {
+      if (
+        input.mode === "write" &&
+        (result.snapshots.size > 0 || result.undoSteps.length > 0)
+      ) {
         pushUndoEntry(context.request.conversationKey, {
           id: `undo-zotero_script-${Date.now()}`,
           toolName: "zotero_script",
