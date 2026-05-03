@@ -144,6 +144,7 @@ const scopedZoteroMcpScopes = new Map<
   { createdAt: number; expiresAt: number; scope: ZoteroMcpActiveScope }
 >();
 let activeZoteroMcpScope: ZoteroMcpActiveScope | null = null;
+let registeredMcpDeps: McpServerDeps | null = null;
 
 export type ZoteroMcpToolActivityEvent = {
   requestId: string;
@@ -1154,6 +1155,7 @@ async function handleRequest(
  */
 export function registerMcpServer(deps: McpServerDeps): void {
   const capturedDeps = deps;
+  registeredMcpDeps = capturedDeps;
 
   class McpEndpoint {
     supportedMethods = ["POST"];
@@ -1182,11 +1184,30 @@ export function registerMcpServer(deps: McpServerDeps): void {
   Zotero.Server.Endpoints[ZOTERO_MCP_ENDPOINT_PATH] = McpEndpoint;
 }
 
+export async function invokeRegisteredZoteroMcpEndpoint(options: EndpointOptions): Promise<
+  [number, string, string] | null
+> {
+  const deps = registeredMcpDeps;
+  if (!deps) return null;
+  if (!isAuthorized(options.headers)) {
+    return [
+      401,
+      "application/json",
+      JSON.stringify({ error: "unauthorized" }),
+    ];
+  }
+  const body =
+    typeof options.data === "string" ? options.data : JSON.stringify(options.data);
+  const response = await handleRequest(body, deps, options.headers);
+  return [response.status, response.contentType, response.body];
+}
+
 /**
  * Removes the MCP endpoint from Zotero's server (call on plugin shutdown).
  */
 export function unregisterMcpServer(): void {
   scopedZoteroMcpScopes.clear();
   zoteroMcpConfirmationHandlers.clear();
+  registeredMcpDeps = null;
   delete Zotero.Server.Endpoints[ZOTERO_MCP_ENDPOINT_PATH];
 }

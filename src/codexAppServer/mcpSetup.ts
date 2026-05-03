@@ -3,6 +3,7 @@ import {
   getZoteroMcpAllowedToolNames,
   getZoteroMcpServerName,
   getZoteroMcpServerUrl,
+  invokeRegisteredZoteroMcpEndpoint,
   ZOTERO_MCP_SERVER_NAME,
   ZOTERO_MCP_SCOPE_HEADER,
 } from "../agent/mcp/server";
@@ -264,6 +265,20 @@ async function postMcpJson(params: {
   headers: Record<string, string>;
   payload: Record<string, unknown>;
 }): Promise<unknown> {
+  const directResponse = await invokeRegisteredZoteroMcpEndpoint({
+    method: "POST",
+    data: params.payload,
+    headers: params.headers,
+  });
+  if (directResponse) {
+    const [status, , body] = directResponse;
+    return parseMcpJsonResponse({
+      ok: status >= 200 && status < 300,
+      status,
+      text: body,
+    });
+  }
+
   const response = await getFetch()(params.url, {
     method: "POST",
     headers: {
@@ -273,16 +288,27 @@ async function postMcpJson(params: {
     },
     body: JSON.stringify(params.payload),
   });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
+  return parseMcpJsonResponse({
+    ok: response.ok,
+    status: response.status,
+    text: await response.text().catch(() => ""),
+  });
+}
+
+function parseMcpJsonResponse(params: {
+  ok: boolean;
+  status: number;
+  text: string;
+}): unknown {
+  const text = params.text;
+  if (!params.ok) {
     throw new Error(
-      `HTTP ${response.status}${text.trim() ? `: ${text.trim().slice(0, 240)}` : ""}`,
+      `HTTP ${params.status}${text.trim() ? `: ${text.trim().slice(0, 240)}` : ""}`,
     );
   }
-  if (response.status === 202 || response.status === 204) {
+  if (params.status === 202 || params.status === 204) {
     return undefined;
   }
-  const text = await response.text();
   if (!text.trim()) return undefined;
   const parsed = JSON.parse(text) as {
     result?: unknown;

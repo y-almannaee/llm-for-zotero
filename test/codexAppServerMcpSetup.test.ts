@@ -7,8 +7,28 @@ import {
   preflightCodexZoteroMcpServer,
   readCodexNativeMcpSetupStatus,
 } from "../src/codexAppServer/mcpSetup";
-import { getZoteroMcpAllowedToolNames } from "../src/agent/mcp/server";
+import {
+  getZoteroMcpAllowedToolNames,
+  registerMcpServer,
+  unregisterMcpServer,
+} from "../src/agent/mcp/server";
+import { AgentToolRegistry } from "../src/agent/tools/registry";
+import type { AgentToolDefinition } from "../src/agent/types";
 import type { CodexAppServerProcess } from "../src/utils/codexAppServerProcess";
+
+function createReadTool(name: string): AgentToolDefinition<unknown, unknown> {
+  return {
+    spec: {
+      name,
+      description: `Read tool ${name}`,
+      inputSchema: { type: "object", additionalProperties: true },
+      mutability: "read",
+      requiresConfirmation: false,
+    },
+    validate: (args) => ({ ok: true, value: args ?? {} }),
+    execute: async (input) => ({ name, input }),
+  };
+}
 
 describe("Codex app-server MCP setup", function () {
   const originalZotero = globalThis.Zotero;
@@ -41,6 +61,19 @@ describe("Codex app-server MCP setup", function () {
 
   afterEach(function () {
     clearCodexZoteroMcpPreflightCache();
+    try {
+      if (
+        (
+          globalThis as typeof globalThis & {
+            Zotero?: { Server?: { Endpoints?: unknown } };
+          }
+        ).Zotero?.Server?.Endpoints
+      ) {
+        unregisterMcpServer();
+      }
+    } catch {
+      /* test cleanup should not mask the assertion failure */
+    }
     (globalThis as typeof globalThis & { Zotero?: typeof Zotero }).Zotero =
       originalZotero;
     (
@@ -210,6 +243,31 @@ describe("Codex app-server MCP setup", function () {
     assert.equal(status.connected, true);
     assert.deepEqual(status.toolNames, ["query_library"]);
     assert.deepEqual(status.errors, []);
+  });
+
+  it("preflights the registered Zotero MCP endpoint in-process when available", async function () {
+    (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
+      ...globalThis.Zotero,
+      Server: { Endpoints: {} },
+    } as unknown as typeof Zotero;
+    const registry = new AgentToolRegistry();
+    registry.register(createReadTool("query_library"));
+    registry.register(createReadTool("read_library"));
+    registerMcpServer({
+      toolRegistry: registry,
+      zoteroGateway: {} as never,
+    });
+    (globalThis as typeof globalThis & { fetch: typeof fetch }).fetch = (async () => {
+      throw new Error("preflight should not self-fetch Zotero's HTTP server");
+    }) as typeof fetch;
+
+    const status = await preflightCodexZoteroMcpServer({
+      scopeToken: "scope-direct",
+      required: true,
+    });
+
+    assert.equal(status.connected, true);
+    assert.deepEqual(status.toolNames, ["query_library", "read_library"]);
   });
 
   it("caches successful local MCP preflight across per-turn scope tokens", async function () {
