@@ -1,5 +1,7 @@
 import { assert } from "chai";
 import {
+  clearCodexNativeHistoryVerificationState,
+  clearCodexNativeResourceLifecycleState,
   resolveCodexNativeApprovalRequest,
   resolveSafeCodexNativeApprovalRequest,
   runCodexAppServerNativeTurn,
@@ -10,6 +12,11 @@ import { setUserSkills } from "../src/agent/skills";
 import type { AgentSkill } from "../src/agent/skills/skillLoader";
 import { clearCodexZoteroMcpPreflightCache } from "../src/codexAppServer/mcpSetup";
 import { clearCodexNativeSkillClassifierCache } from "../src/codexAppServer/nativeSkills";
+import {
+  buildCodexNativePriorReadContextBlock,
+  clearCodexNativeReadLedger,
+  recordCodexNativeReadActivity,
+} from "../src/codexAppServer/nativeContextLedger";
 
 describe("Codex app-server native client", function () {
   const originalChromeUtils = (
@@ -144,6 +151,9 @@ describe("Codex app-server native client", function () {
     setUserSkills([]);
     clearCodexNativeSkillClassifierCache();
     clearCodexZoteroMcpPreflightCache();
+    clearCodexNativeHistoryVerificationState();
+    clearCodexNativeResourceLifecycleState();
+    clearCodexNativeReadLedger();
     const mockCodexPath = { codexPath: "/mock/codex" };
     destroyCachedCodexAppServerProcess(
       "native-client-test",
@@ -330,6 +340,112 @@ describe("Codex app-server native client", function () {
       }).response,
       { action: "decline", content: null, _meta: null },
     );
+  });
+
+  it("records successful native paper reads for context reuse hints", function () {
+    const scope = {
+      profileSignature: "profile-ledger-test",
+      conversationKey: 6_000_000_010,
+      libraryID: 1,
+      kind: "paper" as const,
+      paperItemID: 42,
+      activeContextItemId: 99,
+      paperTitle: "Ledger Paper",
+    };
+    const baseEvent = {
+      requestId: "read-1",
+      phase: "completed" as const,
+      serverName: "llm_for_zotero",
+      profileSignature: "profile-ledger-test",
+      conversationKey: 6_000_000_010,
+      timestamp: 1000,
+    };
+
+    recordCodexNativeReadActivity({
+      threadId: "thread-ledger",
+      scope,
+      event: {
+        ...baseEvent,
+        toolName: "read_paper",
+        toolLabel: "Read Paper",
+        arguments: {},
+        ok: true,
+      },
+    });
+    recordCodexNativeReadActivity({
+      threadId: "thread-ledger",
+      scope,
+      event: {
+        ...baseEvent,
+        requestId: "read-2",
+        toolName: "read_paper",
+        toolLabel: "Read Paper",
+        arguments: {},
+        ok: true,
+        timestamp: 1100,
+      },
+    });
+    recordCodexNativeReadActivity({
+      threadId: "thread-ledger",
+      scope,
+      event: {
+        ...baseEvent,
+        requestId: "search-failed",
+        toolName: "search_paper",
+        toolLabel: "Search Paper",
+        arguments: { question: "failed search" },
+        ok: false,
+        timestamp: 1200,
+      },
+    });
+    recordCodexNativeReadActivity({
+      threadId: "thread-ledger",
+      scope,
+      event: {
+        ...baseEvent,
+        requestId: "write-file",
+        toolName: "file_io",
+        toolLabel: "File I/O",
+        arguments: {
+          action: "write",
+          filePath: "/tmp/llm-for-zotero-mineru/paper/full.md",
+        },
+        ok: true,
+        timestamp: 1300,
+      },
+    });
+    recordCodexNativeReadActivity({
+      threadId: "thread-ledger",
+      scope,
+      event: {
+        ...baseEvent,
+        requestId: "read-mineru",
+        toolName: "file_io",
+        toolLabel: "File I/O",
+        arguments: {
+          action: "read",
+          filePath: "/tmp/llm-for-zotero-mineru/paper/full.md",
+          offset: 25,
+          length: 500,
+        },
+        ok: true,
+        timestamp: 1400,
+      },
+    });
+
+    const block = buildCodexNativePriorReadContextBlock({
+      profileSignature: "profile-ledger-test",
+      conversationKey: 6_000_000_010,
+      threadId: "thread-ledger",
+    });
+    assert.include(block, "Already inspected in this Codex thread");
+    assert.include(block, "Ledger Paper");
+    assert.include(block, "Read Paper");
+    assert.include(block, "2x");
+    assert.include(block, "Read MinerU full.md");
+    assert.include(block, "offset=25");
+    assert.notInclude(block, "failed search");
+    assert.notInclude(block, "write-file");
   });
 
   it("starts persistent native threads and injects legacy UI history once", async function () {
@@ -547,6 +663,10 @@ describe("Codex app-server native client", function () {
     assert.include(
       String(threadStartParams?.developerInstructions || ""),
       "Do not inspect local Zotero profile folders",
+    );
+    assert.include(
+      String(threadStartParams?.developerInstructions || ""),
+      "Context reuse: if prior Zotero, PDF, or MinerU content already inspected",
     );
     const threadConfig = threadStartParams?.config as Record<string, any>;
     assert.deepEqual(threadConfig.features, { shell_tool: false });
@@ -1161,11 +1281,43 @@ describe("Codex app-server native client", function () {
         },
       }),
     };
+    recordCodexNativeReadActivity({
+      threadId: "thread-native-1",
+      scope: {
+        profileSignature: "profile-resume-test",
+        conversationKey: 6_000_000_001,
+        libraryID: 1,
+        kind: "global",
+      },
+      event: {
+        requestId: "read-1",
+        phase: "completed",
+        toolName: "read_paper",
+        toolLabel: "Read Paper",
+        serverName: "llm_for_zotero",
+        arguments: {
+          target: {
+            itemId: 42,
+            contextItemId: 99,
+            paperContext: {
+              itemId: 42,
+              contextItemId: 99,
+              title: "Ledger Paper",
+            },
+          },
+        },
+        ok: true,
+        profileSignature: "profile-resume-test",
+        conversationKey: 6_000_000_001,
+        timestamp: Date.now(),
+      },
+    });
 
     const result = await runCodexAppServerNativeTurn({
       processKey: "native-client-resume-test",
       codexPath: "/mock/codex",
       scope: {
+        profileSignature: "profile-resume-test",
         conversationKey: 6_000_000_001,
         libraryID: 1,
         kind: "global",
@@ -1201,6 +1353,14 @@ describe("Codex app-server native client", function () {
     assert.include(
       String(resumeParams?.developerInstructions || ""),
       "Fresh context.",
+    );
+    assert.include(
+      String(resumeParams?.developerInstructions || ""),
+      "Already inspected in this Codex thread",
+    );
+    assert.include(
+      String(resumeParams?.developerInstructions || ""),
+      "Ledger Paper",
     );
     const resumeConfig = resumeParams?.config as Record<string, any>;
     assert.deepEqual(resumeConfig.features, { shell_tool: false });
@@ -1633,6 +1793,8 @@ describe("Codex app-server native client", function () {
     let storedThreadId = "";
     let turnCount = 0;
     const prefStore = new Map<string, unknown>();
+    const threadResumeParams: Record<string, unknown>[] = [];
+    const turnInputs: unknown[] = [];
 
     if (globalThis.process?.env) {
       globalThis.process.env.CODEX_PATH = "/mock/codex";
@@ -1719,6 +1881,7 @@ describe("Codex app-server native client", function () {
                     continue;
                   }
                   if (message.method === "thread/resume") {
+                    threadResumeParams.push(message.params || {});
                     stdout.push(
                       `${JSON.stringify({ id: message.id, result: { thread: { id: "thread-reuse", source: "appServer" } } })}\n`,
                     );
@@ -1731,6 +1894,7 @@ describe("Codex app-server native client", function () {
                     continue;
                   }
                   if (message.method === "turn/start") {
+                    turnInputs.push(message.params?.input);
                     turnCount += 1;
                     const turnId = `turn-reuse-${turnCount}`;
                     stdout.push(
@@ -1780,27 +1944,96 @@ describe("Codex app-server native client", function () {
       },
     };
 
-    const first = await runCodexAppServerNativeTurn({
-      ...common,
-      messages: [{ role: "user", content: "First question." }],
-    });
-    const second = await runCodexAppServerNativeTurn({
-      ...common,
-      messages: [{ role: "user", content: "Second question." }],
-    });
+    const originalDateNowForTest = Date.now;
+    let fakeNow = 1_700_000_000_000;
+    Date.now = () => fakeNow;
+    try {
+      const first = await runCodexAppServerNativeTurn({
+        ...common,
+        messages: [{ role: "user", content: "First question." }],
+      });
+      fakeNow += 1000;
+      const second = await runCodexAppServerNativeTurn({
+        ...common,
+        messages: [{ role: "user", content: "Second question." }],
+        skillContext: {
+          selectedTexts: ["Prior model answer"],
+          selectedTextSources: ["model"],
+        },
+      });
+      fakeNow += 5 * 60 * 1000 + 1;
+      const third = await runCodexAppServerNativeTurn({
+        ...common,
+        messages: [{ role: "user", content: "Third question." }],
+      });
+      fakeNow += 1000;
+      const fourth = await runCodexAppServerNativeTurn({
+        ...common,
+        messages: [{ role: "user", content: "Fourth question." }],
+        skillContext: {
+          selectedPaperContexts: [
+            {
+              itemId: 42,
+              contextItemId: 99,
+              title: "Selected Resource Paper",
+              mineruCacheDir: "/tmp/llm-for-zotero-mineru/99",
+            },
+          ],
+        },
+      });
 
-    assert.equal(first.threadId, "thread-reuse");
-    assert.equal(second.threadId, "thread-reuse");
-    assert.equal(first.resumed, false);
-    assert.equal(second.resumed, true);
-    assert.equal(
-      methods.filter((method) => method === "thread/start").length,
-      1,
-    );
-    assert.equal(
-      methods.filter((method) => method === "thread/resume").length,
-      1,
-    );
+      assert.equal(first.threadId, "thread-reuse");
+      assert.equal(second.threadId, "thread-reuse");
+      assert.equal(third.threadId, "thread-reuse");
+      assert.equal(fourth.threadId, "thread-reuse");
+      assert.equal(first.resumed, false);
+      assert.equal(second.resumed, true);
+      assert.equal(third.resumed, true);
+      assert.equal(fourth.resumed, true);
+      assert.equal(first.diagnostics?.lifecycleState, "setup-required");
+      assert.equal(first.diagnostics?.contextInjection, "full");
+      assert.equal(second.diagnostics?.lifecycleState, "thin-followup");
+      assert.equal(second.diagnostics?.contextInjection, "thin");
+      assert.equal(third.diagnostics?.lifecycleState, "thin-followup");
+      assert.equal(fourth.diagnostics?.lifecycleState, "resources-changed");
+      assert.equal(fourth.diagnostics?.contextInjection, "full");
+      assert.equal(first.diagnostics?.historyVerified, true);
+      assert.isUndefined(second.diagnostics?.historyVerified);
+      assert.equal(third.diagnostics?.historyVerified, true);
+      assert.isUndefined(fourth.diagnostics?.historyVerified);
+      assert.notProperty(threadResumeParams[0] || {}, "developerInstructions");
+      assert.notProperty(threadResumeParams[1] || {}, "developerInstructions");
+      assert.include(
+        String(threadResumeParams[2]?.developerInstructions || ""),
+        "Selected Zotero paper resources available this turn",
+      );
+      assert.include(
+        String(threadResumeParams[2]?.developerInstructions || ""),
+        "Selected Resource Paper",
+      );
+      const secondTextInput = (
+        (turnInputs[1] || []) as Array<Record<string, unknown>>
+      ).find((part) => part.type === "text");
+      assert.equal(String(secondTextInput?.text || ""), "Second question.");
+      assert.notInclude(
+        String(secondTextInput?.text || ""),
+        "Zotero environment for this turn",
+      );
+      assert.equal(
+        methods.filter((method) => method === "thread/start").length,
+        1,
+      );
+      assert.equal(
+        methods.filter((method) => method === "thread/resume").length,
+        3,
+      );
+      assert.equal(
+        methods.filter((method) => method === "thread/read").length,
+        2,
+      );
+    } finally {
+      Date.now = originalDateNowForTest;
+    }
   });
 
   it("aborts native turns before model generation when required MCP tools are missing", async function () {

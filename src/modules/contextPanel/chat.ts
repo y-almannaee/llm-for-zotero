@@ -2068,7 +2068,10 @@ function formatCodexNativeDiagnosticsStatus(
     diagnostics.historyVerified === undefined
       ? ""
       : `, history ${diagnostics.historyVerified ? "verified" : "unverified"}`;
-  return `Codex app-server ${threadShort} (${source}), library ${libraryLabel}, ${mcpLabel}${historyLabel}`;
+  const lifecycleLabel = diagnostics.lifecycleState
+    ? `, ${diagnostics.lifecycleState}`
+    : "";
+  return `Codex app-server ${threadShort} (${source}), library ${libraryLabel}, ${mcpLabel}${historyLabel}${lifecycleLabel}`;
 }
 
 function buildCodexNativeSkillContext(params: {
@@ -2136,71 +2139,11 @@ function buildLightCodexNativeMcpContextPlan(params: {
     kind: Parameters<typeof setStatus>[2],
   ) => void;
 }): ContextPlanForRequest {
-  params.setStatusSafely("Using Zotero MCP tools for context", "sending");
-  const metadataLines: string[] = [];
-  const paperScopeLines = params.paperContexts.map((paper) =>
-    [
-      `itemId=${paper.itemId}`,
-      `contextItemId=${paper.contextItemId}`,
-      paper.title ? `title="${sanitizeText(paper.title)}"` : "",
-      paper.citationKey
-        ? `citationKey="${sanitizeText(paper.citationKey)}"`
-        : "",
-      paper.mineruCacheDir
-        ? `mineruCacheDir="${sanitizeText(paper.mineruCacheDir)}"`
-        : "",
-    ]
-      .filter(Boolean)
-      .join(", "),
-  );
-  if (paperScopeLines.length) {
-    metadataLines.push(
-      "Selected Zotero paper scopes:",
-      ...paperScopeLines.map((line) => `- ${line}`),
-    );
-  }
-  const fullTextScopeLines = params.fullTextPaperContexts.map((paper) =>
-    [
-      `itemId=${paper.itemId}`,
-      `contextItemId=${paper.contextItemId}`,
-      paper.title ? `title="${sanitizeText(paper.title)}"` : "",
-      paper.mineruCacheDir
-        ? `mineruCacheDir="${sanitizeText(paper.mineruCacheDir)}"`
-        : "",
-    ]
-      .filter(Boolean)
-      .join(", "),
-  );
-  if (fullTextScopeLines.length) {
-    metadataLines.push(
-      "User-marked full-text paper scopes:",
-      ...fullTextScopeLines.map((line) => `- ${line}`),
-    );
-  }
-  const collectionScopeLines = (params.selectedCollectionContexts || []).map(
-    (collection) =>
-      [
-        `collectionId=${collection.collectionId}`,
-        `libraryID=${collection.libraryID}`,
-        collection.name ? `name="${sanitizeText(collection.name)}"` : "",
-      ]
-        .filter(Boolean)
-        .join(", "),
-  );
-  if (collectionScopeLines.length) {
-    metadataLines.push(
-      "Selected Zotero collection scopes:",
-      ...collectionScopeLines.map((line) => `- ${line}`),
-    );
-  }
+  params.setStatusSafely("Using Codex native Zotero tools", "sending");
   return {
-    combinedContext: metadataLines.join("\n"),
+    combinedContext: "",
     strategy: "general-retrieval",
-    assistantInstruction: [
-      "Codex native Zotero MCP mode is active.",
-      "Use Zotero MCP tools to read library, paper, PDF, and note content when needed; do not assume full paper or active-note text was preloaded in this request.",
-      "For note creation/editing/saving requests, use edit_current_note rather than returning note-ready text in chat.",
-    ].join(" "),
+    assistantInstruction: "",
     paperContexts: params.paperContexts,
     fullTextPaperContexts: params.fullTextPaperContexts,
     citationPaperContexts: mergeCitationPaperContexts(

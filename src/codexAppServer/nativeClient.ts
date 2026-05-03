@@ -7,7 +7,13 @@ import type {
   UsageStats,
 } from "../shared/llm";
 import type { AgentConfirmationResolution } from "../agent/types";
-import type { CodexConversationKind, PaperContextRef } from "../shared/types";
+import type {
+  ChatAttachment,
+  CodexConversationKind,
+  CollectionContextRef,
+  PaperContextRef,
+  SelectedTextSource,
+} from "../shared/types";
 import {
   addZoteroMcpToolActivityObserver,
   addZoteroMcpConfirmationHandler,
@@ -50,6 +56,10 @@ import {
   resolveCodexNativeSkills,
   type CodexNativeSkillContext,
 } from "./nativeSkills";
+import {
+  buildCodexNativePriorReadContextBlock,
+  recordCodexNativeReadActivity,
+} from "./nativeContextLedger";
 import { buildNotesDirectoryConfigSection } from "../utils/notesDirectoryConfig";
 
 export const CODEX_APP_SERVER_NATIVE_PROCESS_KEY = "codex_app_server_native";
@@ -114,8 +124,20 @@ export type CodexNativeDiagnostics = {
   mcpReady: boolean;
   mcpToolNames: string[];
   skillIds: string[];
+  lifecycleState?: CodexNativeLifecycleState;
+  contextInjection?: CodexNativeContextInjection;
   historyVerified?: boolean;
 };
+
+export type CodexNativeLifecycleState =
+  | "setup-required"
+  | "resources-changed"
+  | "thin-followup";
+
+export type CodexNativeContextInjection =
+  | "full"
+  | "thin"
+  | "thin-visible-fallback";
 
 const CODEX_APP_SERVER_APPROVAL_REQUEST_METHODS = [
   "item/tool/requestUserInput",
@@ -136,11 +158,30 @@ const CODEX_APP_SERVER_NATIVE_APPROVAL_PARAMS = {
   approvalPolicy: "on-request",
   approvalsReviewer: "user",
 };
+const CODEX_NATIVE_HISTORY_VERIFICATION_TTL_MS = 5 * 60 * 1000;
 const CODEX_APP_SERVER_GUARDIAN_REVIEW_COMPLETED_METHOD =
   "item/autoApprovalReview/completed";
+const nativeHistoryVerificationState = new Map<string, number>();
+const nativeResourceLifecycleState = new Map<
+  string,
+  {
+    resourceSignature: string;
+    developerInstructionsAccepted: boolean;
+    lastSetupAt: number;
+    mcpStatus?: CodexNativeMcpSetupStatus;
+  }
+>();
 
 function normalizeNonEmptyString(value: unknown): string {
   return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+export function clearCodexNativeHistoryVerificationState(): void {
+  nativeHistoryVerificationState.clear();
+}
+
+export function clearCodexNativeResourceLifecycleState(): void {
+  nativeResourceLifecycleState.clear();
 }
 
 function serializeApprovalPayload(value: unknown): string {
@@ -155,6 +196,232 @@ function normalizeRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function normalizePositiveInt(value: unknown): number | undefined {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function lifecycleKey(params: {
+  profileSignature?: string;
+  conversationKey: number;
+  threadId: string;
+}): string {
+  return [
+    normalizeNonEmptyString(params.profileSignature) || "default-profile",
+    normalizePositiveInt(params.conversationKey) || 0,
+    normalizeNonEmptyString(params.threadId),
+  ].join(":");
+}
+
+function normalizePaperResource(
+  paper: PaperContextRef | undefined,
+): Record<string, unknown> | null {
+  if (!paper) return null;
+  return {
+    itemId: normalizePositiveInt(paper.itemId) || 0,
+    contextItemId: normalizePositiveInt(paper.contextItemId) || 0,
+    mineruCacheDir: normalizeNonEmptyString(paper.mineruCacheDir),
+  };
+}
+
+function sortResourceRecords<T extends Record<string, unknown>>(
+  records: T[],
+): T[] {
+  return [...records].sort((a, b) =>
+    JSON.stringify(a).localeCompare(JSON.stringify(b)),
+  );
+}
+
+function normalizePaperResourceList(
+  papers: PaperContextRef[] | undefined,
+): Record<string, unknown>[] {
+  return sortResourceRecords(
+    (Array.isArray(papers) ? papers : [])
+      .map(normalizePaperResource)
+      .filter((paper): paper is Record<string, unknown> => Boolean(paper)),
+  );
+}
+
+function normalizeCollectionResourceList(
+  collections: CollectionContextRef[] | undefined,
+): Record<string, unknown>[] {
+  return sortResourceRecords(
+    (Array.isArray(collections) ? collections : []).map((collection) => ({
+      collectionId: normalizePositiveInt(collection.collectionId) || 0,
+      libraryID: normalizePositiveInt(collection.libraryID) || 0,
+      name: normalizeNonEmptyString(collection.name),
+    })),
+  );
+}
+
+function normalizeAttachmentResourceList(
+  attachments: ChatAttachment[] | undefined,
+): Record<string, unknown>[] {
+  return sortResourceRecords(
+    (Array.isArray(attachments) ? attachments : []).map((attachment) => ({
+      id: normalizeNonEmptyString(attachment.id),
+      name: normalizeNonEmptyString(attachment.name),
+      category: normalizeNonEmptyString(attachment.category),
+      mimeType: normalizeNonEmptyString(attachment.mimeType),
+      contentHash: normalizeNonEmptyString(attachment.contentHash),
+      storedPath: normalizeNonEmptyString(attachment.storedPath),
+      sizeBytes: normalizePositiveInt(attachment.sizeBytes) || 0,
+    })),
+  );
+}
+
+function normalizeSelectedTextSources(
+  selectedTexts: string[] | undefined,
+  selectedTextSources: SelectedTextSource[] | undefined,
+): SelectedTextSource[] {
+  const texts = Array.isArray(selectedTexts) ? selectedTexts : [];
+  const sources = Array.isArray(selectedTextSources) ? selectedTextSources : [];
+  return texts.map((_, index) => sources[index] || "pdf");
+}
+
+function normalizeNonModelSelectedTextResources(
+  skillContext: CodexNativeSkillContext | undefined,
+): Record<string, unknown>[] {
+  const selectedTexts = Array.isArray(skillContext?.selectedTexts)
+    ? skillContext.selectedTexts
+    : [];
+  if (!selectedTexts.length) return [];
+  const sources = normalizeSelectedTextSources(
+    selectedTexts,
+    skillContext?.selectedTextSources,
+  );
+  return selectedTexts
+    .map((text, index) => ({
+      source: sources[index],
+      text,
+      paper: normalizePaperResource(
+        skillContext?.selectedTextPaperContexts?.[index],
+      ),
+    }))
+    .filter((entry) => entry.source !== "model")
+    .map((entry) => ({
+      source: entry.source,
+      textHash: hashString(normalizeNonEmptyString(entry.text)),
+      textLength: normalizeNonEmptyString(entry.text).length,
+      paper: entry.paper,
+    }));
+}
+
+function buildCodexNativeResourceSignature(params: {
+  scope: CodexNativeConversationScope;
+  profileSignature: string;
+  skillContext?: CodexNativeSkillContext;
+}): string {
+  const { scope, skillContext } = params;
+  return JSON.stringify({
+    scope: {
+      profileSignature: params.profileSignature,
+      conversationKey: normalizePositiveInt(scope.conversationKey) || 0,
+      libraryID: normalizePositiveInt(scope.libraryID) || 0,
+      kind: scope.kind,
+      paperItemID: normalizePositiveInt(scope.paperItemID) || 0,
+      activeItemId: normalizePositiveInt(scope.activeItemId) || 0,
+      activeContextItemId: normalizePositiveInt(scope.activeContextItemId) || 0,
+      activeNoteId: normalizePositiveInt(scope.activeNoteId) || 0,
+      activeNoteKind: normalizeNonEmptyString(scope.activeNoteKind),
+      activeNoteParentItemId:
+        normalizePositiveInt(scope.activeNoteParentItemId) || 0,
+      paperContext: normalizePaperResource(scope.paperContext),
+    },
+    resources: {
+      selectedPapers: normalizePaperResourceList(
+        skillContext?.selectedPaperContexts,
+      ),
+      fullTextPapers: normalizePaperResourceList(
+        skillContext?.fullTextPaperContexts,
+      ),
+      collections: normalizeCollectionResourceList(
+        skillContext?.selectedCollectionContexts,
+      ),
+      selectedTexts: normalizeNonModelSelectedTextResources(skillContext),
+      screenshots: (skillContext?.screenshots || [])
+        .map((screenshot) => hashString(normalizeNonEmptyString(screenshot)))
+        .sort(),
+      attachments: normalizeAttachmentResourceList(skillContext?.attachments),
+    },
+  });
+}
+
+function getLifecycleEntry(params: {
+  profileSignature: string;
+  conversationKey: number;
+  threadId?: string;
+}):
+  | {
+      resourceSignature: string;
+      developerInstructionsAccepted: boolean;
+      lastSetupAt: number;
+      mcpStatus?: CodexNativeMcpSetupStatus;
+    }
+  | undefined {
+  const threadId = normalizeNonEmptyString(params.threadId);
+  if (!threadId) return undefined;
+  return nativeResourceLifecycleState.get(
+    lifecycleKey({
+      profileSignature: params.profileSignature,
+      conversationKey: params.conversationKey,
+      threadId,
+    }),
+  );
+}
+
+function resolveCodexNativeLifecycleState(params: {
+  storedThreadId?: string;
+  lifecycleEntry?: { resourceSignature: string };
+  resourceSignature: string;
+  forcedSkillIds?: string[];
+}): CodexNativeLifecycleState {
+  if (!normalizeNonEmptyString(params.storedThreadId)) return "setup-required";
+  if (Array.isArray(params.forcedSkillIds) && params.forcedSkillIds.length) {
+    return "resources-changed";
+  }
+  if (!params.lifecycleEntry) return "setup-required";
+  if (params.lifecycleEntry.resourceSignature !== params.resourceSignature) {
+    return "resources-changed";
+  }
+  return "thin-followup";
+}
+
+function recordCodexNativeLifecycleSetup(params: {
+  profileSignature: string;
+  conversationKey: number;
+  threadId: string;
+  resourceSignature: string;
+  developerInstructionsAccepted: boolean;
+  mcpStatus?: CodexNativeMcpSetupStatus;
+}): void {
+  const threadId = normalizeNonEmptyString(params.threadId);
+  if (!threadId) return;
+  nativeResourceLifecycleState.set(
+    lifecycleKey({
+      profileSignature: params.profileSignature,
+      conversationKey: params.conversationKey,
+      threadId,
+    }),
+    {
+      resourceSignature: params.resourceSignature,
+      developerInstructionsAccepted: params.developerInstructionsAccepted,
+      lastSetupAt: Date.now(),
+      mcpStatus: params.mcpStatus,
+    },
+  );
 }
 
 function isCodexAppServerApprovalRequestMethod(method: string): boolean {
@@ -529,12 +796,116 @@ function formatPaperContextLine(
   return `- Active paper context: ${pieces.join(", ")}`;
 }
 
+function formatPaperResourceLine(paper: PaperContextRef): string {
+  const pieces = [
+    `itemId=${paper.itemId}`,
+    `contextItemId=${paper.contextItemId}`,
+  ];
+  if (paper.title) pieces.push(`title="${paper.title}"`);
+  if (paper.citationKey) pieces.push(`citationKey="${paper.citationKey}"`);
+  if (paper.mineruCacheDir) {
+    pieces.push(`mineruCacheDir="${paper.mineruCacheDir}"`);
+  }
+  return `- ${pieces.join(", ")}`;
+}
+
+function buildSelectedTextResourceLine(params: {
+  selectedTexts?: string[];
+  selectedTextSources?: SelectedTextSource[];
+}): string | null {
+  const selectedTexts = Array.isArray(params.selectedTexts)
+    ? params.selectedTexts
+    : [];
+  if (!selectedTexts.length) return null;
+  const sources = normalizeSelectedTextSources(
+    selectedTexts,
+    params.selectedTextSources,
+  ).filter((source) => source !== "model");
+  if (!sources.length) return null;
+  const counts = new Map<string, number>();
+  for (const source of sources)
+    counts.set(source, (counts.get(source) || 0) + 1);
+  const sourceLabel = Array.from(counts.entries())
+    .map(([source, count]) => `${source}:${count}`)
+    .join(", ");
+  return `- Selected non-model text contexts: ${sources.length} (${sourceLabel})`;
+}
+
+function buildCodexNativeResourceContextBlock(
+  skillContext: CodexNativeSkillContext | undefined,
+): string {
+  if (!skillContext) return "";
+  const lines: string[] = [];
+  const selectedPapers = skillContext.selectedPaperContexts || [];
+  if (selectedPapers.length) {
+    lines.push(
+      "Selected Zotero paper resources available this turn:",
+      ...selectedPapers.map(formatPaperResourceLine),
+    );
+  }
+  const fullTextPapers = skillContext.fullTextPaperContexts || [];
+  if (fullTextPapers.length) {
+    lines.push(
+      "User-marked full-text paper resources available this turn:",
+      ...fullTextPapers.map(formatPaperResourceLine),
+    );
+  }
+  const collections = skillContext.selectedCollectionContexts || [];
+  if (collections.length) {
+    lines.push(
+      "Selected Zotero collection resources available this turn:",
+      ...collections.map((collection) =>
+        [
+          `- collectionId=${collection.collectionId}`,
+          `libraryID=${collection.libraryID}`,
+          collection.name ? `name="${collection.name}"` : "",
+        ]
+          .filter(Boolean)
+          .join(", "),
+      ),
+    );
+  }
+  const selectedTextLine = buildSelectedTextResourceLine({
+    selectedTexts: skillContext.selectedTexts,
+    selectedTextSources: skillContext.selectedTextSources,
+  });
+  if (selectedTextLine) {
+    lines.push(
+      "Selected text resources available this turn:",
+      selectedTextLine,
+    );
+  }
+  if (skillContext.screenshots?.length) {
+    lines.push(`- Screenshots attached: ${skillContext.screenshots.length}`);
+  }
+  if (skillContext.attachments?.length) {
+    lines.push(
+      "File resources attached this turn:",
+      ...skillContext.attachments.map((attachment) =>
+        [
+          `- name="${attachment.name}"`,
+          `category=${attachment.category}`,
+          attachment.mimeType ? `mimeType=${attachment.mimeType}` : "",
+          attachment.sizeBytes ? `sizeBytes=${attachment.sizeBytes}` : "",
+        ]
+          .filter(Boolean)
+          .join(", "),
+      ),
+    );
+  }
+  return lines.length
+    ? ["Additional Zotero/user resources for this turn:", ...lines].join("\n")
+    : "";
+}
+
 function buildZoteroEnvironmentManifest(params: {
   scope: CodexNativeConversationScope;
   mcpEnabled: boolean;
   mcpReady: boolean;
   mcpWarning?: string;
   skillInstructionBlock?: string;
+  priorReadContextBlock?: string;
+  resourceContextBlock?: string;
 }): string {
   const { scope } = params;
   const notesDirectoryConfig = buildNotesDirectoryConfigSection();
@@ -608,6 +979,7 @@ function buildZoteroEnvironmentManifest(params: {
     "- Zotero MCP tools: available. Use them to inspect and update Zotero data instead of assuming library or paper content is preloaded.",
     "- Critical: use only Zotero MCP tools for Zotero library, profile, item, PDF, and note data. If Zotero MCP tools are unavailable or fail, report the setup error. Do not inspect local Zotero profile folders, zotero.sqlite, WAL files, backups, or other filesystem copies to answer Zotero-library questions.",
     "- Codex built-in shell access is disabled. Use Zotero MCP tools such as run_command, file_io, and zotero_script only when needed.",
+    "- Context reuse: if prior Zotero, PDF, or MinerU content already inspected in this Codex thread is sufficient, answer directly from that thread context without rereading. Reread only when the user asks about a new paper, section, figure, page, exact quote/evidence, or when the prior context is missing, stale, or uncertain.",
     "- Write workflow: use focused Zotero MCP write tools for requested changes. For Zotero note creation or editing, call edit_current_note; do not output note-ready text in chat as a substitute.",
     "- Note workflow: for note creation, saving, editing, appending, updating, or rewriting requests in any language, use edit_current_note. Do not rediscover the active note before editing it, and do not dump note-ready text in chat instead of applying the requested note change.",
     "- Active-note workflow: when an active note ID is listed, edit_current_note can edit that note directly. Use the listed active note ID/scope as the target unless the user explicitly names a different note.",
@@ -625,6 +997,8 @@ function buildZoteroEnvironmentManifest(params: {
   return [
     lines.join("\n"),
     notesDirectoryConfig,
+    params.resourceContextBlock || "",
+    params.priorReadContextBlock || "",
     params.skillInstructionBlock || "",
   ]
     .filter(Boolean)
@@ -705,6 +1079,22 @@ function buildNativeMessages(params: {
       content: prefixUserContentWithContext(latestUser.content, systemText),
     },
   ];
+}
+
+function buildThinVisibleFallbackContext(params: {
+  mcpEnabled: boolean;
+}): string {
+  if (!params.mcpEnabled) {
+    return [
+      "This is a continued Codex native Zotero thread.",
+      "Zotero MCP tools are disabled for this turn; answer from existing thread context unless another available tool source is sufficient.",
+    ].join("\n");
+  }
+  return [
+    "This is a continued Codex native Zotero thread with the same Zotero resources as before.",
+    "Zotero MCP tools remain available if needed for new evidence, exact quotes/pages/figures, or Zotero note/library changes.",
+    "For Zotero note or library changes, use the appropriate Zotero MCP write tool instead of returning note-ready text as a substitute.",
+  ].join("\n");
 }
 
 async function loadStoredProviderSessionId(params: {
@@ -861,13 +1251,18 @@ async function resolveNativeThread(params: {
   model: string;
   effort?: string;
   developerInstructions?: string;
+  newThreadDeveloperInstructions?: string;
   config?: Record<string, unknown>;
   hooks?: CodexNativeStoreHooks;
+  storedThreadId?: string | null;
 }): Promise<NativeThreadResolution> {
-  const storedThreadId = await loadStoredProviderSessionId({
-    conversationKey: params.scope.conversationKey,
-    hooks: params.hooks,
-  });
+  const storedThreadId =
+    params.storedThreadId !== undefined
+      ? normalizeNonEmptyString(params.storedThreadId)
+      : await loadStoredProviderSessionId({
+          conversationKey: params.scope.conversationKey,
+          hooks: params.hooks,
+        });
   if (storedThreadId) {
     try {
       const resumedThread = await resumeNativeThread({
@@ -898,7 +1293,8 @@ async function resolveNativeThread(params: {
   const thread = await startNativeThread({
     proc: params.proc,
     model: params.model,
-    developerInstructions: params.developerInstructions,
+    developerInstructions:
+      params.newThreadDeveloperInstructions ?? params.developerInstructions,
     config: params.config,
   });
   await persistProviderSessionId({
@@ -1078,6 +1474,28 @@ async function verifyCodexAppServerThreadHistory(params: {
   }
 }
 
+async function verifyCodexAppServerThreadHistoryIfDue(params: {
+  proc: CodexAppServerProcess;
+  threadId: string;
+}): Promise<boolean | undefined> {
+  const threadId = normalizeNonEmptyString(params.threadId);
+  if (!threadId) return undefined;
+  const now = Date.now();
+  const lastVerifiedAt = nativeHistoryVerificationState.get(threadId);
+  if (
+    lastVerifiedAt !== undefined &&
+    now - lastVerifiedAt < CODEX_NATIVE_HISTORY_VERIFICATION_TTL_MS
+  ) {
+    return undefined;
+  }
+  const verified = await verifyCodexAppServerThreadHistory({
+    proc: params.proc,
+    threadId,
+  });
+  nativeHistoryVerificationState.set(threadId, now);
+  return verified;
+}
+
 function buildNativeDiagnostics(params: {
   thread: NativeThreadResolution;
   profileSignature: string;
@@ -1086,6 +1504,8 @@ function buildNativeDiagnostics(params: {
   mcpReady: boolean;
   mcpStatus?: CodexNativeMcpSetupStatus;
   skillIds?: string[];
+  lifecycleState?: CodexNativeLifecycleState;
+  contextInjection?: CodexNativeContextInjection;
   historyVerified?: boolean;
 }): CodexNativeDiagnostics {
   return {
@@ -1098,6 +1518,8 @@ function buildNativeDiagnostics(params: {
     mcpReady: params.mcpReady,
     mcpToolNames: params.mcpStatus?.toolNames || [],
     skillIds: params.skillIds || [],
+    lifecycleState: params.lifecycleState,
+    contextInjection: params.contextInjection,
     historyVerified: params.historyVerified,
   };
 }
@@ -1145,21 +1567,30 @@ export async function runCodexAppServerNativeTurn(params: {
       normalizeNonEmptyString(params.scope.profileSignature) ||
       getCodexProfileSignature();
     const latestUserText = extractLatestUserText(params.messages);
-    const resolvedSkills = await resolveCodexNativeSkills({
-      scope: { ...params.scope, profileSignature },
-      userText: latestUserText,
-      model: params.model,
-      apiBase: params.codexPath,
-      signal: params.signal,
+    const storedThreadId = await loadStoredProviderSessionId({
+      conversationKey: params.scope.conversationKey,
+      hooks: params.hooks,
+    });
+    const scopeWithProfile = { ...params.scope, profileSignature };
+    const resourceSignature = buildCodexNativeResourceSignature({
+      scope: scopeWithProfile,
+      profileSignature,
       skillContext: params.skillContext,
     });
-    for (const skillId of resolvedSkills.matchedSkillIds) {
-      params.onSkillActivated?.(skillId);
-    }
+    const lifecycleEntry = getLifecycleEntry({
+      profileSignature,
+      conversationKey: params.scope.conversationKey,
+      threadId: storedThreadId,
+    });
+    let lifecycleState = resolveCodexNativeLifecycleState({
+      storedThreadId,
+      lifecycleEntry,
+      resourceSignature,
+      forcedSkillIds: params.skillContext?.forcedSkillIds,
+    });
     const scopedMcp = mcpEnabled
       ? registerScopedZoteroMcpScope({
-          ...params.scope,
-          profileSignature,
+          ...scopeWithProfile,
           userText: latestUserText,
         })
       : null;
@@ -1202,20 +1633,229 @@ export async function runCodexAppServerNativeTurn(params: {
         params.reasoning,
         params.model,
       );
+      let setupStoredThreadId = storedThreadId;
+      const executePreparedThread = async (args: {
+        thread: NativeThreadResolution;
+        input: unknown;
+        skillIds: string[];
+        lifecycleState: CodexNativeLifecycleState;
+        contextInjection: CodexNativeContextInjection;
+      }): Promise<CodexNativeTurnResult> => {
+        unregisterGuardianReviews = registerNativeGuardianReviewHandlers({
+          proc,
+          threadId: args.thread.threadId,
+        });
+        params.onDiagnostics?.(
+          buildNativeDiagnostics({
+            thread: args.thread,
+            profileSignature,
+            scope: params.scope,
+            mcpServerName: mcpThreadConfig?.serverName,
+            mcpReady,
+            mcpStatus,
+            skillIds: args.skillIds,
+            lifecycleState: args.lifecycleState,
+            contextInjection: args.contextInjection,
+          }),
+        );
+        const unregisterMcpToolActivity = addZoteroMcpToolActivityObserver(
+          (event) => {
+            const sameConversation =
+              !event.conversationKey ||
+              !params.scope.conversationKey ||
+              event.conversationKey === params.scope.conversationKey;
+            const sameProfile =
+              !event.profileSignature ||
+              !profileSignature ||
+              event.profileSignature === profileSignature;
+            if (!sameConversation || !sameProfile) return;
+            recordCodexNativeReadActivity({
+              threadId: args.thread.threadId,
+              scope: scopeWithProfile,
+              event,
+            });
+            params.onMcpToolActivity?.(event);
+          },
+        );
+        let text = "";
+        try {
+          const turnResult = await proc.sendRequest("turn/start", {
+            threadId: args.thread.threadId,
+            input: args.input,
+            model: params.model,
+            ...CODEX_APP_SERVER_NATIVE_APPROVAL_PARAMS,
+            ...reasoningParams,
+          });
+          const turnId = extractCodexAppServerTurnId(turnResult);
+          if (!turnId) {
+            throw new Error("Codex app-server did not return a turn ID");
+          }
+          text = await waitForCodexAppServerTurnCompletion({
+            proc,
+            threadId: args.thread.threadId,
+            turnId,
+            onTextDelta: params.onDelta,
+            onAgentMessageDelta: params.onAgentMessageDelta,
+            onReasoning: params.onReasoning,
+            onUsage: params.onUsage,
+            onItemStarted: params.onItemStarted,
+            onItemCompleted: params.onItemCompleted,
+            onTurnCompleted: params.onTurnCompleted,
+            signal: params.signal,
+            interruptOnAbort: true,
+            cacheKey: processKey,
+            processOptions: { codexPath },
+          });
+        } finally {
+          unregisterMcpToolActivity();
+        }
+        const historyVerified = await verifyCodexAppServerThreadHistoryIfDue({
+          proc,
+          threadId: args.thread.threadId,
+        });
+        const diagnostics = buildNativeDiagnostics({
+          thread: args.thread,
+          profileSignature,
+          scope: params.scope,
+          mcpServerName: mcpThreadConfig?.serverName,
+          mcpReady,
+          mcpStatus,
+          skillIds: args.skillIds,
+          lifecycleState: args.lifecycleState,
+          contextInjection: args.contextInjection,
+          historyVerified,
+        });
+        params.onDiagnostics?.(diagnostics);
+        return {
+          text,
+          threadId: args.thread.threadId,
+          resumed: args.thread.resumed,
+          diagnostics,
+        };
+      };
+
+      if (lifecycleState === "thin-followup" && storedThreadId) {
+        mcpStatus = lifecycleEntry?.mcpStatus;
+        mcpReady = !mcpEnabled || Boolean(lifecycleEntry);
+        const contextInjection: CodexNativeContextInjection =
+          lifecycleEntry?.developerInstructionsAccepted === false
+            ? "thin-visible-fallback"
+            : "thin";
+        try {
+          const resumedThread = await resumeNativeThread({
+            proc,
+            threadId: storedThreadId,
+            model: params.model,
+            config: threadConfig,
+          });
+          if (resumedThread.threadId !== storedThreadId) {
+            setupStoredThreadId = resumedThread.threadId;
+            await persistProviderSessionId({
+              scope: scopeWithProfile,
+              threadId: resumedThread.threadId,
+              model: params.model,
+              effort: reasoningParams.effort,
+              hooks: params.hooks,
+            });
+            throw new Error("Codex app-server returned a different thread ID");
+          }
+          const thread: NativeThreadResolution = {
+            ...resumedThread,
+            resumed: true,
+            developerInstructionsAccepted:
+              lifecycleEntry?.developerInstructionsAccepted ??
+              resumedThread.developerInstructionsAccepted,
+          };
+          const thinNativeMessages = buildNativeMessages({
+            messages: params.messages,
+            includeVisibleHistory: false,
+            zoteroEnvironmentText:
+              contextInjection === "thin-visible-fallback"
+                ? buildThinVisibleFallbackContext({ mcpEnabled })
+                : "",
+            prefixLatestUserWithContext:
+              contextInjection === "thin-visible-fallback",
+          });
+          const preparedTurn =
+            await prepareCodexAppServerChatTurn(thinNativeMessages);
+          const input = await resolveCodexAppServerTurnInputWithFallback({
+            proc,
+            threadId: thread.threadId,
+            historyItemsToInject: [],
+            turnInput: preparedTurn.turnInput,
+            legacyInputFactory: () =>
+              buildLegacyCodexAppServerChatInput(thinNativeMessages),
+            logContext: "native",
+          });
+          return await executePreparedThread({
+            thread,
+            input,
+            skillIds: [],
+            lifecycleState,
+            contextInjection,
+          });
+        } catch (error) {
+          ztoolkit.log(
+            "Codex app-server native: thin resume failed; refreshing native setup",
+            error,
+          );
+          lifecycleState = "setup-required";
+        }
+      }
+
+      const priorReadContextBlock = buildCodexNativePriorReadContextBlock({
+        profileSignature,
+        conversationKey: params.scope.conversationKey,
+        threadId: setupStoredThreadId,
+      });
+      const resolvedSkills = await resolveCodexNativeSkills({
+        scope: scopeWithProfile,
+        userText: latestUserText,
+        model: params.model,
+        apiBase: params.codexPath,
+        signal: params.signal,
+        skillContext: params.skillContext,
+      });
+      for (const skillId of resolvedSkills.matchedSkillIds) {
+        params.onSkillActivated?.(skillId);
+      }
+      const resourceContextBlock = buildCodexNativeResourceContextBlock(
+        params.skillContext,
+      );
       const optimisticMcpReady = mcpEnabled;
       const plainNativeMessages = buildNativeMessages({
         messages: params.messages,
         includeVisibleHistory: true,
         zoteroEnvironmentText: buildZoteroEnvironmentManifest({
-          scope: { ...params.scope, profileSignature },
+          scope: scopeWithProfile,
           mcpEnabled,
           mcpReady: optimisticMcpReady,
           mcpWarning,
           skillInstructionBlock: resolvedSkills.instructionBlock,
+          priorReadContextBlock,
+          resourceContextBlock,
         }),
       });
       const plainPreparedTurn =
         await prepareCodexAppServerChatTurn(plainNativeMessages);
+      const newThreadNativeMessages = priorReadContextBlock
+        ? buildNativeMessages({
+            messages: params.messages,
+            includeVisibleHistory: true,
+            zoteroEnvironmentText: buildZoteroEnvironmentManifest({
+              scope: scopeWithProfile,
+              mcpEnabled,
+              mcpReady: optimisticMcpReady,
+              mcpWarning,
+              skillInstructionBlock: resolvedSkills.instructionBlock,
+              resourceContextBlock,
+            }),
+          })
+        : plainNativeMessages;
+      const newThreadPreparedTurn =
+        newThreadNativeMessages === plainNativeMessages
+          ? plainPreparedTurn
+          : await prepareCodexAppServerChatTurn(newThreadNativeMessages);
       if (mcpEnabled && mcpThreadConfig && scopedMcp) {
         try {
           mcpStatus = await preflightCodexZoteroMcpServer({
@@ -1240,13 +1880,19 @@ export async function runCodexAppServerNativeTurn(params: {
       }
       const thread = await resolveNativeThread({
         proc,
-        scope: { ...params.scope, profileSignature },
+        scope: scopeWithProfile,
         model: params.model,
         effort: reasoningParams.effort,
         developerInstructions: plainPreparedTurn.developerInstructions,
+        newThreadDeveloperInstructions:
+          newThreadPreparedTurn.developerInstructions,
         config: threadConfig,
         hooks: params.hooks,
+        storedThreadId: setupStoredThreadId || null,
       });
+      const effectiveLifecycleState: CodexNativeLifecycleState = thread.resumed
+        ? lifecycleState
+        : "setup-required";
       if (!thread.resumed) {
         await setNativeThreadName({
           proc,
@@ -1254,35 +1900,49 @@ export async function runCodexAppServerNativeTurn(params: {
           name: params.scope.title,
         });
       }
-      unregisterGuardianReviews = registerNativeGuardianReviewHandlers({
-        proc,
+      recordCodexNativeLifecycleSetup({
+        profileSignature,
+        conversationKey: params.scope.conversationKey,
         threadId: thread.threadId,
+        resourceSignature,
+        developerInstructionsAccepted: thread.developerInstructionsAccepted,
+        mcpStatus,
       });
-      params.onDiagnostics?.(
-        buildNativeDiagnostics({
-          thread,
-          profileSignature,
-          scope: params.scope,
-          mcpServerName: mcpThreadConfig?.serverName,
-          mcpReady,
-          mcpStatus,
-          skillIds: resolvedSkills.matchedSkillIds,
-        }),
-      );
-      const nativeMessages = buildNativeMessages({
+      const nativeMessagesWithPriorContext = buildNativeMessages({
         messages: params.messages,
         includeVisibleHistory: true,
         zoteroEnvironmentText: buildZoteroEnvironmentManifest({
-          scope: { ...params.scope, profileSignature },
+          scope: scopeWithProfile,
           mcpEnabled,
           mcpReady,
           mcpWarning,
           skillInstructionBlock: resolvedSkills.instructionBlock,
+          priorReadContextBlock,
+          resourceContextBlock,
         }),
         prefixLatestUserWithContext: !thread.developerInstructionsAccepted,
       });
+      const nativeMessages =
+        !thread.resumed && priorReadContextBlock
+          ? buildNativeMessages({
+              messages: params.messages,
+              includeVisibleHistory: true,
+              zoteroEnvironmentText: buildZoteroEnvironmentManifest({
+                scope: scopeWithProfile,
+                mcpEnabled,
+                mcpReady,
+                mcpWarning,
+                skillInstructionBlock: resolvedSkills.instructionBlock,
+                resourceContextBlock,
+              }),
+              prefixLatestUserWithContext:
+                !thread.developerInstructionsAccepted,
+            })
+          : nativeMessagesWithPriorContext;
       const preparedTurn = thread.developerInstructionsAccepted
-        ? plainPreparedTurn
+        ? thread.resumed || !priorReadContextBlock
+          ? plainPreparedTurn
+          : newThreadPreparedTurn
         : await prepareCodexAppServerChatTurn(nativeMessages);
       const input = await resolveCodexAppServerTurnInputWithFallback({
         proc,
@@ -1295,73 +1955,13 @@ export async function runCodexAppServerNativeTurn(params: {
           buildLegacyCodexAppServerChatInput(nativeMessages),
         logContext: "native",
       });
-      const unregisterMcpToolActivity = params.onMcpToolActivity
-        ? addZoteroMcpToolActivityObserver((event) => {
-            const sameConversation =
-              !event.conversationKey ||
-              !params.scope.conversationKey ||
-              event.conversationKey === params.scope.conversationKey;
-            const sameProfile =
-              !event.profileSignature ||
-              !profileSignature ||
-              event.profileSignature === profileSignature;
-            if (!sameConversation || !sameProfile) return;
-            params.onMcpToolActivity?.(event);
-          })
-        : () => undefined;
-      let text = "";
-      try {
-        const turnResult = await proc.sendRequest("turn/start", {
-          threadId: thread.threadId,
-          input,
-          model: params.model,
-          ...CODEX_APP_SERVER_NATIVE_APPROVAL_PARAMS,
-          ...reasoningParams,
-        });
-        const turnId = extractCodexAppServerTurnId(turnResult);
-        if (!turnId) {
-          throw new Error("Codex app-server did not return a turn ID");
-        }
-        text = await waitForCodexAppServerTurnCompletion({
-          proc,
-          threadId: thread.threadId,
-          turnId,
-          onTextDelta: params.onDelta,
-          onAgentMessageDelta: params.onAgentMessageDelta,
-          onReasoning: params.onReasoning,
-          onUsage: params.onUsage,
-          onItemStarted: params.onItemStarted,
-          onItemCompleted: params.onItemCompleted,
-          onTurnCompleted: params.onTurnCompleted,
-          signal: params.signal,
-          interruptOnAbort: true,
-          cacheKey: processKey,
-          processOptions: { codexPath },
-        });
-      } finally {
-        unregisterMcpToolActivity();
-      }
-      const historyVerified = await verifyCodexAppServerThreadHistory({
-        proc,
-        threadId: thread.threadId,
-      });
-      const diagnostics = buildNativeDiagnostics({
+      return await executePreparedThread({
         thread,
-        profileSignature,
-        scope: params.scope,
-        mcpServerName: mcpThreadConfig?.serverName,
-        mcpReady,
-        mcpStatus,
+        input,
         skillIds: resolvedSkills.matchedSkillIds,
-        historyVerified,
+        lifecycleState: effectiveLifecycleState,
+        contextInjection: "full",
       });
-      params.onDiagnostics?.(diagnostics);
-      return {
-        text,
-        threadId: thread.threadId,
-        resumed: thread.resumed,
-        diagnostics,
-      };
     } finally {
       unregisterGuardianReviews();
       scopedMcp?.clear();
