@@ -3,6 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AgentRuntime } from "../src/agent/runtime";
+import {
+  clearAgentReadLedger,
+  clearAgentResourceLifecycleState,
+} from "../src/agent/context/resourceLifecycle";
 import { getAgentRunTrace } from "../src/agent/store/traceStore";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import {
@@ -121,6 +125,11 @@ class MockAdapter implements AgentModelAdapter {
 }
 
 describe("AgentRuntime", function () {
+  beforeEach(function () {
+    clearAgentResourceLifecycleState();
+    clearAgentReadLedger();
+  });
+
   it("falls back when the adapter does not support tools", async function () {
     const restoreDb = installMockDb();
     try {
@@ -1362,6 +1371,356 @@ describe("AgentRuntime", function () {
           },
         ],
       );
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("emits resource lifecycle events and advances state only after completed runs", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const request: AgentRuntimeRequest = {
+        conversationKey: 501,
+        mode: "agent",
+        userText: "summarize this paper",
+        activeItemId: 1,
+        libraryID: 1,
+        selectedPaperContexts: [
+          {
+            itemId: 1,
+            contextItemId: 10,
+            title: "Lifecycle Paper",
+          },
+        ],
+        model: "gpt-5.4",
+      };
+
+      const firstRuntime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "final",
+                text: "First answer.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "First answer.",
+                },
+              },
+            ],
+            {
+              streaming: false,
+              toolCalls: true,
+              multimodal: false,
+              fileInputs: false,
+              reasoning: true,
+            },
+          ),
+      });
+      const firstEvents: AgentEvent[] = [];
+      await firstRuntime.runTurn({
+        request,
+        onEvent: (event) => {
+          firstEvents.push(event);
+        },
+      });
+      const firstLifecycleEvent = firstEvents.find(
+        (event) =>
+          event.type === "provider_event" &&
+          event.providerType === "agent_resource_lifecycle",
+      );
+      assert.deepInclude(
+        firstLifecycleEvent?.type === "provider_event"
+          ? firstLifecycleEvent.payload
+          : {},
+        {
+          lifecycleState: "setup-required",
+          contextInjection: "full",
+        },
+      );
+
+      let secondInitialUserMessage = "";
+      const secondRuntime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            const userMessage = params.messages.findLast(
+              (message) => message.role === "user",
+            );
+            secondInitialUserMessage =
+              typeof userMessage?.content === "string"
+                ? userMessage.content
+                : "";
+            return {
+              kind: "final",
+              text: "Second answer.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Second answer.",
+              },
+            };
+          },
+        }),
+      });
+      const secondEvents: AgentEvent[] = [];
+      await secondRuntime.runTurn({
+        request: {
+          ...request,
+          userText: "what about the methods?",
+        },
+        onEvent: (event) => {
+          secondEvents.push(event);
+        },
+      });
+      const secondLifecycleEvent = secondEvents.find(
+        (event) =>
+          event.type === "provider_event" &&
+          event.providerType === "agent_resource_lifecycle",
+      );
+      assert.deepInclude(
+        secondLifecycleEvent?.type === "provider_event"
+          ? secondLifecycleEvent.payload
+          : {},
+        {
+          lifecycleState: "thin-followup",
+          contextInjection: "thin",
+        },
+      );
+      assert.include(secondInitialUserMessage, "same Zotero resources");
+
+      const failingRuntime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "tool_calls",
+                calls: [],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [],
+                },
+              },
+            ],
+            {
+              streaming: false,
+              toolCalls: true,
+              multimodal: false,
+              fileInputs: false,
+              reasoning: true,
+            },
+          ),
+      });
+      const failedEvents: AgentEvent[] = [];
+      await failingRuntime.runTurn({
+        request: {
+          ...request,
+          conversationKey: 777,
+          userText: "this will fail",
+        },
+        onEvent: (event) => {
+          failedEvents.push(event);
+        },
+      });
+      const retryRuntime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "final",
+                text: "Retry answer.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Retry answer.",
+                },
+              },
+            ],
+            {
+              streaming: false,
+              toolCalls: true,
+              multimodal: false,
+              fileInputs: false,
+              reasoning: true,
+            },
+          ),
+      });
+      const retryEvents: AgentEvent[] = [];
+      await retryRuntime.runTurn({
+        request: {
+          ...request,
+          conversationKey: 777,
+          userText: "retry",
+        },
+        onEvent: (event) => {
+          retryEvents.push(event);
+        },
+      });
+      const retryLifecycleEvent = retryEvents.find(
+        (event) =>
+          event.type === "provider_event" &&
+          event.providerType === "agent_resource_lifecycle",
+      );
+      assert.deepInclude(
+        retryLifecycleEvent?.type === "provider_event"
+          ? retryLifecycleEvent.payload
+          : {},
+        {
+          lifecycleState: "setup-required",
+          contextInjection: "full",
+        },
+      );
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("records successful read tools as prior-read hints for later turns", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "read_paper",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        presentation: {
+          label: "Read Paper",
+        },
+        validate: (args: unknown) => ({ ok: true, value: args }),
+        execute: async () => ({ excerpt: "paper text" }),
+      });
+
+      const request: AgentRuntimeRequest = {
+        conversationKey: 601,
+        mode: "agent",
+        userText: "read the abstract",
+        activeItemId: 1,
+        libraryID: 1,
+        selectedPaperContexts: [
+          {
+            itemId: 1,
+            contextItemId: 10,
+            title: "Ledger Paper",
+          },
+        ],
+        model: "gpt-5.4",
+      };
+
+      const firstRuntime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "call-read",
+                    name: "read_paper",
+                    arguments: {
+                      target: {
+                        paperContext: request.selectedPaperContexts?.[0],
+                      },
+                      chunkIndexes: [1],
+                    },
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "call-read",
+                      name: "read_paper",
+                      arguments: {
+                        target: {
+                          paperContext: request.selectedPaperContexts?.[0],
+                        },
+                        chunkIndexes: [1],
+                      },
+                    },
+                  ],
+                },
+              },
+              {
+                kind: "final",
+                text: "Read it.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Read it.",
+                },
+              },
+            ],
+            {
+              streaming: false,
+              toolCalls: true,
+              multimodal: false,
+              fileInputs: false,
+              reasoning: true,
+            },
+          ),
+      });
+      await firstRuntime.runTurn({ request });
+
+      let secondInitialUserMessage = "";
+      const secondRuntime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            const userMessage = params.messages.findLast(
+              (message) => message.role === "user",
+            );
+            secondInitialUserMessage =
+              typeof userMessage?.content === "string"
+                ? userMessage.content
+                : "";
+            return {
+              kind: "final",
+              text: "Follow-up.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Follow-up.",
+              },
+            };
+          },
+        }),
+      });
+      await secondRuntime.runTurn({
+        request: {
+          ...request,
+          userText: "use what you read",
+        },
+      });
+
+      assert.include(
+        secondInitialUserMessage,
+        "Already inspected in this agent conversation:",
+      );
+      assert.include(secondInitialUserMessage, "Read Paper");
+      assert.include(secondInitialUserMessage, "Ledger Paper");
+      assert.include(secondInitialUserMessage, "chunks=1");
     } finally {
       restoreDb();
     }

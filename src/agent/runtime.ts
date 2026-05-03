@@ -29,6 +29,12 @@ import { buildAgentInitialMessages } from "./model/messageBuilder";
 import { detectSkillIntent } from "./model/skillClassifier";
 import { getAllSkills, getMatchedSkillIds } from "./skills";
 import {
+  buildAgentResourceContextPlan,
+  commitAgentReadActivities,
+  commitAgentResourceContextPlan,
+  type AgentPendingReadActivity,
+} from "./context/resourceLifecycle";
+import {
   getNotesDirectoryNickname,
   isNotesDirectoryConfigured,
 } from "../utils/notesDirectoryConfig";
@@ -523,6 +529,7 @@ export class AgentRuntime {
       ok: boolean;
       input?: unknown;
     }> = [];
+    const pendingReadActivities: AgentPendingReadActivity[] = [];
     // Intent/skill selection runs ONCE per user turn, before the system
     // prompt is built. The flow:
     //   1. detectSkillIntent — one LLM call against the primary model,
@@ -538,10 +545,21 @@ export class AgentRuntime {
     // inside the agent loop — no per-step classification cost.
     const classifiedSkillIds = await detectSkillIntent(request, getAllSkills());
     const matchedSkills = getMatchedSkillIds(request, classifiedSkillIds);
+    const resourceContextPlan = buildAgentResourceContextPlan(request);
+    await emit({
+      type: "provider_event",
+      providerType: "agent_resource_lifecycle",
+      payload: {
+        lifecycleState: resourceContextPlan.lifecycleState,
+        contextInjection: resourceContextPlan.injection,
+        resourceDelta: resourceContextPlan.resourceDeltaCounts,
+      },
+    });
     const messages = (await buildAgentInitialMessages(
       request,
       this.registry.listToolDefinitionsForRequest(request),
       matchedSkills,
+      resourceContextPlan,
     )) as AgentModelMessage[];
 
     for (const skillId of matchedSkills) {
@@ -577,13 +595,20 @@ export class AgentRuntime {
         });
       }
       await finishAgentRun(runId, status, finalText);
-      if (status === "completed" && finalText) {
-        await recordAgentTurn(
-          request.conversationKey,
-          request.userText,
-          toolsUsedThisTurn,
-          finalText,
-        );
+      if (status === "completed") {
+        commitAgentResourceContextPlan(resourceContextPlan);
+        commitAgentReadActivities({
+          conversationKey: request.conversationKey,
+          activities: pendingReadActivities,
+        });
+        if (finalText) {
+          await recordAgentTurn(
+            request.conversationKey,
+            request.userText,
+            toolsUsedThisTurn,
+            finalText,
+          );
+        }
       }
       return {
         kind: "completed",
@@ -860,6 +885,17 @@ export class AgentRuntime {
       });
       if (toolResult.ok) {
         consecutiveToolErrors = 0;
+        pendingReadActivities.push({
+          toolName: toolResult.name,
+          toolLabel:
+            typeof executedCall.toolDefinition?.presentation?.label ===
+            "string"
+              ? executedCall.toolDefinition.presentation.label
+              : undefined,
+          input: executedCall.input,
+          request,
+          timestamp: this.now(),
+        });
       } else {
         consecutiveToolErrors += 1;
         const rawError = readToolError(toolResult);

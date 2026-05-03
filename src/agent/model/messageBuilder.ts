@@ -19,6 +19,10 @@ import {
   formatPaperSourceLabel,
 } from "../../modules/contextPanel/paperAttribution";
 import type { PaperContextRef } from "../../shared/types";
+import {
+  renderAgentResourceContextPlan,
+  type AgentResourceContextPlan,
+} from "../context/resourceLifecycle";
 
 export function isMultimodalRequestSupported(
   request: AgentRuntimeRequest,
@@ -102,7 +106,10 @@ function normalizeHistoryMessages(
     }));
 }
 
-function buildUserMessage(request: AgentRuntimeRequest): AgentModelMessage {
+function buildFullUserMessage(
+  request: AgentRuntimeRequest,
+  options: { priorReadBlock?: string } = {},
+): AgentModelMessage {
   const fullTextPaperKeySet = new Set(
     (request.fullTextPaperContexts || []).map(
       (entry) => `${entry.itemId}:${entry.contextItemId}`,
@@ -218,6 +225,9 @@ function buildUserMessage(request: AgentRuntimeRequest): AgentModelMessage {
       "Current uploaded attachments are available through the registered document tools.",
     );
   }
+  if (options.priorReadBlock) {
+    contextLines.push(options.priorReadBlock);
+  }
 
   const promptText = `${contextLines.join("\n")}\n\nUser request:\n${request.userText}`;
   const screenshots = Array.isArray(request.screenshots)
@@ -254,6 +264,22 @@ function buildUserMessage(request: AgentRuntimeRequest): AgentModelMessage {
       })),
     ],
   };
+}
+
+function buildUserMessage(
+  request: AgentRuntimeRequest,
+  resourceContextPlan?: AgentResourceContextPlan,
+): AgentModelMessage {
+  if (
+    resourceContextPlan &&
+    (resourceContextPlan.injection === "thin" ||
+      resourceContextPlan.injection === "delta")
+  ) {
+    return renderAgentResourceContextPlan(resourceContextPlan, request);
+  }
+  return buildFullUserMessage(request, {
+    priorReadBlock: resourceContextPlan?.priorReadBlock,
+  });
 }
 
 type PromptSection = {
@@ -407,6 +433,7 @@ export async function buildAgentInitialMessages(
   request: AgentRuntimeRequest,
   tools: AgentToolDefinition<any, any>[],
   matchedSkillIds: ReadonlyArray<string>,
+  resourceContextPlan?: AgentResourceContextPlan,
 ): Promise<AgentModelMessage[]> {
   const memoryBlock = await buildAgentMemoryBlock(request.conversationKey);
   const autoReadInstruction = buildAutoReadInstruction(request);
@@ -464,6 +491,6 @@ export async function buildAgentInitialMessages(
       content: buildSystemPrompt(sections),
     },
     ...normalizeHistoryMessages(request),
-    buildUserMessage(request),
+    buildUserMessage(request, resourceContextPlan),
   ];
 }
