@@ -1,4 +1,8 @@
-import type { AgentRuntimeRequest } from "../types";
+import type {
+  AgentModelCapabilities,
+  AgentModelStep,
+  AgentRuntimeRequest,
+} from "../types";
 import {
   normalizeProviderProtocolForAuthMode,
   type ProviderProtocol,
@@ -7,11 +11,32 @@ import { isGeminiBase } from "../../utils/apiHelpers";
 import { providerSupportsResponsesEndpoint } from "../../utils/providerPresets";
 import type { AgentModelAdapter } from "./adapter";
 import { CodexResponsesAgentAdapter } from "./codexResponses";
-import { CodexAppServerAdapter } from "./codexAppServer";
 import { OpenAIResponsesAgentAdapter } from "./openaiResponses";
 import { OpenAIChatCompatAgentAdapter } from "./openaiCompatible";
 import { AnthropicMessagesAgentAdapter } from "./anthropicMessages";
 import { GeminiNativeAgentAdapter } from "./geminiNative";
+
+class CodexAppServerNativeOnlyAgentAdapter implements AgentModelAdapter {
+  getCapabilities(_request: AgentRuntimeRequest): AgentModelCapabilities {
+    return {
+      streaming: false,
+      toolCalls: false,
+      multimodal: false,
+      fileInputs: false,
+      reasoning: false,
+    };
+  }
+
+  supportsTools(_request: AgentRuntimeRequest): boolean {
+    return false;
+  }
+
+  async runStep(): Promise<AgentModelStep> {
+    throw new Error(
+      "Codex App Server is handled by the native persistent runtime, not the original agent pipeline.",
+    );
+  }
+}
 
 export function resolveRequestProviderProtocol(
   request: Pick<AgentRuntimeRequest, "providerProtocol" | "authMode" | "apiBase">,
@@ -27,7 +52,7 @@ export function createAgentModelAdapter(
   request: AgentRuntimeRequest,
 ): AgentModelAdapter {
   if (request.authMode === "codex_app_server") {
-    return new CodexAppServerAdapter("codex_app_server");
+    return new CodexAppServerNativeOnlyAgentAdapter();
   }
   const protocol = resolveRequestProviderProtocol(request);
   if (
