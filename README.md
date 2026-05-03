@@ -288,7 +288,7 @@ Or if you want to keep notes inside Zotero, the agent can also write to internal
 </p>
 
 <p align="center">
-  <img src="./assets/obsidian_example.png" alt="Example of a paper note rendered in Obsidian" width="1024" />
+  <img src="./assets/obsidian_example.png" alt="Example of a paper note rendered in Obsidian" width="512" />
 </p>
 
 Notes use [Pandoc citation syntax](https://pandoc.org/MANUAL.html#citations)
