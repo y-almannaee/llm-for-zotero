@@ -51,6 +51,7 @@ import {
   resolveCodexNativeSkills,
   type CodexNativeSkillContext,
 } from "./nativeSkills";
+import { buildNotesDirectoryConfigSection } from "../utils/notesDirectoryConfig";
 
 export const CODEX_APP_SERVER_NATIVE_PROCESS_KEY = "codex_app_server_native";
 const CODEX_APP_SERVER_SERVICE_NAME = "llm_for_zotero";
@@ -534,6 +535,7 @@ function buildZoteroEnvironmentManifest(params: {
   skillInstructionBlock?: string;
 }): string {
   const { scope } = params;
+  const notesDirectoryConfig = buildNotesDirectoryConfigSection();
   const lines = [
     "Zotero environment for this turn:",
     formatScopeLine(
@@ -578,7 +580,11 @@ function buildZoteroEnvironmentManifest(params: {
     lines.push(
       "- Zotero MCP tools: disabled for this turn. Do not claim access to Zotero library or PDF tools unless another tool source is available.",
     );
-    return [lines.join("\n"), params.skillInstructionBlock || ""]
+    return [
+      lines.join("\n"),
+      notesDirectoryConfig,
+      params.skillInstructionBlock || "",
+    ]
       .filter(Boolean)
       .join("\n\n");
   }
@@ -587,7 +593,11 @@ function buildZoteroEnvironmentManifest(params: {
     lines.push(
       `- Zotero MCP tools: unavailable for this turn.${params.mcpWarning ? ` ${params.mcpWarning}` : ""}`,
     );
-    return [lines.join("\n"), params.skillInstructionBlock || ""]
+    return [
+      lines.join("\n"),
+      notesDirectoryConfig,
+      params.skillInstructionBlock || "",
+    ]
       .filter(Boolean)
       .join("\n\n");
   }
@@ -609,7 +619,11 @@ function buildZoteroEnvironmentManifest(params: {
       "- Library workflow: use query_library to discover/search/list items in the active library, then read_library and paper tools on selected item IDs before answering. Do not ask the user to paste the whole library.",
     );
   }
-  return [lines.join("\n"), params.skillInstructionBlock || ""]
+  return [
+    lines.join("\n"),
+    notesDirectoryConfig,
+    params.skillInstructionBlock || "",
+  ]
     .filter(Boolean)
     .join("\n\n");
 }

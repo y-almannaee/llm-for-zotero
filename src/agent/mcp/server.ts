@@ -79,6 +79,14 @@ const READ_ONLY_TOOL_ANNOTATIONS = {
 const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   openWorldHint: false,
+  destructiveHint: false,
+} as const;
+const DESTRUCTIVE_WRITE_TOOL_NAMES = new Set<string>([
+  "trash_items",
+  "merge_items",
+]);
+const DESTRUCTIVE_WRITE_TOOL_ANNOTATIONS = {
+  ...WRITE_TOOL_ANNOTATIONS,
   destructiveHint: true,
 } as const;
 const MCP_SCOPE_ARG_NAMES = new Set([
@@ -494,6 +502,16 @@ function isMcpExposedTool(tool: ToolSpec): boolean {
   return false;
 }
 
+function getMcpToolAnnotations(
+  toolName: string,
+  mutability: ToolSpec["mutability"],
+): McpToolDefinition["annotations"] {
+  if (mutability === "read") return READ_ONLY_TOOL_ANNOTATIONS;
+  return DESTRUCTIVE_WRITE_TOOL_NAMES.has(toolName)
+    ? DESTRUCTIVE_WRITE_TOOL_ANNOTATIONS
+    : WRITE_TOOL_ANNOTATIONS;
+}
+
 function handleToolsList(toolRegistry: AgentToolRegistry): McpToolsListResult {
   const tools: McpToolDefinition[] = toolRegistry
     .listTools()
@@ -503,10 +521,7 @@ function handleToolsList(toolRegistry: AgentToolRegistry): McpToolsListResult {
       title: formatToolTitle(name),
       description: decorateMcpToolDescription(name, description, mutability),
       inputSchema: decorateMcpToolSchema(inputSchema),
-      annotations:
-        mutability === "read"
-          ? READ_ONLY_TOOL_ANNOTATIONS
-          : WRITE_TOOL_ANNOTATIONS,
+      annotations: getMcpToolAnnotations(name, mutability),
     }));
   return { tools };
 }

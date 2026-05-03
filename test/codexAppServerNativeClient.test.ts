@@ -598,6 +598,22 @@ describe("Codex app-server native client", function () {
     const activatedSkillIds: string[] = [];
     const prefStore = new Map<string, unknown>();
     setUserSkills([makeSkill("write-note", "Use the write-note workflow.")]);
+    prefStore.set(
+      "extensions.zotero.llmforzotero.obsidianVaultPath",
+      "/tmp/obsidian-vault",
+    );
+    prefStore.set(
+      "extensions.zotero.llmforzotero.obsidianTargetFolder",
+      "Logs",
+    );
+    prefStore.set(
+      "extensions.zotero.llmforzotero.obsidianAttachmentsFolder",
+      "Logs/imgs",
+    );
+    prefStore.set(
+      "extensions.zotero.llmforzotero.notesDirectoryNickname",
+      "Obsidian",
+    );
 
     if (globalThis.process?.env) {
       globalThis.process.env.CODEX_PATH = "/mock/codex";
@@ -779,6 +795,19 @@ describe("Codex app-server native client", function () {
     assert.include(
       developerInstructions,
       "LLM-for-Zotero skills active for this turn",
+    );
+    assert.include(
+      developerInstructions,
+      "Notes directory configuration (user-configured):",
+    );
+    assert.include(developerInstructions, "- Nickname: Obsidian");
+    assert.include(
+      developerInstructions,
+      "- Default target path: /tmp/obsidian-vault/Logs",
+    );
+    assert.include(
+      developerInstructions,
+      "- Attachments path: /tmp/obsidian-vault/Logs/imgs",
     );
     assert.include(developerInstructions, "Skill: write-note");
     assert.include(developerInstructions, "Use the write-note workflow.");

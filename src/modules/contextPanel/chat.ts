@@ -2666,6 +2666,7 @@ function createCodexNativeActivityTraceController(
   const progressEventIndexes = new Map<string, number>();
   const toolEventIndexes = new Map<string, number>();
   const mcpRequestToolItemIds = new Map<string, string>();
+  const activatedSkillIds = new Set<string>();
   let seq = 0;
   let lastAgentMessageItemId = "";
 
@@ -2860,6 +2861,21 @@ function createCodexNativeActivityTraceController(
     return true;
   };
 
+  const noteSkillActivated = (skillId: string): void => {
+    const cleanSkillId = sanitizeText(skillId || "").trim();
+    if (!cleanSkillId || activatedSkillIds.has(cleanSkillId)) return;
+    activatedSkillIds.add(cleanSkillId);
+    events.push(
+      createEvent({
+        type: "tool_call",
+        callId: `skill:${cleanSkillId}`,
+        name: "Skill",
+        args: { skill: cleanSkillId },
+      }),
+    );
+    sync();
+  };
+
   const appendItemStatus = (
     event: CodexNativeTraceItemEvent,
     phase: "started" | "completed",
@@ -3025,6 +3041,7 @@ function createCodexNativeActivityTraceController(
     appendAgentMessageDelta,
     appendItemStatus,
     finish,
+    noteSkillActivated,
     noteMcpConfirmationRequired,
     noteMcpConfirmationResolved,
     noteMcpToolActivity,
@@ -4035,6 +4052,7 @@ export async function retryLatestAssistantResponse(
               attachments,
             }),
             onSkillActivated: (skillId) => {
+              codexActivityTrace?.noteSkillActivated(skillId);
               setStatusSafely(`Codex skill activated: ${skillId}`, "sending");
             },
             onDelta: handleDelta,
@@ -5441,6 +5459,7 @@ export async function sendQuestion(
               attachments,
             }),
             onSkillActivated: (skillId) => {
+              codexActivityTrace?.noteSkillActivated(skillId);
               setStatusSafely(`Codex skill activated: ${skillId}`, "sending");
             },
             onDelta: handleDelta,

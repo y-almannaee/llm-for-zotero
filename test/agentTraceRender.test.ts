@@ -1040,7 +1040,7 @@ describe("agentTrace render", function () {
     assert.include(actionTexts, "Response ready");
   });
 
-  it("shows the concrete skill name instead of a generic skill label", function () {
+  it("shows concrete skill names instead of a generic skill label", function () {
     const events: AgentRunEventRecord[] = [
       {
         runId: "run-1",
@@ -1054,6 +1054,18 @@ describe("agentTrace render", function () {
         },
         createdAt: 1,
       },
+      {
+        runId: "run-1",
+        seq: 2,
+        eventType: "tool_call",
+        payload: {
+          type: "tool_call",
+          callId: "call-2",
+          name: "Skill",
+          args: { skill: "write-note" },
+        },
+        createdAt: 2,
+      },
     ];
 
     const { items } = buildAgentTraceDisplayItems(events, null);
@@ -1065,6 +1077,11 @@ describe("agentTrace render", function () {
       .map((item) => item.row.text);
 
     assert.include(actionTexts, "Using Skill: graphwalk");
+    assert.include(actionTexts, "Using Skill: write-note");
     assert.notInclude(actionTexts, "Using Skill");
+    assert.isBelow(
+      actionTexts.indexOf("Using Skill: graphwalk"),
+      actionTexts.indexOf("Using Skill: write-note"),
+    );
   });
 });

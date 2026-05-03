@@ -10,13 +10,8 @@ import { getAllSkills } from "../skills";
 import { resolveProviderCapabilities } from "../../providers";
 import type { ProviderCapabilities } from "../../providers";
 import {
-  isNotesDirectoryConfigured,
-  getNotesDirectoryPath,
-  getNotesDirectoryFolder,
-  getNotesDirectoryAttachmentsFolder,
-  getNotesDirectoryNickname,
+  buildNotesDirectoryConfigSection,
 } from "../../utils/notesDirectoryConfig";
-import { joinLocalPath } from "../../utils/localPath";
 import { buildRuntimePlatformGuidanceText } from "../../utils/runtimePlatform";
 import {
   buildPaperQuoteCitationGuidance,
@@ -393,41 +388,6 @@ function buildWriteNoteFileInstruction(
   );
 }
 
-function buildNotesDirectorySection(): string {
-  if (!isNotesDirectoryConfigured()) return "";
-  const dirPath = getNotesDirectoryPath();
-  const targetFolder = getNotesDirectoryFolder();
-  const attachmentsFolder = getNotesDirectoryAttachmentsFolder();
-  const nickname = getNotesDirectoryNickname().trim();
-  const defaultTargetPath = targetFolder
-    ? joinLocalPath(dirPath, targetFolder)
-    : dirPath;
-  const lines = ["Notes directory configuration (user-configured):"];
-  if (nickname) {
-    lines.push(`- Nickname: ${nickname}`);
-  }
-  const attachmentsPath = attachmentsFolder
-    ? joinLocalPath(dirPath, attachmentsFolder)
-    : "";
-  lines.push(
-    `- Directory path: ${dirPath}`,
-    `- Default folder: ${targetFolder}`,
-    `- Default target path: ${defaultTargetPath}`,
-    `- Attachments folder: ${attachmentsFolder} (relative to notes directory root)`,
-  );
-  if (attachmentsPath) {
-    lines.push(
-      `- Attachments path: ${attachmentsPath} (resolved absolute path for copying images)`,
-    );
-  }
-  if (nickname) {
-    lines.push(
-      `When the user mentions "${nickname}" in the context of notes, write to this directory.`,
-    );
-  }
-  return lines.join("\n");
-}
-
 function buildRuntimePlatformSection(): string {
   return buildRuntimePlatformGuidanceText();
 }
@@ -478,7 +438,7 @@ export async function buildAgentInitialMessages(
     },
     {
       id: "notes-directory-config",
-      lines: [buildNotesDirectorySection()],
+      lines: [buildNotesDirectoryConfigSection()],
     },
     {
       id: "tool-guidance",

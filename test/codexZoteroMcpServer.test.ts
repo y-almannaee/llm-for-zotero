@@ -131,6 +131,8 @@ describe("Zotero MCP server", function () {
     const registry = new AgentToolRegistry();
     registry.register(createReadTool("query_library"));
     registry.register(createWriteTool("apply_tags"));
+    registry.register(createWriteTool("file_io"));
+    registry.register(createWriteTool("trash_items"));
     registry.register(createReadTool("not_curated_read_tool"));
     registerMcpServer({
       toolRegistry: registry,
@@ -145,7 +147,12 @@ describe("Zotero MCP server", function () {
     const names = payload.result.tools.map(
       (tool: { name: string }) => tool.name,
     );
-    assert.deepEqual(names.sort(), ["apply_tags", "query_library"]);
+    assert.deepEqual(names.sort(), [
+      "apply_tags",
+      "file_io",
+      "query_library",
+      "trash_items",
+    ]);
     const queryTool = payload.result.tools.find(
       (tool: { name: string }) => tool.name === "query_library",
     );
@@ -166,12 +173,28 @@ describe("Zotero MCP server", function () {
     assert.deepEqual(writeTool.annotations, {
       readOnlyHint: false,
       openWorldHint: false,
-      destructiveHint: true,
+      destructiveHint: false,
     });
     assert.include(
       writeTool.description,
       "Write operations pause in Zotero for user review",
     );
+    const fileIoTool = payload.result.tools.find(
+      (tool: { name: string }) => tool.name === "file_io",
+    );
+    assert.deepEqual(fileIoTool.annotations, {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: false,
+    });
+    const trashTool = payload.result.tools.find(
+      (tool: { name: string }) => tool.name === "trash_items",
+    );
+    assert.deepEqual(trashTool.annotations, {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: true,
+    });
   });
 
   it("accepts the MCP initialized notification without a JSON-RPC response", async function () {
